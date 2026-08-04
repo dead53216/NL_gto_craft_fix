@@ -116,7 +116,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.1.1：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.1.2：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -688,6 +688,11 @@ public abstract class CraftingServiceSyncMixin {
                 if (!waiting.isEmpty()) {
                     gtocraftfix$clearStaleWaits(logic, storage, cluster, waiting, finalOut);
                 }
+                // 成品自我認領：waiting 空但成品躺在 CPU 庫存不被交付帳認領（me_pattern_buffer 案例：
+                // 做成品的機器自帶 ME 連接，產物繞過認領 hook 直進 CPU 庫存）→ 補帳＋重插觸發認領
+                if (waiting.isEmpty()) {
+                    gtocraftfix$selfClaimFinal(logic, cluster, finalOut);
+                }
             } catch (Throwable t) {
                 int c = gtocraftfix$sitterLog.incrementAndGet();
                 if (c <= 5) {
@@ -804,6 +809,98 @@ public abstract class CraftingServiceSyncMixin {
             }
         } catch (Throwable ignored) {
             // 反射不可用 → 靜默略過（下一輪再試）
+        }
+    }
+
+    /** 成品滯留快照：cluster → 上次觀察到的 CPU 內成品數量（變動＝有進度，年齡歸零）。 */
+    private final HashMap<String, Long> gtocraftfix$staleHeld = new HashMap<>();
+
+    /**
+     * 成品自我認領：gtolib 的交付認領只掛在 CPU 的插入事件上；產出機器若自帶 ME 連接
+     * （me_pattern_buffer 案例），產物會繞過認領 hook 直接進 CPU 庫存——job 拿著成品卻
+     * 記不了帳，waitingFor 也是空的，餵料／陳舊解鎖／補輸入三層全部無感。
+     * 救援：成品在 CPU 庫存滯留 ≥60 秒且數量不動 → 先把 waitingFor 帳目補回去，再把成品
+     * 從庫存取出走正規 insert 重插——插入事件觸發認領，job 記帳完單。反射全軟失敗。
+     */
+    private void gtocraftfix$selfClaimFinal(appeng.crafting.execution.CraftingCpuLogic logic,
+                                            appeng.me.cluster.implementations.CraftingCPUCluster cluster,
+                                            appeng.api.stacks.GenericStack finalOut) {
+        try {
+            if (finalOut == null) {
+                return;
+            }
+            if (gtocraftfix$fInv == null) {
+                var fi = appeng.crafting.execution.CraftingCpuLogic.class.getDeclaredField("inventory");
+                fi.setAccessible(true);
+                gtocraftfix$fInv = fi;
+            }
+            var inv = (appeng.crafting.inv.ListCraftingInventory) gtocraftfix$fInv.get(logic);
+            if (inv == null) {
+                return;
+            }
+            var fk = finalOut.what();
+            long heldFin = inv.list.get(fk);
+            String mk = Integer.toHexString(System.identityHashCode(cluster)) + "|FINAL";
+            if (heldFin <= 0) {
+                gtocraftfix$staleWait.remove(mk);
+                gtocraftfix$staleHeld.remove(mk);
+                return;
+            }
+            // 數量有變動＝機器還在產出，不是滯留 → 年齡歸零
+            Long prev = gtocraftfix$staleHeld.put(mk, heldFin);
+            if (prev == null || prev != heldFin) {
+                gtocraftfix$staleWait.put(mk, gtocraftfix$tickCounter);
+                return;
+            }
+            Integer first = gtocraftfix$staleWait.get(mk);
+            if (first == null) {
+                gtocraftfix$staleWait.put(mk, gtocraftfix$tickCounter);
+                return;
+            }
+            if (gtocraftfix$tickCounter - first < 1200) {
+                return;
+            }
+            // 補帳：認領路徑要求 waitingFor 有這筆，先塞回去
+            if (gtocraftfix$fJob == null) {
+                var fj = logic.getClass().getDeclaredField("job");
+                fj.setAccessible(true);
+                gtocraftfix$fJob = fj;
+            }
+            Object job = gtocraftfix$fJob.get(logic);
+            if (job == null) {
+                return;
+            }
+            if (gtocraftfix$fWaitingFor == null) {
+                var fw = job.getClass().getDeclaredField("waitingFor");
+                fw.setAccessible(true);
+                gtocraftfix$fWaitingFor = fw;
+            }
+            Object wf = gtocraftfix$fWaitingFor.get(job);
+            if (!(wf instanceof appeng.crafting.inv.ListCraftingInventory wli)) {
+                return;
+            }
+            long got = inv.extract(fk, heldFin, Actionable.MODULATE);
+            if (got <= 0) {
+                return;
+            }
+            wli.insert(fk, got, Actionable.MODULATE);
+            long accepted = logic.insert(fk, got, Actionable.MODULATE);
+            if (accepted < got) {
+                // 沒吃完：帳目多補的部分收回、東西放回庫存
+                wli.extract(fk, got - accepted, Actionable.MODULATE);
+                inv.insert(fk, got - accepted, Actionable.MODULATE);
+            }
+            gtocraftfix$staleWait.put(mk, gtocraftfix$tickCounter);
+            gtocraftfix$staleHeld.remove(mk);
+            if (accepted > 0) {
+                int c = gtocraftfix$sitterLog.incrementAndGet();
+                if (c <= 200) {
+                    LOG.info("[craftfix] 成品自我認領 {} x{}（waiting 空、成品滯留 CPU {} 秒）",
+                            fk, accepted, (gtocraftfix$tickCounter - first) / 20);
+                }
+            }
+        } catch (Throwable ignored) {
+            // 反射不可用 → 靜默略過
         }
     }
 
