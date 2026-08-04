@@ -1,0 +1,37 @@
+# Gradle
+.gradle/
+build/
+out/
+
+# Build output (jars mirrored into ../_NL_mod)
+dist/
+
+# Minecraft local run data
+run/
+src/generated/
+
+# IDE/editor
+.idea/
+.vscode/
+*.iml
+.classpath
+.project
+.settings/
+
+# Local machine files
+local.properties
+.env
+.env.*
+!.env.example
+
+# Logs and JVM crash dumps
+*.log
+logs/
+crash-reports/
+hs_err_pid*
+replay_pid*
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini

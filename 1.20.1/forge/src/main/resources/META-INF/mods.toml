@@ -1,0 +1,39 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[mods]]
+modId="gto_craft_fix"
+version="${mod_version}"
+displayName="GTO Craft Fix (multi-step autocraft)"
+description='''
+修復：GTO 合成算料併發讀活 grid，合成樹超過一步時卡死。改成伺服器執行緒同步算料，通用修好所有自動合成路徑（合成終端 ctrl+左鍵、合成卡、請求器、等級發射器…）。
+'''
+
+[[dependencies.gto_craft_fix]]
+    modId="forge"
+    mandatory=true
+    versionRange="[47,)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.gto_craft_fix]]
+    modId="minecraft"
+    mandatory=true
+    versionRange="[1.20.1,1.21)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.gto_craft_fix]]
+    modId="ae2"
+    mandatory=true
+    versionRange="*"
+    ordering="AFTER"
+    side="BOTH"
+
+[[dependencies.gto_craft_fix]]
+    modId="gtocore"
+    mandatory=true
+    versionRange="*"
+    ordering="AFTER"
+    side="BOTH"

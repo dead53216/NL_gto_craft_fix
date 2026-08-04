@@ -1,0 +1,62 @@
+plugins {
+    id 'java'
+    id 'net.neoforged.moddev.legacyforge' version '2.0.141'
+}
+
+// 版本唯一來源：mod 根目錄 VERSION（CRLF，build-jar.bat 以 set /p 讀同一份）
+def modVersion = { def vls = file('../../VERSION').readLines('UTF-8')*.trim(); def cv = vls.find { it.startsWith('CURRENT_VERSION=') }; cv ? cv.substring(16).trim() : vls.find { it && !it.contains('=') } }()
+version = modVersion
+group = 'com.gtocraftfix'
+base { archivesName = 'gto_craft_fix' }
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+
+repositories {
+    mavenCentral()
+    maven { url = "https://maven.neoforged.net/releases" }
+    maven { url = "https://maven.gtodyssey.com/releases" }  // GTO 版 AE2
+    maven { url = "https://modmaven.dev" }                   // AE2 鏡像
+    maven { url = "https://repo.spongepowered.org/repository/maven-public/" } // Mixin AP
+}
+
+legacyForge {
+    version = "1.20.1-47.1.47"
+
+    mods {
+        gto_craft_fix {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
+
+mixin {
+    add sourceSets.main, "gto_craft_fix.refmap.json"
+    config "gto_craft_fix.mixins.json"
+}
+
+// MDG legacy 不會自動把 MixinConfigs 寫進 manifest；手動加，否則 Forge 不載入 mixin 設定。
+afterEvaluate {
+    tasks.withType(org.gradle.jvm.tasks.Jar).configureEach {
+        manifest.attributes([
+            'MixinConfigs': 'gto_craft_fix.mixins.json'
+        ])
+    }
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    inputs.property 'mod_version', modVersion
+    filesMatching(['META-INF/mods.toml']) {
+        expand mod_version: modVersion
+    }
+}
+
+dependencies {
+    // 編譯需 AE2（CraftingService / KeyCounter / GenericStack…）；執行期由整合包提供。
+    modImplementation("appeng:appliedenergistics2-forge-1.20.1:15.267.4")
+    // Mixin 註解處理器：產生 refmap 與 reobf 所需的 mappings tsrg。
+    annotationProcessor 'org.spongepowered:mixin:0.8.7:processor'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}

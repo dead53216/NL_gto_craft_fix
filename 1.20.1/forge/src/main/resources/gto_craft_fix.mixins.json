@@ -1,0 +1,16 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.gtocraftfix.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "gto_craft_fix.refmap.json",
+  "mixins": [
+    "CraftingServiceSyncMixin",
+    "CraftingCpuHelperMixin"
+  ],
+  "client": [],
+  "server": [],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
