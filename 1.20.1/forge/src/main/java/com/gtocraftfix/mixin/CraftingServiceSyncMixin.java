@@ -116,7 +116,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.1.2：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.1.3：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -656,6 +656,34 @@ public abstract class CraftingServiceSyncMixin {
                     }
                     // 只餵料：網路有貨 → 直餵 CPU（補認領缺口）。不代下巢狀單——那會生一堆小任務佔 CPU。
                     long got = storage.extract(key, want, Actionable.MODULATE, cluster.getSrc());
+                    if (got <= 0) {
+                        // v1.1.3 自庫認領：網內無貨，但貨可能已在 CPU 自己的庫存——繞過認領 hook
+                        // 進來的（液態釹案例：waiting 要 9216mB、庫存正好持有 9216mB）。
+                        // waitingFor 有帳，取出走正規 insert 即認領；沒吃完全數回滾。
+                        var inv0 = gtocraftfix$invOf(logic);
+                        if (inv0 != null) {
+                            long heldHere = inv0.list.get(key);
+                            if (heldHere > 0) {
+                                long g2 = inv0.extract(key, Math.min(heldHere, want), Actionable.MODULATE);
+                                if (g2 > 0) {
+                                    long acc2 = logic.insert(key, g2, Actionable.MODULATE);
+                                    if (acc2 < g2) {
+                                        inv0.insert(key, g2 - acc2, Actionable.MODULATE);
+                                    }
+                                    if (acc2 > 0) {
+                                        handled++;
+                                        int c2 = gtocraftfix$sitterLog.incrementAndGet();
+                                        if (c2 <= 200) {
+                                            LOG.info("[craftfix] 自庫認領 {} x{}（貨在 CPU 庫存、帳未記）", key, acc2);
+                                        }
+                                    } else if (isFinal) {
+                                        gtocraftfix$feedRefused.put(key, gtocraftfix$tickCounter);
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if (got > 0) {
                         long accepted = logic.insert(key, got, Actionable.MODULATE);
                         if (accepted < got) {
@@ -814,6 +842,21 @@ public abstract class CraftingServiceSyncMixin {
 
     /** 成品滯留快照：cluster → 上次觀察到的 CPU 內成品數量（變動＝有進度，年齡歸零）。 */
     private final HashMap<String, Long> gtocraftfix$staleHeld = new HashMap<>();
+
+    /** CPU 內部庫存（CraftingCpuLogic.inventory）反射存取；不可用回 null。 */
+    private appeng.crafting.inv.ListCraftingInventory gtocraftfix$invOf(
+            appeng.crafting.execution.CraftingCpuLogic logic) {
+        try {
+            if (gtocraftfix$fInv == null) {
+                var fi = appeng.crafting.execution.CraftingCpuLogic.class.getDeclaredField("inventory");
+                fi.setAccessible(true);
+                gtocraftfix$fInv = fi;
+            }
+            return (appeng.crafting.inv.ListCraftingInventory) gtocraftfix$fInv.get(logic);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
 
     /**
      * 成品自我認領：gtolib 的交付認領只掛在 CPU 的插入事件上；產出機器若自帶 ME 連接
