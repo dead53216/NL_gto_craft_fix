@@ -116,7 +116,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.1.3：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.1.4：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -613,8 +613,59 @@ public abstract class CraftingServiceSyncMixin {
                     } catch (Throwable t) {
                         held = "n/a";
                     }
-                    LOG.info("[craftfix] CPU探針 out={} waiting[{}]={} held=[{}] results={}",
-                            out, waiting.size(), waitStr, held, results);
+                    // 剩餘任務 X 光：主產物×次數＋首輸入「CPU庫存量/每輪需求」——
+                    // 分辨「缺料不推」（庫存<需求）與「有料不推」（庫存≥需求＝執行器死角）
+                    String tasksStr = "n/a";
+                    try {
+                        if (gtocraftfix$fJob == null) {
+                            var fj = logic.getClass().getDeclaredField("job");
+                            fj.setAccessible(true);
+                            gtocraftfix$fJob = fj;
+                        }
+                        Object job0 = gtocraftfix$fJob.get(logic);
+                        if (job0 != null) {
+                            if (gtocraftfix$fTasks == null) {
+                                var ft = job0.getClass().getDeclaredField("tasks");
+                                ft.setAccessible(true);
+                                gtocraftfix$fTasks = ft;
+                            }
+                            Map<?, ?> ts = (Map<?, ?>) gtocraftfix$fTasks.get(job0);
+                            var inv0 = gtocraftfix$invOf(logic);
+                            if (ts != null) {
+                                StringBuilder tb = new StringBuilder();
+                                int shownT = 0;
+                                for (var en : ts.entrySet()) {
+                                    Object holder0 = en.getValue();
+                                    if (gtocraftfix$fHolderVal == null) {
+                                        var fv = holder0.getClass().getField("value");
+                                        fv.setAccessible(true);
+                                        gtocraftfix$fHolderVal = fv;
+                                    }
+                                    long times = gtocraftfix$fHolderVal.getLong(holder0);
+                                    if (times <= 0) {
+                                        continue;
+                                    }
+                                    if (shownT++ >= 8) {
+                                        tb.append('…');
+                                        break;
+                                    }
+                                    var pat0 = (IPatternDetails) en.getKey();
+                                    tb.append(pat0.getPrimaryOutput().what()).append('x').append(times);
+                                    var ins0 = pat0.getInputs();
+                                    if (ins0.length > 0 && ins0[0].getPossibleInputs().length > 0 && inv0 != null) {
+                                        var pk = ins0[0].getPossibleInputs()[0].what();
+                                        long need = ins0[0].getPossibleInputs()[0].amount() * ins0[0].getMultiplier();
+                                        tb.append("(in:").append(inv0.list.get(pk)).append('/').append(need).append(')');
+                                    }
+                                    tb.append("; ");
+                                }
+                                tasksStr = tb.length() == 0 ? "(無)" : tb.toString();
+                            }
+                        }
+                    } catch (Throwable ignored2) {
+                    }
+                    LOG.info("[craftfix] CPU探針 out={} waiting[{}]={} held=[{}] 剩餘任務=[{}] results={}",
+                            out, waiting.size(), waitStr, held, tasksStr, results);
                 } catch (Throwable ignored) {
                 }
             }
