@@ -116,7 +116,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.1.5：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.1.6：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -651,11 +651,35 @@ public abstract class CraftingServiceSyncMixin {
                                     }
                                     var pat0 = (IPatternDetails) en.getKey();
                                     tb.append(pat0.getPrimaryOutput().what()).append('x').append(times);
-                                    var ins0 = pat0.getInputs();
-                                    if (ins0.length > 0 && ins0[0].getPossibleInputs().length > 0 && inv0 != null) {
-                                        var pk = ins0[0].getPossibleInputs()[0].what();
-                                        long need = ins0[0].getPossibleInputs()[0].amount() * ins0[0].getMultiplier();
-                                        tb.append("(in:").append(inv0.list.get(pk)).append('/').append(need).append(')');
+                                    // 印「最缺的那格」輸入——executeCrafting 任一格不足即無聲跳過，
+                                    // 只看第一格會得到 15/15 的假健康
+                                    if (inv0 != null) {
+                                        AEKey worstK = null;
+                                        long worstHave = 0;
+                                        long worstNeed = 0;
+                                        double worstR = Double.MAX_VALUE;
+                                        for (var in1 : pat0.getInputs()) {
+                                            var ps = in1.getPossibleInputs();
+                                            if (ps.length == 0) {
+                                                continue;
+                                            }
+                                            long need1 = ps[0].amount() * in1.getMultiplier();
+                                            if (need1 <= 0) {
+                                                continue;
+                                            }
+                                            long have1 = inv0.list.get(ps[0].what());
+                                            double r = (double) have1 / need1;
+                                            if (r < worstR) {
+                                                worstR = r;
+                                                worstK = ps[0].what();
+                                                worstHave = have1;
+                                                worstNeed = need1;
+                                            }
+                                        }
+                                        if (worstK != null) {
+                                            tb.append("(缺口:").append(worstK).append(' ')
+                                                    .append(worstHave).append('/').append(worstNeed).append(')');
+                                        }
                                     }
                                     tb.append("; ");
                                 }
@@ -1082,7 +1106,7 @@ public abstract class CraftingServiceSyncMixin {
             }
             int fed = 0;
             for (var en : tasks.entrySet()) {
-                if (fed >= 6) {
+                if (fed >= 16) {
                     break;
                 }
                 Object holder = en.getValue();
@@ -1091,7 +1115,8 @@ public abstract class CraftingServiceSyncMixin {
                     fv.setAccessible(true);
                     gtocraftfix$fHolderVal = fv;
                 }
-                if (gtocraftfix$fHolderVal.getLong(holder) <= 0) {
+                long times = gtocraftfix$fHolderVal.getLong(holder);
+                if (times <= 0) {
                     continue;
                 }
                 var pat = (IPatternDetails) en.getKey();
@@ -1105,17 +1130,33 @@ public abstract class CraftingServiceSyncMixin {
                     if (per <= 0) {
                         continue;
                     }
+                    // v1.1.6：一次補足全部剩餘需求（原本每 5 秒只補一輪 → 整條產線變龜速爬行）。
+                    // 多補的部分完單時由 storeItems 退回網路，不會遺失。
+                    long need;
+                    try {
+                        need = Math.multiplyExact(per, times);
+                    } catch (ArithmeticException e) {
+                        need = Long.MAX_VALUE / 4;
+                    }
                     long have = inv.list.get(ik);
-                    if (have >= per) {
+                    if (have >= need) {
                         continue;
                     }
-                    long got = storage.extract(ik, per - have, Actionable.MODULATE, src);
+                    long got = storage.extract(ik, need - have, Actionable.MODULATE, src);
                     if (got > 0) {
                         inv.insert(ik, got, Actionable.MODULATE);
                         fed++;
                         int c = gtocraftfix$sitterLog.incrementAndGet();
                         if (c <= 200) {
-                            LOG.info("[craftfix] 保母補輸入 {} x{}（凍結任務救援）", ik, got);
+                            LOG.info("[craftfix] 保母補輸入 {} x{}（剩餘 {} 輪全額）", ik, got, times);
+                        }
+                    }
+                    if (have + got < per) {
+                        // 連一輪都湊不齊且網路已乾 → 執行器會無聲跳過此任務；至少留下可見證據
+                        int c = gtocraftfix$sitterLog.incrementAndGet();
+                        if (c <= 200) {
+                            LOG.warn("[craftfix] 任務缺料 {}：每輪需 {}、CPU 有 {}、網路已乾（{} 任務被無聲跳過）",
+                                    ik, per, have + got, pat.getPrimaryOutput().what());
                         }
                     }
                 }
