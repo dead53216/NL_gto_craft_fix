@@ -98,6 +98,10 @@ public abstract class CraftingServiceSyncMixin {
     private static volatile java.lang.reflect.Field gtocraftfix$fTasks;
     private static volatile java.lang.reflect.Field gtocraftfix$fInv;
     private static volatile java.lang.reflect.Field gtocraftfix$fHolderVal;
+    private static volatile java.lang.reflect.Field gtocraftfix$fWaitingFor;
+    /** 陳舊等待偵測：cluster 身分＋key → 首見 tick。60 秒仍在等、網內無貨、且無剩餘任務
+     *  消費該 key 時才視為陳舊（epoxy 案例：板已加工成箔、waitingFor 帳未銷 → 永凍）。 */
+    private final HashMap<String, Integer> gtocraftfix$staleWait = new HashMap<>();
     private final Set<String> gtocraftfix$failLogged = new HashSet<>();
 
     // ---- 修正 1：算料同步化（修好終端 ctrl+左鍵多步卡死）----
@@ -112,7 +116,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.1.0：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.1.1：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -632,6 +636,7 @@ public abstract class CraftingServiceSyncMixin {
                 }
                 Set<AEKey> waiting = new HashSet<>();
                 logic.getAllWaitingFor(waiting);
+                int handledBefore = handled;
                 for (var key : waiting) {
                     if (handled >= 8) {
                         break;
@@ -674,8 +679,14 @@ public abstract class CraftingServiceSyncMixin {
                 }
                 // 輸入補給：waiting 空（無在途）但仍有未完成任務＝執行中帳漂移把某任務輸入吃到不足一輪
                 // → 剩餘任務每 tick 取料失敗、無聲凍結。反射讀任務清單，短缺輸入直接從網路補進 CPU 庫存。
-                if (waiting.isEmpty() && handled < 8) {
+                // v1.1.1：epoxy 案例證明「waiting 非空但無料可餵」的凍結同樣需要補輸入
+                // （陳舊等待擋住視線、真正缺的是任務輸入）→ 本 cluster 這輪餵料掛零時也跑。
+                if ((waiting.isEmpty() || handled == handledBefore) && handled < 8) {
                     gtocraftfix$topUpInputs(logic, storage, cluster.getSrc());
+                }
+                // 陳舊等待解鎖：可證明無用的 waitingFor 帳目才清（無剩餘任務吃、網內無貨、滯留 60 秒+）
+                if (!waiting.isEmpty()) {
+                    gtocraftfix$clearStaleWaits(logic, storage, cluster, waiting, finalOut);
                 }
             } catch (Throwable t) {
                 int c = gtocraftfix$sitterLog.incrementAndGet();
@@ -683,6 +694,116 @@ public abstract class CraftingServiceSyncMixin {
                     LOG.error("[craftfix] 保母例外", t);
                 }
             }
+        }
+    }
+
+    /**
+     * 陳舊等待解鎖：gtolib 的 waitingFor 認領只在插入事件觸發，執行中帳漂移可留下「永遠等不到、
+     * 也不再需要」的帳目（epoxy 案例：電金板早已到貨並全數加工成箔，waitingFor 卻仍掛著板）。
+     * 三重證明缺一不可才清：(1) 該 key 滯留 ≥60 秒；(2) 網內無貨（有貨歸餵料處理）；
+     * (3) 剩餘任務（times>0）沒有任何一個把該 key 列為可能輸入。最終產物永不清。反射全軟失敗。
+     */
+    private void gtocraftfix$clearStaleWaits(appeng.crafting.execution.CraftingCpuLogic logic,
+                                             appeng.api.storage.MEStorage storage,
+                                             appeng.me.cluster.implementations.CraftingCPUCluster cluster,
+                                             Set<AEKey> waiting, appeng.api.stacks.GenericStack finalOut) {
+        try {
+            if (gtocraftfix$staleWait.size() > 512) {
+                gtocraftfix$staleWait.clear();
+            }
+            int cleared = 0;
+            String cid = Integer.toHexString(System.identityHashCode(cluster));
+            for (var key : waiting) {
+                if (cleared >= 2) {
+                    break;
+                }
+                if (finalOut != null && key.equals(finalOut.what())) {
+                    continue;
+                }
+                long want = logic.getWaitingFor(key);
+                if (want <= 0) {
+                    continue;
+                }
+                String mk = cid + "|" + key;
+                // 網內有貨 → 不是陳舊，餵料路徑會處理；年齡歸零
+                if (storage.extract(key, 1, Actionable.SIMULATE, cluster.getSrc()) > 0) {
+                    gtocraftfix$staleWait.remove(mk);
+                    continue;
+                }
+                Integer first = gtocraftfix$staleWait.putIfAbsent(mk, gtocraftfix$tickCounter);
+                if (first == null || gtocraftfix$tickCounter - first < 1200) {
+                    continue;
+                }
+                // 證明 (3)：任何剩餘任務的任何可能輸入都不含該 key
+                Object job = gtocraftfix$fJob != null ? gtocraftfix$fJob.get(logic) : null;
+                if (job == null) {
+                    // fJob 尚未初始化（topUpInputs 未跑過）→ 這輪先跳過，下輪自然補上
+                    continue;
+                }
+                if (gtocraftfix$fTasks == null) {
+                    var ft = job.getClass().getDeclaredField("tasks");
+                    ft.setAccessible(true);
+                    gtocraftfix$fTasks = ft;
+                }
+                Map<?, ?> tasks = (Map<?, ?>) gtocraftfix$fTasks.get(job);
+                if (tasks == null) {
+                    continue;
+                }
+                boolean consumed = false;
+                for (var en : tasks.entrySet()) {
+                    Object holder = en.getValue();
+                    if (gtocraftfix$fHolderVal == null) {
+                        var fv = holder.getClass().getField("value");
+                        fv.setAccessible(true);
+                        gtocraftfix$fHolderVal = fv;
+                    }
+                    if (gtocraftfix$fHolderVal.getLong(holder) <= 0) {
+                        continue;
+                    }
+                    var pat = (IPatternDetails) en.getKey();
+                    for (var input : pat.getInputs()) {
+                        for (var poss : input.getPossibleInputs()) {
+                            if (poss.what().equals(key)) {
+                                consumed = true;
+                                break;
+                            }
+                        }
+                        if (consumed) {
+                            break;
+                        }
+                    }
+                    if (consumed) {
+                        break;
+                    }
+                }
+                if (consumed) {
+                    continue;
+                }
+                if (gtocraftfix$fWaitingFor == null) {
+                    var fw = job.getClass().getDeclaredField("waitingFor");
+                    fw.setAccessible(true);
+                    gtocraftfix$fWaitingFor = fw;
+                }
+                Object wf = gtocraftfix$fWaitingFor.get(job);
+                if (wf instanceof appeng.crafting.inv.ListCraftingInventory li) {
+                    li.extract(key, want, Actionable.MODULATE);
+                } else if (wf != null) {
+                    var lf = wf.getClass().getField("list");
+                    lf.setAccessible(true);
+                    ((appeng.api.stacks.KeyCounter) lf.get(wf)).remove(key, want);
+                } else {
+                    continue;
+                }
+                cleared++;
+                gtocraftfix$staleWait.remove(mk);
+                int c = gtocraftfix$sitterLog.incrementAndGet();
+                if (c <= 200) {
+                    LOG.info("[craftfix] 解除陳舊等待 {} x{}（無剩餘任務需要、網內無貨、滯留 {} 秒）",
+                            key, want, (gtocraftfix$tickCounter - first) / 20);
+                }
+            }
+        } catch (Throwable ignored) {
+            // 反射不可用 → 靜默略過（下一輪再試）
         }
     }
 
