@@ -116,7 +116,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.1.4：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.1.5：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -666,6 +666,23 @@ public abstract class CraftingServiceSyncMixin {
                     }
                     LOG.info("[craftfix] CPU探針 out={} waiting[{}]={} held=[{}] 剩餘任務=[{}] results={}",
                             out, waiting.size(), waitStr, held, tasksStr, results);
+                    // 欄位普查（每 cluster 一次）：waiting 空＋有剩餘任務＝執行器不推but料在——
+                    // 閘門必在 gtolib 私有欄位裡（最可疑：隨存檔保留的在途計數器）。全部倒出來找。
+                    if (waiting.isEmpty() && !"n/a".equals(tasksStr) && !"(無)".equals(tasksStr)) {
+                        String cid0 = Integer.toHexString(System.identityHashCode(cluster));
+                        if (gtocraftfix$censusDone.add(cid0)) {
+                            try {
+                                Object job1 = gtocraftfix$fJob != null ? gtocraftfix$fJob.get(logic) : null;
+                                LOG.info("[craftfix] 欄位普查 logic({}): {}",
+                                        logic.getClass().getName(), gtocraftfix$census(logic));
+                                if (job1 != null) {
+                                    LOG.info("[craftfix] 欄位普查 job({}): {}",
+                                            job1.getClass().getName(), gtocraftfix$census(job1));
+                                }
+                            } catch (Throwable ignored3) {
+                            }
+                        }
+                    }
                 } catch (Throwable ignored) {
                 }
             }
@@ -893,6 +910,45 @@ public abstract class CraftingServiceSyncMixin {
 
     /** 成品滯留快照：cluster → 上次觀察到的 CPU 內成品數量（變動＝有進度，年齡歸零）。 */
     private final HashMap<String, Long> gtocraftfix$staleHeld = new HashMap<>();
+
+    /** 欄位普查已做過的 cluster（每場遊戲每 cluster 只倒一次，避免洗版）。 */
+    private final Set<String> gtocraftfix$censusDone = new HashSet<>();
+
+    /** 反射倒出物件全類別鏈的實例欄位（名稱=精簡值）；集合印型別(大小)，其餘 toString 截 60 字。 */
+    private static String gtocraftfix$census(Object o) {
+        var sb = new StringBuilder();
+        for (Class<?> c = o.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            for (var f : c.getDeclaredFields()) {
+                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                    continue;
+                }
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(o);
+                    String vs;
+                    if (v == null) {
+                        vs = "null";
+                    } else if (v instanceof Number || v instanceof Boolean) {
+                        vs = String.valueOf(v);
+                    } else if (v instanceof appeng.api.stacks.KeyCounter kc) {
+                        vs = "KeyCounter(" + kc.size() + ")";
+                    } else if (v instanceof Map<?, ?> mp) {
+                        vs = v.getClass().getSimpleName() + "(" + mp.size() + ")";
+                    } else if (v instanceof java.util.Collection<?> cl) {
+                        vs = v.getClass().getSimpleName() + "(" + cl.size() + ")";
+                    } else {
+                        vs = String.valueOf(v);
+                        if (vs.length() > 60) {
+                            vs = vs.substring(0, 60) + "…";
+                        }
+                    }
+                    sb.append(f.getName()).append('=').append(vs).append("; ");
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return sb.toString();
+    }
 
     /** CPU 內部庫存（CraftingCpuLogic.inventory）反射存取；不可用回 null。 */
     private appeng.crafting.inv.ListCraftingInventory gtocraftfix$invOf(
