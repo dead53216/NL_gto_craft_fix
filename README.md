@@ -20,6 +20,7 @@
 | 保母（只餵料）| 網路既有庫存不被 waitingFor 認領（GTO 認領只在插入事件觸發）→ 每 5 秒餵入。**訂單 job（`gtocore:order`／臨時訂單）的成品單據不代餵、不自我認領**：玩家單 link 的交付地就是網路儲存，「已交付舊單據」與「在途單據」同 key 無法區分，代餵＝收據充數銷 `remainingAmount` → 實推 4/10 輪就偽完單（下單十份剩四份案例）|
 | 完單法醫 | 保母每輪記錄各 CPU 現任 job 的（交付帳剩、任務剩輪）；job 消失當下欠帳 >0 印「完單快照」並分流死因（`link 已取消→撤單棄殺` vs `link 未取消→執行器自行完單`）、requester 撤單當下即時 WARN、訂單交付帳每次變動印 `訂單交付帳 remaining X→Y`。探針缺口欄加 `有料不推⚠` 與每任務最後 PushResult（`結果:[INSUFFICIENT_PRIORITY]`…）|
 | 配額解鎖 | GTO 優先名額（allocations）扣到剛好 0 就把樣板定義整本抹除（`purgePatternEverywhere`）→ 該樣板剩餘輪次過閘 `allocKey==null` → 永遠 `INSUFFICIENT_PRIORITY`、料在手上卻不推（有料不推⚠ 指紋；lpcalc/修補包裝計畫配額帳空、天然免疫，只有 AE2 原生計畫踩雷）。滯留 ≥30 秒且全 job 零進度 → 清空配額帳退回原版行為 |
+| 擱淺交付 | GTO isOrder 預計數（`remaining−在途≤0 → finishJob(true)`）在成品仍在途時殺單；成品回流時 `job==null` → CPU `insert` 回 0 → 落網路儲存，requester（訂單機器）永遠記不到帳＝「下單十份剩四份」真兇。救援：死時記下原 link＋欠額（`擱淺交付註冊`），成品現身網路 → 經原 link 補送 requester（`finishJob` 只 `markDone` 不拆 tie、`CraftingLink.insert` 只擋 canceled——AE2 :155-165 源碼背書）；standalone 玩家單（無 requester、實收 0）成品留網路即正確歸宿。逾時 10 分鐘放棄 |
 
 ## lpcalc（機器源結構化算料器）
 

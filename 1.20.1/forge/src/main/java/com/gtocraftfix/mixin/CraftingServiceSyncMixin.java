@@ -141,6 +141,11 @@ public abstract class CraftingServiceSyncMixin {
     /** [v1.2.1] 配額死鎖計時：cluster（弱鍵）→ {首見 tick, 當時總剩輪}；INSUFFICIENT_PRIORITY
      *  滯留 ≥30 秒且總輪數零進度才清配額帳（防誤殺暫態）。 */
     private Map<CraftingCPUCluster, long[]> gtocraftfix$quotaStuck = new WeakHashMap<>();
+    /** [v1.2.2] 擱淺成品補交付佇列：{link 弱參照, 成品 AEKey, long[]{欠額}, 註冊 tick}。
+     *  GTO isOrder 預計數在成品在途時 finishJob → 成品回流時 job 已亡 → 落網路儲存、
+     *  requester 永遠記不到帳。finishJob 只 markDone 不拆 tie、link.insert 只擋 canceled
+     *  （AE2 CraftingLink:155-165）→ 死後仍可經原 link 補送 requester。 */
+    private java.util.ArrayDeque<Object[]> gtocraftfix$stranded = new java.util.ArrayDeque<>();
 
     /**
      * [重檢17] Mixin 實例欄位初始化式不保證併入目標建構子（1.1.8 實測 feedRefused 為 null、
@@ -181,6 +186,9 @@ public abstract class CraftingServiceSyncMixin {
         if (gtocraftfix$quotaStuck == null) {
             gtocraftfix$quotaStuck = new WeakHashMap<>();
         }
+        if (gtocraftfix$stranded == null) {
+            gtocraftfix$stranded = new java.util.ArrayDeque<>();
+        }
     }
 
     // ---- 修正 1：算料同步化（修好終端 ctrl+左鍵多步卡死）----
@@ -196,7 +204,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.2.1：同步算料＋機器源 IgnoreMissing＋保母＋配額解鎖；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.2.2：同步算料＋機器源 IgnoreMissing＋保母＋配額解鎖＋擱淺交付；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -838,6 +846,7 @@ public abstract class CraftingServiceSyncMixin {
             return;
         }
         var storage = grid.getStorageService().getInventory();
+        gtocraftfix$deliverStranded(storage); // [v1.2.2] 死單在途成品 → 補送 requester
         int handled = 0;
         // [重檢8] cluster 輪替起點：ReferenceOpenHashSet 迭代序輪輪相同＋handled≥8 中斷整圈，固定順序
         // 會讓後段 cluster 的餵料／補輸入／重綁永遠輪不到（前段大單每輪優先抽料）——每輪換起點。
@@ -1623,12 +1632,29 @@ public abstract class CraftingServiceSyncMixin {
             if (prev != null && jobNow != prevJob) {
                 long lr = (Long) prev[2];
                 long rounds = (Long) prev[3];
+                boolean wasCanceled = prev.length > 4 && Boolean.TRUE.equals(prev[4]);
                 if ((lr > 0 || rounds > 0) && gtocraftfix$logInfoOk()) {
-                    // [v1.2.1] 死因分流：link 生前已取消＝requester 撤單/卸載棄殺；未取消＝執行器自行完單
-                    boolean wasCanceled = prev.length > 4 && Boolean.TRUE.equals(prev[4]);
+                    // [v1.2.2] 標籤修正：玩家在 CPU 介面取消走 cancel() 直達、不設 link canceled
+                    // 旗標——「未取消」不能斷言執行器自殺
                     LOG.info("[craftfix] 完單快照 out={}：job 消失/更換當下交付帳剩 {}、任務剩 {} 輪（{}）",
                             prev[1], lr, rounds,
-                            wasCanceled ? "link 已取消→撤單棄殺" : "link 未取消→執行器自行完單＝提早完單");
+                            wasCanceled ? "link 已取消→撤單棄殺" : "link 未取消（執行器自行完單或玩家取消）");
+                }
+                // [v1.2.2] 擱淺成品補交付註冊：死時交付帳有欠、成品仍在途、link 未取消
+                // → 成品回流會落網路儲存（job 亡 → CPU insert 回 0）——記下原 link，
+                // 之後由 deliverStranded 從儲存抽出補送 requester（GTO isOrder 預計數殺單案例）。
+                Object plinkRef = prev.length > 5 ? prev[5] : null;
+                Object plink = plinkRef instanceof java.lang.ref.WeakReference<?> wr ? wr.get() : null;
+                long pinf = prev.length > 6 && prev[6] instanceof Long l6 ? l6 : 0L;
+                Object pkey = prev.length > 7 ? prev[7] : null;
+                if (lr > 0 && pinf > 0 && !wasCanceled && pkey instanceof AEKey ak
+                        && plink instanceof appeng.api.networking.crafting.ICraftingLink cl
+                        && !cl.isCanceled() && gtocraftfix$stranded.size() < 32) {
+                    long amount = Math.min(lr, pinf);
+                    gtocraftfix$stranded.add(new Object[] {
+                            new java.lang.ref.WeakReference<>(cl), ak, new long[] { amount },
+                            gtocraftfix$tickCounter });
+                    LOG.info("[craftfix] 擱淺交付註冊 {} x{}（在途成品落網路後補送 requester）", ak, amount);
                 }
             }
             if (jobNow == null) {
@@ -1641,10 +1667,10 @@ public abstract class CraftingServiceSyncMixin {
             long rounds = gtocraftfix$totalTaskRounds(jobNow);
             var fo = logic.getFinalJobOutput();
             String outDesc = fo == null ? "?" : String.valueOf(fo.what());
+            long inflight = fo == null ? 0 : logic.getWaitingFor(fo.what());
             if (prev != null && prevJob == jobNow) {
                 long lr = (Long) prev[2];
                 if (remaining != lr && gtocraftfix$isOrderJob(jobNow) && gtocraftfix$logInfoOk()) {
-                    long inflight = fo == null ? -1 : logic.getWaitingFor(fo.what());
                     LOG.info("[craftfix] 訂單交付帳 {}：remaining {}→{}（在途 {}、任務剩 {} 輪）",
                             outDesc, lr, remaining, inflight, rounds);
                 }
@@ -1657,9 +1683,86 @@ public abstract class CraftingServiceSyncMixin {
                 LOG.warn("[craftfix] link 已取消 out={}：requester 撤單/卸載——GTO 將棄殺整張 job（交付帳剩 {}、任務剩 {} 輪）",
                         outDesc, remaining, rounds);
             }
+            Object linkObj = gtocraftfix$linkObjOf(jobNow); // [v1.2.2] 供死後擱淺補交付
             gtocraftfix$jobTrack.put(cluster, new Object[] {
-                    new java.lang.ref.WeakReference<>(jobNow), outDesc, remaining, rounds, linkDead });
+                    new java.lang.ref.WeakReference<>(jobNow), outDesc, remaining, rounds, linkDead,
+                    linkObj == null ? null : new java.lang.ref.WeakReference<>(linkObj),
+                    inflight, fo == null ? null : fo.what() });
         } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * [v1.2.2] 擱淺成品補交付：GTO isOrder 預計數（remaining−在途≤0 → finishJob(true)）
+     * 在成品尚在途時殺單；成品回流時 job==null → CPU insert 回 0 → 落網路儲存，
+     * requester（訂單機器）永遠收不到、訂單永不記帳。這裡輪詢佇列：成品現身網路
+     * → 抽出走原 link 補送（finishJob 只 markDone 不拆 tie；insert 只擋 canceled）。
+     * link 實收 0（standalone 玩家單無 requester）或逾時 10 分鐘 → 放棄（成品留網路歸玩家）。
+     */
+    private void gtocraftfix$deliverStranded(appeng.api.storage.MEStorage storage) {
+        if (gtocraftfix$stranded.isEmpty()) {
+            return;
+        }
+        var it = gtocraftfix$stranded.iterator();
+        while (it.hasNext()) {
+            Object[] rec = it.next();
+            try {
+                Object lo = ((java.lang.ref.WeakReference<?>) rec[0]).get();
+                var key = (AEKey) rec[1];
+                long[] amt = (long[]) rec[2];
+                int born = (Integer) rec[3];
+                if (lo == null || amt[0] <= 0 || gtocraftfix$tickCounter - born > 12000) {
+                    it.remove();
+                    continue;
+                }
+                if (!(lo instanceof appeng.crafting.CraftingLink link) || link.isCanceled()) {
+                    it.remove(); // insert(AEKey,long,Actionable) 只在具體 CraftingLink 上，介面沒有
+                    continue;
+                }
+                long got = storage.extract(key, amt[0], Actionable.MODULATE, gtocraftfix$STRANDED_SRC);
+                if (got <= 0) {
+                    continue; // 成品還沒回流，下輪再看
+                }
+                long acc = link.insert(key, got, Actionable.MODULATE);
+                if (acc < got) {
+                    storage.insert(key, got - acc, Actionable.MODULATE, gtocraftfix$STRANDED_SRC);
+                }
+                if (acc > 0) {
+                    amt[0] -= acc;
+                    LOG.info("[craftfix] 擱淺交付 {} x{}（job 亡後成品落網路 → 經原 link 補送 requester，餘 {}）",
+                            key, acc, amt[0]);
+                    if (amt[0] <= 0) {
+                        it.remove();
+                    }
+                } else {
+                    it.remove(); // link 無 requester（standalone 玩家單）→ 成品留網路即正確歸宿
+                }
+            } catch (Throwable t) {
+                it.remove();
+                if (gtocraftfix$logErrOk()) {
+                    LOG.error("[craftfix] 擱淺交付例外", t);
+                }
+            }
+        }
+    }
+
+    private static final IActionSource gtocraftfix$STRANDED_SRC = IActionSource.empty();
+
+    /** [v1.2.2] job.link 物件反射直讀；讀不到回 null。 */
+    private static Object gtocraftfix$linkObjOf(Object job) {
+        try {
+            if (gtocraftfix$fLink == null) {
+                if (gtocraftfix$fLinkTried) {
+                    return null;
+                }
+                gtocraftfix$fLinkTried = true;
+                var f = job.getClass().getDeclaredField("link");
+                f.setAccessible(true);
+                gtocraftfix$fLink = f;
+            }
+            return gtocraftfix$fLink.get(job);
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
@@ -1871,9 +1974,11 @@ public abstract class CraftingServiceSyncMixin {
             if (job == null) {
                 return false;
             }
-            if (gtocraftfix$isOrderJob(job)) {
-                // [v1.2.0] 訂單單據＝收據不可替代；CPU 庫存裡的同 tag 單據可能是前單退庫殘留
+            if (gtocraftfix$isOrderJob(job) && gtocraftfix$totalTaskRounds(job) != 0) {
+                // [v1.2.0] 有剩餘任務的訂單 job 不認領：CPU 庫存裡的同 tag 單據可能是前單退庫殘留
                 //（cantStoreItems 案例：探針 held 從開單就躺 10 張），認領＝收據充數偽完單。
+                // [v1.2.2] 零任務（純現貨/全部完工）放行：此時持有單據＝本單交付品，認領＝
+                // 經 link 交給訂單機器記帳——唯一歸還路徑（totalTaskRounds 讀不到回 -1 → 照舊跳過）。
                 return false;
             }
             if (gtocraftfix$fWaitingFor == null) {
@@ -1957,7 +2062,10 @@ public abstract class CraftingServiceSyncMixin {
                 gtocraftfix$fTasks = ft;
             }
             Map<?, ?> tasks = (Map<?, ?>) gtocraftfix$fTasks.get(job);
-            var inv = (appeng.crafting.inv.ListCraftingInventory) gtocraftfix$fInv.get(logic);
+            // [v1.2.2] fInv 改走自帶初始化的 invOf：v1.2.0 起 jobOf() 會先初始化 fJob，
+            // 舊「fJob==null 才順便初始化 fInv」耦合被跳過 → 開機頭 20 秒（探針/餵料還沒
+            // 路過 invOf 前）補輸入整層 NPE（21:08:36 實錄）。
+            var inv = gtocraftfix$invOf(logic);
             if (tasks == null || inv == null || tasks.isEmpty()) {
                 return false;
             }
