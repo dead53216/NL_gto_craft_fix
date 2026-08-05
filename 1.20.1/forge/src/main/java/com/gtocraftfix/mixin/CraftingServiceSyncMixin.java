@@ -138,6 +138,9 @@ public abstract class CraftingServiceSyncMixin {
     private Map<CraftingCPUCluster, Object[]> gtocraftfix$jobTrack = new WeakHashMap<>();
     private static volatile java.lang.reflect.Field gtocraftfix$fRemaining;
     private static volatile boolean gtocraftfix$fRemainingTried;
+    /** [v1.2.1] 配額死鎖計時：cluster（弱鍵）→ {首見 tick, 當時總剩輪}；INSUFFICIENT_PRIORITY
+     *  滯留 ≥30 秒且總輪數零進度才清配額帳（防誤殺暫態）。 */
+    private Map<CraftingCPUCluster, long[]> gtocraftfix$quotaStuck = new WeakHashMap<>();
 
     /**
      * [重檢17] Mixin 實例欄位初始化式不保證併入目標建構子（1.1.8 實測 feedRefused 為 null、
@@ -175,6 +178,9 @@ public abstract class CraftingServiceSyncMixin {
         if (gtocraftfix$jobTrack == null) {
             gtocraftfix$jobTrack = new WeakHashMap<>();
         }
+        if (gtocraftfix$quotaStuck == null) {
+            gtocraftfix$quotaStuck = new WeakHashMap<>();
+        }
     }
 
     // ---- 修正 1：算料同步化（修好終端 ctrl+左鍵多步卡死）----
@@ -190,7 +196,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.2.0：同步算料＋機器源 IgnoreMissing＋保母（訂單單據不代餵）；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.2.1：同步算料＋機器源 IgnoreMissing＋保母＋配額解鎖；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -675,8 +681,10 @@ public abstract class CraftingServiceSyncMixin {
                     String waitStr = waiting.stream().limit(8).map(String::valueOf)
                             .reduce((a, b) -> a + "," + b).orElse("(空)");
                     String results;
+                    Object resultsObj = null; // [v1.2.1] 供任務段按主產物精準撈個別 PushResult（總表會被截斷）
                     try {
                         Object r = logic.getClass().getMethod("getCraftingResults").invoke(logic);
+                        resultsObj = r;
                         results = String.valueOf(r);
                         if (results.length() > 300) {
                             results = results.substring(0, 300) + "…";
@@ -783,6 +791,19 @@ public abstract class CraftingServiceSyncMixin {
                                             }
                                             tb.append(')');
                                         }
+                                    }
+                                    // [v1.2.1] 每任務最後推送結果（INSUFFICIENT_PRIORITY／NOWHERE_TO_PUSH…）
+                                    // identity-keyed multimap，用同一 pattern 實例的主產物 key 才撈得到
+                                    try {
+                                        if (resultsObj != null) {
+                                            @SuppressWarnings("rawtypes")
+                                            var rr = ((com.google.common.collect.SetMultimap) resultsObj)
+                                                    .get(pat0.getPrimaryOutput().what());
+                                            if (rr != null && !rr.isEmpty()) {
+                                                tb.append("結果:").append(rr);
+                                            }
+                                        }
+                                    } catch (Throwable ignored4) {
                                     }
                                     tb.append("; ");
                                 }
@@ -964,6 +985,10 @@ public abstract class CraftingServiceSyncMixin {
                 // 孤兒任務重綁：樣板實例失聯（getProviders 空 → executeCrafting 空轉不留痕、永凍）
                 // → 換綁到同產物＋同輸入簽名、有活供應器的現行樣板
                 acted |= gtocraftfix$rebindOrphanTasks(logic, cluster);
+                // [v1.2.1] 配額解鎖：GTO 配額扣到剛好 0 就把樣板定義整本抹除（purgePatternEverywhere）
+                // → 該樣板剩餘輪次永遠 INSUFFICIENT_PRIORITY（料在手上、只差名額）→ 任務凍死
+                //（探針指紋「有料不推⚠」）。滯留 ≥30 秒且零進度 → 清空 job 配額帳退回原版行為。
+                acted |= gtocraftfix$unlockQuota(logic, cluster);
             } catch (Throwable t) {
                 if (gtocraftfix$logErrOk()) { // [重檢7] 例外計數器獨立
                     LOG.error("[craftfix] 保母例外", t);
@@ -1416,6 +1441,112 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
+    /**
+     * [v1.2.1] 配額死鎖解鎖。GTO executeCrafting 的優先名額（allocations）在
+     * pushPatternSuccess 扣到 newQ<=0 時呼叫 purgePatternEverywhere 把該樣板定義從
+     * 整本配額帳抹除；之後同樣板剩餘輪次過閘時 allocKey==null → 記
+     * INSUFFICIENT_PRIORITY 直接跳過——料明明取出手上（extractPatternInputs 已成功）
+     * 卻永遠不推。配額帳只在 plan 是 AE2 原生 CraftingPlan 時存在（lpcalc／修補包裝計畫
+     * 帳空、天然免疫），所以只有原生計畫踩雷。
+     * 救援：某剩輪任務主產物的最後結果含 INSUFFICIENT_PRIORITY、持續 ≥30 秒且
+     * 全 job 總輪數零進度 → 清空配額帳（名額是優化不是正確性條件，清了＝原版行為）。
+     * 反射全軟失敗。
+     */
+    private boolean gtocraftfix$unlockQuota(appeng.crafting.execution.CraftingCpuLogic logic,
+                                            appeng.me.cluster.implementations.CraftingCPUCluster cluster) {
+        try {
+            Object job = gtocraftfix$jobOf(logic);
+            if (job == null) {
+                gtocraftfix$quotaStuck.remove(cluster);
+                return false;
+            }
+            if (gtocraftfix$fAlloc == null && !gtocraftfix$fAllocTried) {
+                gtocraftfix$fAllocTried = true;
+                try {
+                    var f = job.getClass().getDeclaredField("allocations");
+                    f.setAccessible(true);
+                    gtocraftfix$fAlloc = f;
+                } catch (NoSuchFieldException e) {
+                    gtocraftfix$fAllocMissing = true;
+                }
+            }
+            if (gtocraftfix$fAlloc == null) {
+                return false;
+            }
+            Object allocObj = gtocraftfix$fAlloc.get(job);
+            if (!(allocObj instanceof Map<?, ?> am) || am.isEmpty()) {
+                gtocraftfix$quotaStuck.remove(cluster);
+                return false;
+            }
+            Object resultsObj;
+            try {
+                resultsObj = logic.getClass().getMethod("getCraftingResults").invoke(logic);
+            } catch (Throwable t) {
+                return false;
+            }
+            if (!(resultsObj instanceof com.google.common.collect.SetMultimap)) {
+                return false;
+            }
+            @SuppressWarnings("rawtypes")
+            com.google.common.collect.SetMultimap rm = (com.google.common.collect.SetMultimap) resultsObj;
+            if (gtocraftfix$fTasks == null) {
+                var ft = job.getClass().getDeclaredField("tasks");
+                ft.setAccessible(true);
+                gtocraftfix$fTasks = ft;
+            }
+            Map<?, ?> ts = (Map<?, ?>) gtocraftfix$fTasks.get(job);
+            if (ts == null || ts.isEmpty()) {
+                gtocraftfix$quotaStuck.remove(cluster);
+                return false;
+            }
+            long totalRounds = 0;
+            AEKey stuckOut = null;
+            for (var en : ts.entrySet()) {
+                Object holder = en.getValue();
+                if (gtocraftfix$fHolderVal == null) {
+                    var fv = holder.getClass().getField("value");
+                    fv.setAccessible(true);
+                    gtocraftfix$fHolderVal = fv;
+                }
+                long v = gtocraftfix$fHolderVal.getLong(holder);
+                if (v <= 0) {
+                    continue;
+                }
+                totalRounds += v;
+                var pat = (IPatternDetails) en.getKey();
+                var outK = pat.getPrimaryOutput().what();
+                // 用字串比對避免 compile 期依賴 gtolib 的 PushResult enum
+                if (stuckOut == null && String.valueOf(rm.get(outK)).contains("INSUFFICIENT_PRIORITY")) {
+                    stuckOut = outK;
+                }
+            }
+            if (stuckOut == null) {
+                gtocraftfix$quotaStuck.remove(cluster);
+                return false;
+            }
+            long[] st = gtocraftfix$quotaStuck.get(cluster);
+            if (st == null || st[1] != totalRounds) {
+                // 首見或有進度（總輪數變了）→ 重新計時
+                gtocraftfix$quotaStuck.put(cluster, new long[] { gtocraftfix$tickCounter, totalRounds });
+                return false;
+            }
+            if (gtocraftfix$tickCounter - st[0] < 600) {
+                return false;
+            }
+            int nKeys = am.size();
+            ((Map<?, ?>) am).clear();
+            gtocraftfix$quotaStuck.remove(cluster);
+            LOG.warn("[craftfix] 配額解鎖 {}：INSUFFICIENT_PRIORITY 滯留 {} 秒、零進度 → 清空優先名額帳（{} key，退回原版無名額行為）",
+                    stuckOut, (gtocraftfix$tickCounter - st[0]) / 20, nKeys);
+            return true;
+        } catch (Throwable t) {
+            if (gtocraftfix$logErrOk()) {
+                LOG.error("[craftfix] 配額解鎖例外", t);
+            }
+            return false;
+        }
+    }
+
     /** [v1.2.0] logic.job 反射直讀（懶初始化共用 fJob）；全軟失敗回 null。 */
     private static Object gtocraftfix$jobOf(appeng.crafting.execution.CraftingCpuLogic logic) {
         try {
@@ -1493,8 +1624,11 @@ public abstract class CraftingServiceSyncMixin {
                 long lr = (Long) prev[2];
                 long rounds = (Long) prev[3];
                 if ((lr > 0 || rounds > 0) && gtocraftfix$logInfoOk()) {
-                    LOG.info("[craftfix] 完單快照 out={}：job 消失/更換當下交付帳剩 {}、任務剩 {} 輪（欠帳收工＝提早完單）",
-                            prev[1], lr, rounds);
+                    // [v1.2.1] 死因分流：link 生前已取消＝requester 撤單/卸載棄殺；未取消＝執行器自行完單
+                    boolean wasCanceled = prev.length > 4 && Boolean.TRUE.equals(prev[4]);
+                    LOG.info("[craftfix] 完單快照 out={}：job 消失/更換當下交付帳剩 {}、任務剩 {} 輪（{}）",
+                            prev[1], lr, rounds,
+                            wasCanceled ? "link 已取消→撤單棄殺" : "link 未取消→執行器自行完單＝提早完單");
                 }
             }
             if (jobNow == null) {
@@ -1515,9 +1649,39 @@ public abstract class CraftingServiceSyncMixin {
                             outDesc, lr, remaining, inflight, rounds);
                 }
             }
+            // [v1.2.1] link 取消偵測：requester（訂單機器/接口）撤單當下先警告一次——
+            // GTO 下一 tick 會 cancel 整張 job、剩餘任務全棄（十份剩四份的死因候選）
+            boolean linkDead = gtocraftfix$linkCanceled(jobNow);
+            if (linkDead && !(prev != null && prevJob == jobNow && prev.length > 4
+                    && Boolean.TRUE.equals(prev[4]))) {
+                LOG.warn("[craftfix] link 已取消 out={}：requester 撤單/卸載——GTO 將棄殺整張 job（交付帳剩 {}、任務剩 {} 輪）",
+                        outDesc, remaining, rounds);
+            }
             gtocraftfix$jobTrack.put(cluster, new Object[] {
-                    new java.lang.ref.WeakReference<>(jobNow), outDesc, remaining, rounds });
+                    new java.lang.ref.WeakReference<>(jobNow), outDesc, remaining, rounds, linkDead });
         } catch (Throwable ignored) {
+        }
+    }
+
+    private static volatile java.lang.reflect.Field gtocraftfix$fLink;
+    private static volatile boolean gtocraftfix$fLinkTried;
+
+    /** [v1.2.1] job.link.isCanceled() 反射直讀；讀不到回 false。 */
+    private static boolean gtocraftfix$linkCanceled(Object job) {
+        try {
+            if (gtocraftfix$fLink == null) {
+                if (gtocraftfix$fLinkTried) {
+                    return false;
+                }
+                gtocraftfix$fLinkTried = true;
+                var f = job.getClass().getDeclaredField("link");
+                f.setAccessible(true);
+                gtocraftfix$fLink = f;
+            }
+            Object l = gtocraftfix$fLink.get(job);
+            return l instanceof appeng.api.networking.crafting.ICraftingLink cl && cl.isCanceled();
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 
