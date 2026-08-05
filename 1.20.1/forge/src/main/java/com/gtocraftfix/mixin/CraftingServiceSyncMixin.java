@@ -98,10 +98,10 @@ public abstract class CraftingServiceSyncMixin {
     private static final long gtocraftfix$TOPUP_ROUNDS_CAP =
             Math.max(1L, Long.getLong("gtodiag.lpcalc.topUpRoundsCap", 4096L));
     private int gtocraftfix$tickCounter;
-    private final Set<AEKey> gtocraftfix$noPatternLogged = new HashSet<>();
+    private Set<AEKey> gtocraftfix$noPatternLogged = new HashSet<>();
     /** [重檢14] 成品被 link 拒收的記憶改 per-cluster（cluster 弱鍵 → key → 拒收 tick）；10 分鐘內不再試。
      *  舊版全 grid 共用單一 key 表：A cluster 的死 link 會誤封 B cluster 同成品的救援。 */
-    private final Map<CraftingCPUCluster, HashMap<AEKey, Integer>> gtocraftfix$feedRefused = new WeakHashMap<>();
+    private Map<CraftingCPUCluster, HashMap<AEKey, Integer>> gtocraftfix$feedRefused = new WeakHashMap<>();
     /** 內置原版算料器的背景執行緒池（daemon）。 */
     private static final java.util.concurrent.ExecutorService gtocraftfix$CALC_POOL =
             java.util.concurrent.Executors.newFixedThreadPool(2, r -> {
@@ -123,21 +123,57 @@ public abstract class CraftingServiceSyncMixin {
     private static volatile boolean gtocraftfix$mPendReqTried;
     /** [重檢14] 陳舊等待偵測：cluster（弱鍵，重建即回收——舊 identityHashCode 字串鍵會洩漏＋撞號）→
      *  key → 首見 tick。網內無貨、無剩餘任務消費、滯留逾時才視為陳舊（epoxy 案例）。 */
-    private final Map<CraftingCPUCluster, HashMap<AEKey, Integer>> gtocraftfix$staleWait = new WeakHashMap<>();
+    private Map<CraftingCPUCluster, HashMap<AEKey, Integer>> gtocraftfix$staleWait = new WeakHashMap<>();
     /** [重檢16] 孤兒觀測計時：cluster（弱鍵）→ 樣板 → 首見「無供應器」tick；持續 60 秒才換綁
      *  （供應器 chunk 卸載／節點暫離的暫態 unmount 不該立刻觸發換綁）。 */
-    private final Map<CraftingCPUCluster, HashMap<IPatternDetails, Integer>> gtocraftfix$orphanSince = new WeakHashMap<>();
+    private Map<CraftingCPUCluster, HashMap<IPatternDetails, Integer>> gtocraftfix$orphanSince = new WeakHashMap<>();
     /** [重檢3] 已銷帳成品留庫量：job（弱鍵，完單即隨 GC 歸零）→ 帳已被 GTO insert 銷掉、
      *  物理留在 CPU 庫存待 storeItems 退網的成品數——selfClaimFinal 不得對這部分再燒帳。 */
-    private final Map<Object, long[]> gtocraftfix$claimedFinalHeld = new WeakHashMap<>();
+    private Map<Object, long[]> gtocraftfix$claimedFinalHeld = new WeakHashMap<>();
     /** [重檢14] 成品自我認領計時：cluster（弱鍵）→ 首見滯留 tick（與陳舊等待分表，互不誤清）。 */
-    private final Map<CraftingCPUCluster, Integer> gtocraftfix$finalClaimTick = new WeakHashMap<>();
-    private final Set<String> gtocraftfix$failLogged = new HashSet<>();
+    private Map<CraftingCPUCluster, Integer> gtocraftfix$finalClaimTick = new WeakHashMap<>();
+    private Set<String> gtocraftfix$failLogged = new HashSet<>();
+
+    /**
+     * [重檢17] Mixin 實例欄位初始化式不保證併入目標建構子（1.1.8 實測 feedRefused 為 null、
+     * 保母每輪 NPE 全滅）——所有狀態表進場先過這裡懶初始化，對合併雷免疫。
+     * 只在伺服器執行緒呼叫，無並發問題。
+     */
+    private void gtocraftfix$ensureState() {
+        if (gtocraftfix$noPatternLogged == null) {
+            gtocraftfix$noPatternLogged = new HashSet<>();
+        }
+        if (gtocraftfix$feedRefused == null) {
+            gtocraftfix$feedRefused = new WeakHashMap<>();
+        }
+        if (gtocraftfix$staleWait == null) {
+            gtocraftfix$staleWait = new WeakHashMap<>();
+        }
+        if (gtocraftfix$orphanSince == null) {
+            gtocraftfix$orphanSince = new WeakHashMap<>();
+        }
+        if (gtocraftfix$claimedFinalHeld == null) {
+            gtocraftfix$claimedFinalHeld = new WeakHashMap<>();
+        }
+        if (gtocraftfix$finalClaimTick == null) {
+            gtocraftfix$finalClaimTick = new WeakHashMap<>();
+        }
+        if (gtocraftfix$failLogged == null) {
+            gtocraftfix$failLogged = new HashSet<>();
+        }
+        if (gtocraftfix$staleHeld == null) {
+            gtocraftfix$staleHeld = new WeakHashMap<>();
+        }
+        if (gtocraftfix$censusDone == null) {
+            gtocraftfix$censusDone = java.util.Collections.newSetFromMap(new WeakHashMap<>());
+        }
+    }
 
     // ---- 修正 1：算料同步化（修好終端 ctrl+左鍵多步卡死）----
     @Inject(method = "beginCraftingCalculation", at = @At("HEAD"), cancellable = true, remap = false)
     private void gtocraftfix$syncCalc(Level level, ICraftingSimulationRequester simRequester, AEKey what, long amount,
                                       CalculationStrategy strategy, CallbackInfoReturnable<Future<ICraftingPlan>> cir) {
+        gtocraftfix$ensureState(); // [重檢17]
         if (!gtocraftfix$resolved) {
             synchronized (CraftingServiceSyncMixin.class) {
                 if (!gtocraftfix$resolved) {
@@ -146,7 +182,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.1.8：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.1.9：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -280,6 +316,7 @@ public abstract class CraftingServiceSyncMixin {
     private void gtocraftfix$repairPlan(ICraftingPlan job, ICraftingRequester requestingMachine, ICraftingCPU target,
                                         boolean prioritizePower, IActionSource src,
                                         CallbackInfoReturnable<ICraftingSubmitResult> cir) {
+        gtocraftfix$ensureState(); // [重檢17]
         if (!(job instanceof CraftingPlan plan)) {
             return;
         }
@@ -536,6 +573,7 @@ public abstract class CraftingServiceSyncMixin {
     private void gtocraftfix$diagMachineFail(ICraftingPlan job, ICraftingRequester requestingMachine,
                                              ICraftingCPU target, boolean prioritizePower, IActionSource src,
                                              CallbackInfoReturnable<ICraftingSubmitResult> cir) {
+        gtocraftfix$ensureState(); // [重檢17]
         if (src.player().isPresent()) {
             return;
         }
@@ -612,6 +650,7 @@ public abstract class CraftingServiceSyncMixin {
     // ---- 修正 3：保母（每 5 秒掃孤兒 waitingFor）＋ 診斷探針（每 20 秒）----
     @Inject(method = "onServerEndTick", at = @At("TAIL"), remap = false)
     private void gtocraftfix$tick(MinecraftServer server, CallbackInfo ci) {
+        gtocraftfix$ensureState(); // [重檢17]
         com.gtocraftfix.calc.CalcTicker.tick(); // 內置原版算料器的預算泵（每 tick）
         com.gtocraftfix.lpcalc.LpFallbackQueue.drainOnServerTick(); // LP 晚期回退/影子驗證的伺服器緒建構點（鐵則5/8）
         gtocraftfix$tickCounter++;
@@ -1175,10 +1214,10 @@ public abstract class CraftingServiceSyncMixin {
     }
 
     /** [重檢14] 成品滯留快照：cluster（弱鍵）→ 上次觀察到的 CPU 內成品數量（變動＝有進度，年齡歸零）。 */
-    private final Map<CraftingCPUCluster, Long> gtocraftfix$staleHeld = new WeakHashMap<>();
+    private Map<CraftingCPUCluster, Long> gtocraftfix$staleHeld = new WeakHashMap<>();
 
     /** [重檢14] 欄位普查已做過的 cluster（每場遊戲每 cluster 只倒一次）；弱集合防 cluster 重建洩漏。 */
-    private final Set<CraftingCPUCluster> gtocraftfix$censusDone =
+    private Set<CraftingCPUCluster> gtocraftfix$censusDone =
             java.util.Collections.newSetFromMap(new WeakHashMap<>());
 
     /** 反射倒出物件全類別鏈的實例欄位（名稱=精簡值）；集合印型別(大小)，其餘 toString 截 60 字。 */
