@@ -273,6 +273,19 @@ public final class LpCraftSnapshot {
                 }
                 if (candidates.size() == 1) {
                     resolved = candidates.iterator().next(); // 恰一候選 → 路由與重放都用代入後 key
+                    // [重檢10] 執行器可達性守衛：GTO 執行器（OptimizedCraftingCpuLogic.extractPatternInputs）
+                    // 只精確比對 possibleInputs、未實作 vanilla 的 findFuzzyTemplates 模糊提取——重導向出
+                    // 槽外變體的計畫過得了 audit（重放用 compiled.inKey）卻永遠取不出料 → 回退樹狀版。
+                    boolean reachable = false;
+                    for (var pin : possible) {
+                        if (pin.what().equals(resolved)) {
+                            reachable = true;
+                            break;
+                        }
+                    }
+                    if (!reachable) {
+                        throw new LpFallbackException(FallbackReason.REDIRECT_UNREACHABLE, String.valueOf(resolved));
+                    }
                 } else if (candidates.size() > 1) {
                     ambiguousRedirect = true; // 求解期該樣板 runs>0 才回退（REDIRECT_AMBIGUOUS）
                 }
