@@ -196,7 +196,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.3.0：同步算料＋機器源 IgnoreMissing＋保母＋配額解鎖＋link判死寬限；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.3.1：同步算料＋機器源 IgnoreMissing＋保母＋配額解鎖＋link判死寬限；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -1635,6 +1635,23 @@ public abstract class CraftingServiceSyncMixin {
                 //（IdleState 比 knownAmount，不記交付帳）——死單在途成品回流落 ME 儲存後，
                 // 水位自動反映、requester 自行收斂；經原 link 補送反而炸
                 // "No CraftingLinkState found"（完單/取消當下 LinkState 已轉走）。
+                // [v1.3.1] 手動訂單提前收單提示：GTO isOrder 預計數在單據全數推入機器後即收單
+                //（remaining−在途≤0 → finishJob），終端上 job 消失但單據仍在機器裡做、
+                // 完成後落 ME 儲存——廣播告知玩家，免得看成「下單十份剩四份」重複下單。
+                long pinf = prev.length > 6 && prev[6] instanceof Long l6 ? l6 : 0L;
+                boolean pOrder = prev.length > 8 && Boolean.TRUE.equals(prev[8]);
+                if (pOrder && lr > 0 && pinf > 0 && !wasCanceled) {
+                    var server = grid.getPivot() != null && grid.getPivot().getLevel() != null
+                            ? grid.getPivot().getLevel().getServer()
+                            : null;
+                    if (server != null) {
+                        server.getPlayerList().broadcastSystemMessage(
+                                net.minecraft.network.chat.Component.literal(
+                                        "[合成修復] 訂單提前收單：" + prev[1] + " 尚有 " + Math.min(lr, pinf)
+                                                + " 份在途，機器做完會直接進 ME 儲存（勿重複下單）"),
+                                false);
+                    }
+                }
             }
             if (jobNow == null) {
                 if (prev != null) {
@@ -1662,11 +1679,12 @@ public abstract class CraftingServiceSyncMixin {
                 LOG.warn("[craftfix] link 已取消 out={}：requester 撤單/卸載——GTO 將棄殺整張 job（交付帳剩 {}、任務剩 {} 輪）",
                         outDesc, remaining, rounds);
             }
-            Object linkObj = gtocraftfix$linkObjOf(jobNow); // [v1.2.2] 供死後擱淺補交付
+            Object linkObj = gtocraftfix$linkObjOf(jobNow); // 法醫用
             gtocraftfix$jobTrack.put(cluster, new Object[] {
                     new java.lang.ref.WeakReference<>(jobNow), outDesc, remaining, rounds, linkDead,
                     linkObj == null ? null : new java.lang.ref.WeakReference<>(linkObj),
-                    inflight, fo == null ? null : fo.what() });
+                    inflight, fo == null ? null : fo.what(),
+                    gtocraftfix$isOrderJob(jobNow) }); // [v1.3.1] slot8：死後判訂單用
         } catch (Throwable ignored) {
         }
     }
