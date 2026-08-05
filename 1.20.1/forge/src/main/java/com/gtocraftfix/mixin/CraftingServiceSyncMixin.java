@@ -133,6 +133,11 @@ public abstract class CraftingServiceSyncMixin {
     /** [重檢14] 成品自我認領計時：cluster（弱鍵）→ 首見滯留 tick（與陳舊等待分表，互不誤清）。 */
     private Map<CraftingCPUCluster, Integer> gtocraftfix$finalClaimTick = new WeakHashMap<>();
     private Set<String> gtocraftfix$failLogged = new HashSet<>();
+    /** [v1.2.0] 完單法醫：cluster（弱鍵）→ {job 弱參照, out 描述, 交付帳剩, 任務剩輪}。
+     *  job 消失/更換當下印「完單快照」——十份剩四份類提早完單的死亡瞬間存證。 */
+    private Map<CraftingCPUCluster, Object[]> gtocraftfix$jobTrack = new WeakHashMap<>();
+    private static volatile java.lang.reflect.Field gtocraftfix$fRemaining;
+    private static volatile boolean gtocraftfix$fRemainingTried;
 
     /**
      * [重檢17] Mixin 實例欄位初始化式不保證併入目標建構子（1.1.8 實測 feedRefused 為 null、
@@ -167,6 +172,9 @@ public abstract class CraftingServiceSyncMixin {
         if (gtocraftfix$censusDone == null) {
             gtocraftfix$censusDone = java.util.Collections.newSetFromMap(new WeakHashMap<>());
         }
+        if (gtocraftfix$jobTrack == null) {
+            gtocraftfix$jobTrack = new WeakHashMap<>();
+        }
     }
 
     // ---- 修正 1：算料同步化（修好終端 ctrl+左鍵多步卡死）----
@@ -182,7 +190,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.1.9：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.2.0：同步算料＋機器源 IgnoreMissing＋保母（訂單單據不代餵）；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -767,7 +775,13 @@ public abstract class CraftingServiceSyncMixin {
                                         }
                                         if (worstK != null) {
                                             tb.append("(缺口:").append(worstK).append(' ')
-                                                    .append(worstHave).append('/').append(worstNeed).append(')');
+                                                    .append(worstHave).append('/').append(worstNeed);
+                                            // 輸入齊備＋供應器在列仍留在剩餘任務 → 不是缺料：機器拒收
+                                            //（滿/離線）或配額鎖死（INSUFFICIENT_PRIORITY 指紋）
+                                            if (worstHave >= worstNeed && provN > 0) {
+                                                tb.append(" 有料不推⚠");
+                                            }
+                                            tb.append(')');
                                         }
                                     }
                                     tb.append("; ");
@@ -817,6 +831,9 @@ public abstract class CraftingServiceSyncMixin {
             boolean acted = false;
             try {
                 var logic = cluster.craftingLogic;
+                Object jobNow = gtocraftfix$jobOf(logic);
+                gtocraftfix$trackJob(cluster, logic, jobNow); // [v1.2.0] 完單法醫＋訂單交付帳
+                boolean orderJob = jobNow != null && gtocraftfix$isOrderJob(jobNow);
                 var finalOut = logic.getFinalJobOutput();
                 if (finalOut == null) {
                     continue;
@@ -830,6 +847,13 @@ public abstract class CraftingServiceSyncMixin {
                     }
                     boolean isFinal = key.equals(finalOut.what());
                     if (isFinal) {
+                        // [v1.2.0] 訂單成品（gtocore:order 單據）一律不代餵：玩家單 link 的交付地
+                        // 就是網路儲存——儲存裡「已交付舊單據」與「繞過認領的在途單據」同 key
+                        // 無法區分，餵到舊單據＝收據充數銷 remainingAmount → 實推 4 輪就偽完單
+                        //（下單十份剩四份案例）。訂單鏈認領走機器 ME 回流的正規 insert，不需代餵。
+                        if (orderJob) {
+                            continue;
+                        }
                         // 成品也要餵（成品回流網路但 CPU 沒攔到認領時，唯一救援路徑）；
                         // 拒收記憶改 per-cluster（[重檢14]），10 分鐘內不再試。
                         Integer ru = gtocraftfix$refusedGet(cluster, key);
@@ -1392,6 +1416,111 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
+    /** [v1.2.0] logic.job 反射直讀（懶初始化共用 fJob）；全軟失敗回 null。 */
+    private static Object gtocraftfix$jobOf(appeng.crafting.execution.CraftingCpuLogic logic) {
+        try {
+            if (gtocraftfix$fJob == null) {
+                var fj = logic.getClass().getDeclaredField("job");
+                fj.setAccessible(true);
+                gtocraftfix$fJob = fj;
+            }
+            return gtocraftfix$fJob.get(logic);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /** [v1.2.0] job.remainingAmount（成品交付帳）反射直讀；讀不到回 -1。 */
+    private static long gtocraftfix$remainingOf(Object job) {
+        try {
+            if (gtocraftfix$fRemaining == null) {
+                if (gtocraftfix$fRemainingTried) {
+                    return -1L;
+                }
+                gtocraftfix$fRemainingTried = true;
+                var f = job.getClass().getDeclaredField("remainingAmount");
+                f.setAccessible(true);
+                gtocraftfix$fRemaining = f;
+            }
+            return gtocraftfix$fRemaining.getLong(job);
+        } catch (Throwable ignored) {
+            return -1L;
+        }
+    }
+
+    /** [v1.2.0] 剩餘任務總輪數（Σ tasks 值）；讀不到回 -1。 */
+    private static long gtocraftfix$totalTaskRounds(Object job) {
+        try {
+            if (gtocraftfix$fTasks == null) {
+                var ft = job.getClass().getDeclaredField("tasks");
+                ft.setAccessible(true);
+                gtocraftfix$fTasks = ft;
+            }
+            Map<?, ?> ts = (Map<?, ?>) gtocraftfix$fTasks.get(job);
+            if (ts == null) {
+                return -1L;
+            }
+            long sum = 0;
+            for (var en : ts.entrySet()) {
+                Object holder = en.getValue();
+                if (gtocraftfix$fHolderVal == null) {
+                    var fv = holder.getClass().getField("value");
+                    fv.setAccessible(true);
+                    gtocraftfix$fHolderVal = fv;
+                }
+                long v = gtocraftfix$fHolderVal.getLong(holder);
+                if (v > 0) {
+                    sum += v;
+                }
+            }
+            return sum;
+        } catch (Throwable ignored) {
+            return -1L;
+        }
+    }
+
+    /**
+     * [v1.2.0] 完單法醫＋訂單交付帳：每輪保母記錄 cluster 現任 job 的（交付帳剩、任務剩輪）；
+     * job 消失/更換當下欠帳 >0 就印「完單快照」（提早完單存證），訂單 job 交付帳每次變動
+     * 也印一行——十份剩四份類事件從此死得明明白白。純記錄，不動任何帳。
+     */
+    private void gtocraftfix$trackJob(appeng.me.cluster.implementations.CraftingCPUCluster cluster,
+                                      appeng.crafting.execution.CraftingCpuLogic logic, Object jobNow) {
+        try {
+            Object[] prev = gtocraftfix$jobTrack.get(cluster);
+            Object prevJob = prev == null ? null : ((java.lang.ref.WeakReference<?>) prev[0]).get();
+            if (prev != null && jobNow != prevJob) {
+                long lr = (Long) prev[2];
+                long rounds = (Long) prev[3];
+                if ((lr > 0 || rounds > 0) && gtocraftfix$logInfoOk()) {
+                    LOG.info("[craftfix] 完單快照 out={}：job 消失/更換當下交付帳剩 {}、任務剩 {} 輪（欠帳收工＝提早完單）",
+                            prev[1], lr, rounds);
+                }
+            }
+            if (jobNow == null) {
+                if (prev != null) {
+                    gtocraftfix$jobTrack.remove(cluster);
+                }
+                return;
+            }
+            long remaining = gtocraftfix$remainingOf(jobNow);
+            long rounds = gtocraftfix$totalTaskRounds(jobNow);
+            var fo = logic.getFinalJobOutput();
+            String outDesc = fo == null ? "?" : String.valueOf(fo.what());
+            if (prev != null && prevJob == jobNow) {
+                long lr = (Long) prev[2];
+                if (remaining != lr && gtocraftfix$isOrderJob(jobNow) && gtocraftfix$logInfoOk()) {
+                    long inflight = fo == null ? -1 : logic.getWaitingFor(fo.what());
+                    LOG.info("[craftfix] 訂單交付帳 {}：remaining {}→{}（在途 {}、任務剩 {} 輪）",
+                            outDesc, lr, remaining, inflight, rounds);
+                }
+            }
+            gtocraftfix$jobTrack.put(cluster, new Object[] {
+                    new java.lang.ref.WeakReference<>(jobNow), outDesc, remaining, rounds });
+        } catch (Throwable ignored) {
+        }
+    }
+
     /** [重檢9] job.isOrder 反射直讀（比 registry name 比對穩）；欄位不存在（GTO 改版）回 false 不擋。 */
     private static boolean gtocraftfix$isOrderJob(Object job) {
         try {
@@ -1576,6 +1705,11 @@ public abstract class CraftingServiceSyncMixin {
             }
             Object job = gtocraftfix$fJob.get(logic);
             if (job == null) {
+                return false;
+            }
+            if (gtocraftfix$isOrderJob(job)) {
+                // [v1.2.0] 訂單單據＝收據不可替代；CPU 庫存裡的同 tag 單據可能是前單退庫殘留
+                //（cantStoreItems 案例：探針 held 從開單就躺 10 張），認領＝收據充數偽完單。
                 return false;
             }
             if (gtocraftfix$fWaitingFor == null) {
