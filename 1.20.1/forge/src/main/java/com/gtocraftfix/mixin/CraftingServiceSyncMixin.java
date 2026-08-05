@@ -138,9 +138,13 @@ public abstract class CraftingServiceSyncMixin {
     private Map<CraftingCPUCluster, Object[]> gtocraftfix$jobTrack = new WeakHashMap<>();
     private static volatile java.lang.reflect.Field gtocraftfix$fRemaining;
     private static volatile boolean gtocraftfix$fRemainingTried;
-    /** [v1.2.1] 配額死鎖計時：cluster（弱鍵）→ {首見 tick, 當時總剩輪}；INSUFFICIENT_PRIORITY
-     *  滯留 ≥30 秒且總輪數零進度才清配額帳（防誤殺暫態）。 */
-    private Map<CraftingCPUCluster, long[]> gtocraftfix$quotaStuck = new WeakHashMap<>();
+    /** [v1.2.1] 配額死鎖計時：cluster（弱鍵）→ {job 弱參照, 首見 tick, 當時總剩輪}。
+     *  [重檢18] 加 job 身分（跨 job 殘留計時會讓新單被秒清）；掛號當下先拔掉該 key 的
+     *  INSUFFICIENT_PRIORITY 殘留——活的配額鎖每 tick 會被 GTO 重寫回來、陳舊的不會，
+     *  下輪還在即證明非殘留。 */
+    private Map<CraftingCPUCluster, Object[]> gtocraftfix$quotaStuck = new WeakHashMap<>();
+    /** [重檢18] 訂單提前收單廣播冷卻：cluster（弱鍵）→ 上次廣播 tick（10 分鐘內不重發）。 */
+    private Map<CraftingCPUCluster, Integer> gtocraftfix$orderNoticeTick = new WeakHashMap<>();
 
     /**
      * [重檢17] Mixin 實例欄位初始化式不保證併入目標建構子（1.1.8 實測 feedRefused 為 null、
@@ -181,6 +185,9 @@ public abstract class CraftingServiceSyncMixin {
         if (gtocraftfix$quotaStuck == null) {
             gtocraftfix$quotaStuck = new WeakHashMap<>();
         }
+        if (gtocraftfix$orderNoticeTick == null) {
+            gtocraftfix$orderNoticeTick = new WeakHashMap<>();
+        }
     }
 
     // ---- 修正 1：算料同步化（修好終端 ctrl+左鍵多步卡死）----
@@ -196,7 +203,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.3.1：同步算料＋機器源 IgnoreMissing＋保母＋配額解鎖＋link判死寬限；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.3.2：同步算料＋機器源 IgnoreMissing＋保母＋配額解鎖＋link判死寬限；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -662,7 +669,11 @@ public abstract class CraftingServiceSyncMixin {
     }
 
     // ---- 修正 3：保母（每 5 秒掃孤兒 waitingFor）＋ 診斷探針（每 20 秒）----
-    @Inject(method = "onServerEndTick", at = @At("TAIL"), remap = false)
+    // [重檢18] 掛 HEAD 不掛 TAIL：GTOCore 的 CraftingServiceMixin 在偶數 tick 於
+    // craftingLinks.values() 呼叫前 ci.cancel() 掐斷本方法（節能半頻），TAIL 錨最後一個
+    // RETURN、偶數 tick 永不執行——1.3.1 以前整段（算料泵/保母/探針）實跑半速
+    //（保母 10 秒、探針 40 秒，log 間隔實證）。HEAD 在取消點之前，恢復全速。
+    @Inject(method = "onServerEndTick", at = @At("HEAD"), remap = false)
     private void gtocraftfix$tick(MinecraftServer server, CallbackInfo ci) {
         gtocraftfix$ensureState(); // [重檢17]
         com.gtocraftfix.calc.CalcTicker.tick(); // 內置原版算料器的預算泵（每 tick）
@@ -711,7 +722,7 @@ public abstract class CraftingServiceSyncMixin {
                         held = "n/a";
                     }
                     // 剩餘任務 X 光：主產物×次數＋首輸入「CPU庫存量/每輪需求」——
-                    // 分辨「缺料不推」（庫存<需求）與「有料不推」（庫存≥需求＝執行器死角）
+                    // 分辨「缺料不推」（庫存<需求）與「料齊未推」（庫存≥需求＝執行器死角）
                     String tasksStr = "n/a";
                     try {
                         if (gtocraftfix$fJob == null) {
@@ -756,6 +767,20 @@ public abstract class CraftingServiceSyncMixin {
                                         }
                                     }
                                     tb.append(",prov:").append(provN);
+                                    // [v1.2.1] 每任務最後推送結果字串（identity-keyed multimap，
+                                    // 用同一 pattern 實例的主產物 key 才撈得到）——先取，供⚠佐證用
+                                    String rrStr = null;
+                                    try {
+                                        if (resultsObj != null) {
+                                            @SuppressWarnings("rawtypes")
+                                            var rr = ((com.google.common.collect.SetMultimap) resultsObj)
+                                                    .get(pat0.getPrimaryOutput().what());
+                                            if (rr != null && !rr.isEmpty()) {
+                                                rrStr = String.valueOf(rr);
+                                            }
+                                        }
+                                    } catch (Throwable ignored4) {
+                                    }
                                     // 印「最缺的那格」輸入——executeCrafting 任一格不足即無聲跳過，
                                     // 只看第一格會得到 15/15 的假健康
                                     if (inv0 != null) {
@@ -772,7 +797,12 @@ public abstract class CraftingServiceSyncMixin {
                                             if (need1 <= 0) {
                                                 continue;
                                             }
-                                            long have1 = inv0.list.get(ps[0].what());
+                                            // [重檢18] 含全部替代品加總（對齊 extractPatternInputs 取料語意，
+                                            // 只讀 ps[0] 會把「庫存持替代品」誤報成缺料）
+                                            long have1 = 0;
+                                            for (var p1 : ps) {
+                                                have1 += inv0.list.get(p1.what());
+                                            }
                                             double r = (double) have1 / need1;
                                             if (r < worstR) {
                                                 worstR = r;
@@ -784,26 +814,19 @@ public abstract class CraftingServiceSyncMixin {
                                         if (worstK != null) {
                                             tb.append("(缺口:").append(worstK).append(' ')
                                                     .append(worstHave).append('/').append(worstNeed);
-                                            // 輸入齊備＋供應器在列仍留在剩餘任務 → 不是缺料：機器拒收
-                                            //（滿/離線）或配額鎖死（INSUFFICIENT_PRIORITY 指紋）
-                                            if (worstHave >= worstNeed && provN > 0) {
-                                                tb.append(" 有料不推⚠");
+                                            // [重檢18] ⚠ 需失敗碼佐證：料齊＋供應器在列＋結果集含
+                                            // INSUFFICIENT_PRIORITY／NOWHERE_TO_PUSH 才標——無證據的
+                                            //「機器忙碌中」是常態，舊版對健康任務每輪誤報
+                                            if (worstHave >= worstNeed && provN > 0 && rrStr != null
+                                                    && (rrStr.contains("INSUFFICIENT_PRIORITY")
+                                                            || rrStr.contains("NOWHERE_TO_PUSH"))) {
+                                                tb.append(" 料齊未推⚠");
                                             }
                                             tb.append(')');
                                         }
                                     }
-                                    // [v1.2.1] 每任務最後推送結果（INSUFFICIENT_PRIORITY／NOWHERE_TO_PUSH…）
-                                    // identity-keyed multimap，用同一 pattern 實例的主產物 key 才撈得到
-                                    try {
-                                        if (resultsObj != null) {
-                                            @SuppressWarnings("rawtypes")
-                                            var rr = ((com.google.common.collect.SetMultimap) resultsObj)
-                                                    .get(pat0.getPrimaryOutput().what());
-                                            if (rr != null && !rr.isEmpty()) {
-                                                tb.append("結果:").append(rr);
-                                            }
-                                        }
-                                    } catch (Throwable ignored4) {
+                                    if (rrStr != null) {
+                                        tb.append("結果:").append(rrStr);
                                     }
                                     tb.append("; ");
                                 }
@@ -987,7 +1010,7 @@ public abstract class CraftingServiceSyncMixin {
                 acted |= gtocraftfix$rebindOrphanTasks(logic, cluster);
                 // [v1.2.1] 配額解鎖：GTO 配額扣到剛好 0 就把樣板定義整本抹除（purgePatternEverywhere）
                 // → 該樣板剩餘輪次永遠 INSUFFICIENT_PRIORITY（料在手上、只差名額）→ 任務凍死
-                //（探針指紋「有料不推⚠」）。滯留 ≥30 秒且零進度 → 清空 job 配額帳退回原版行為。
+                //（探針指紋「料齊未推⚠」）。滯留 ≥30 秒且零進度 → 清空 job 配額帳退回原版行為。
                 acted |= gtocraftfix$unlockQuota(logic, cluster);
             } catch (Throwable t) {
                 if (gtocraftfix$logErrOk()) { // [重檢7] 例外計數器獨立
@@ -1524,26 +1547,50 @@ public abstract class CraftingServiceSyncMixin {
                 gtocraftfix$quotaStuck.remove(cluster);
                 return false;
             }
-            long[] st = gtocraftfix$quotaStuck.get(cluster);
-            if (st == null || st[1] != totalRounds) {
-                // 首見或有進度（總輪數變了）→ 重新計時
-                gtocraftfix$quotaStuck.put(cluster, new long[] { gtocraftfix$tickCounter, totalRounds });
+            Object[] st = gtocraftfix$quotaStuck.get(cluster);
+            Object stJob = st == null ? null : ((java.lang.ref.WeakReference<?>) st[0]).get();
+            if (st == null || stJob != job || (Long) st[2] != totalRounds) {
+                // [重檢18] 首見／換單／有進度 → 重新計時；掛號當下把該 key 的 INSUFFICIENT_PRIORITY
+                // 從 craftingResults 拔掉：活的配額鎖每 tick 被 GTO 重寫、下輪必在；陳舊殘留
+                //（忙碌/失聯等不寫結果的停滯路徑不會清舊帳）拔掉就不回來 → 下輪 stuckOut==null 自動解除。
+                gtocraftfix$removeResult(rm, stuckOut, "INSUFFICIENT_PRIORITY");
+                gtocraftfix$quotaStuck.put(cluster, new Object[] {
+                        new java.lang.ref.WeakReference<>(job), (long) gtocraftfix$tickCounter, totalRounds });
                 return false;
             }
-            if (gtocraftfix$tickCounter - st[0] < 600) {
+            if (gtocraftfix$tickCounter - (Long) st[1] < 600) {
                 return false;
             }
             int nKeys = am.size();
             ((Map<?, ?>) am).clear();
             gtocraftfix$quotaStuck.remove(cluster);
             LOG.warn("[craftfix] 配額解鎖 {}：INSUFFICIENT_PRIORITY 滯留 {} 秒、零進度 → 清空優先名額帳（{} key，退回原版無名額行為）",
-                    stuckOut, (gtocraftfix$tickCounter - st[0]) / 20, nKeys);
+                    stuckOut, (gtocraftfix$tickCounter - (Long) st[1]) / 20, nKeys);
             return true;
         } catch (Throwable t) {
             if (gtocraftfix$logErrOk()) {
                 LOG.error("[craftfix] 配額解鎖例外", t);
             }
             return false;
+        }
+    }
+
+    /** [重檢18] 從 craftingResults（raw SetMultimap 活視圖）移除含指定字樣的結果項；全軟失敗。 */
+    @SuppressWarnings({ "rawtypes", "unchecked" })
+    private static void gtocraftfix$removeResult(com.google.common.collect.SetMultimap rm, Object key, String marker) {
+        try {
+            var set = rm.get(key);
+            Object hit = null;
+            for (Object o : set) {
+                if (String.valueOf(o).contains(marker)) {
+                    hit = o;
+                    break;
+                }
+            }
+            if (hit != null) {
+                rm.remove(key, hit);
+            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -1620,36 +1667,50 @@ public abstract class CraftingServiceSyncMixin {
         try {
             Object[] prev = gtocraftfix$jobTrack.get(cluster);
             Object prevJob = prev == null ? null : ((java.lang.ref.WeakReference<?>) prev[0]).get();
-            if (prev != null && jobNow != prevJob) {
+            // [重檢18] prevJob 弱參照被 GC 清掉 ⟺ job 確實換過（prev[0] 恆以非 null job 建構）——
+            // 舊條件 jobNow != prevJob 在「job 死＋GC」時 null==null 誤判沒換單，訃聞/廣播被無聲吞掉
+            if (prev != null && (jobNow != prevJob || prevJob == null)) {
                 long lr = (Long) prev[2];
                 long rounds = (Long) prev[3];
-                boolean wasCanceled = prev.length > 4 && Boolean.TRUE.equals(prev[4]);
+                // [重檢18] 死亡時刻現讀 link 狀態：slot4 取樣滯後最多一輪保母，而取消→job 死亡
+                // 同 tick 完成（GTO 每 tick 檢 isCanceled 即殺）——舊快照對 cancel 死法恆 false。
+                // link 物件受 nexus/CraftingService 強持有，死後仍可靠讀。
+                boolean liveCanceled = prev.length > 4 && Boolean.TRUE.equals(prev[4]);
+                Object lref = prev.length > 5 && prev[5] instanceof java.lang.ref.WeakReference<?> w5
+                        ? w5.get() : null;
+                if (lref instanceof appeng.api.networking.crafting.ICraftingLink lcl) {
+                    liveCanceled = lcl.isCanceled();
+                }
                 if ((lr > 0 || rounds > 0) && gtocraftfix$logInfoOk()) {
-                    // [v1.2.2] 標籤修正：玩家在 CPU 介面取消走 cancel() 直達、不設 link canceled
-                    // 旗標——「未取消」不能斷言執行器自殺
                     LOG.info("[craftfix] 完單快照 out={}：job 消失/更換當下交付帳剩 {}、任務剩 {} 輪（{}）",
                             prev[1], lr, rounds,
-                            wasCanceled ? "link 已取消→撤單棄殺" : "link 未取消（執行器自行完單或玩家取消）");
+                            liveCanceled ? "link 已取消→撤單/玩家取消" : "link 未取消→執行器自行完單");
                 }
-                // [v1.3.0] 擱淺補送層已拔除：merequester 源碼證實 requester 是「網路存量水位制」
-                //（IdleState 比 knownAmount，不記交付帳）——死單在途成品回流落 ME 儲存後，
-                // 水位自動反映、requester 自行收斂；經原 link 補送反而炸
-                // "No CraftingLinkState found"（完單/取消當下 LinkState 已轉走）。
                 // [v1.3.1] 手動訂單提前收單提示：GTO isOrder 預計數在單據全數推入機器後即收單
-                //（remaining−在途≤0 → finishJob），終端上 job 消失但單據仍在機器裡做、
-                // 完成後落 ME 儲存——廣播告知玩家，免得看成「下單十份剩四份」重複下單。
+                //（remaining−在途≤0 → finishJob），終端上 job 消失但單據仍在機器裡做、完成後落
+                // ME 儲存——廣播告知玩家免得重複下單。[重檢18] 取消死法不播（在途未推部分不會補做，
+                // 播「勿重複下單」反而誤導）；per-cluster 10 分鐘冷卻防刷版；用顯示名不用 raw id。
                 long pinf = prev.length > 6 && prev[6] instanceof Long l6 ? l6 : 0L;
                 boolean pOrder = prev.length > 8 && Boolean.TRUE.equals(prev[8]);
-                if (pOrder && lr > 0 && pinf > 0 && !wasCanceled) {
-                    var server = grid.getPivot() != null && grid.getPivot().getLevel() != null
-                            ? grid.getPivot().getLevel().getServer()
-                            : null;
-                    if (server != null) {
-                        server.getPlayerList().broadcastSystemMessage(
-                                net.minecraft.network.chat.Component.literal(
-                                        "[合成修復] 訂單提前收單：" + prev[1] + " 尚有 " + Math.min(lr, pinf)
-                                                + " 份在途，機器做完會直接進 ME 儲存（勿重複下單）"),
-                                false);
+                if (pOrder && lr > 0 && pinf > 0 && !liveCanceled) {
+                    Integer lastNotice = gtocraftfix$orderNoticeTick.get(cluster);
+                    if (lastNotice == null || gtocraftfix$tickCounter - lastNotice >= 12000) {
+                        gtocraftfix$orderNoticeTick.put(cluster, gtocraftfix$tickCounter);
+                        var server = grid.getPivot() != null && grid.getPivot().getLevel() != null
+                                ? grid.getPivot().getLevel().getServer()
+                                : null;
+                        if (server != null) {
+                            var name = prev.length > 7 && prev[7] instanceof AEKey k7
+                                    ? k7.getDisplayName()
+                                    : net.minecraft.network.chat.Component.literal(String.valueOf(prev[1]));
+                            server.getPlayerList().broadcastSystemMessage(
+                                    net.minecraft.network.chat.Component.literal("[合成修復] 訂單提前收單：")
+                                            .append(name)
+                                            .append(net.minecraft.network.chat.Component.literal(
+                                                    " 約 " + Math.min(lr, pinf)
+                                                            + " 份在途，機器做完會直接進 ME 儲存（勿重複下單）")),
+                                    false);
+                        }
                     }
                 }
             }
@@ -1733,12 +1794,13 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
-    /** [重檢9] job.isOrder 反射直讀（比 registry name 比對穩）；欄位不存在（GTO 改版）回 false 不擋。 */
+    /** [重檢9] job.isOrder 反射直讀。[重檢18] 反射失效改走 registry id 後援——三層訂單守衛
+     *  （不代餵/不認領/不清帳）不可被一次反射失敗（fail-open 回 false）無聲全滅。 */
     private static boolean gtocraftfix$isOrderJob(Object job) {
         try {
             if (gtocraftfix$fIsOrder == null) {
                 if (gtocraftfix$fIsOrderTried) {
-                    return false;
+                    return gtocraftfix$isOrderByOutput(job);
                 }
                 gtocraftfix$fIsOrderTried = true;
                 var f = job.getClass().getDeclaredField("isOrder");
@@ -1747,8 +1809,24 @@ public abstract class CraftingServiceSyncMixin {
             }
             return gtocraftfix$fIsOrder.getBoolean(job);
         } catch (Throwable ignored) {
-            return false;
+            return gtocraftfix$isOrderByOutput(job);
         }
+    }
+
+    /** [重檢18] isOrder 後援：finalOutput 的 registry id 比對（gtocore:order／temporary_order）。 */
+    private static boolean gtocraftfix$isOrderByOutput(Object job) {
+        try {
+            var f = job.getClass().getDeclaredField("finalOutput");
+            f.setAccessible(true);
+            Object fo = f.get(job);
+            if (fo instanceof appeng.api.stacks.GenericStack gs
+                    && gs.what() instanceof appeng.api.stacks.AEItemKey ik) {
+                var id = ik.getId().toString();
+                return id.equals("gtocore:order") || id.equals("gtocore:temporary_order");
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
     }
 
     /** [重檢9] OCCL.getPendingRequests(key) 非空＝仍有機器在做；不可用（非 GTO 執行器）回 false。 */
