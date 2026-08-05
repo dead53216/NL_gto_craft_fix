@@ -116,7 +116,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.1.6：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.1.7：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -651,6 +651,14 @@ public abstract class CraftingServiceSyncMixin {
                                     }
                                     var pat0 = (IPatternDetails) en.getKey();
                                     tb.append(pat0.getPrimaryOutput().what()).append('x').append(times);
+                                    // prov:0 = 樣板失聯（供應器清單找不到機器）→ executeCrafting 空轉不留痕
+                                    int provN = 0;
+                                    for (var p0 : ((CraftingService) (Object) this).getProviders(pat0)) {
+                                        if (++provN >= 9) {
+                                            break;
+                                        }
+                                    }
+                                    tb.append(",prov:").append(provN);
                                     // 印「最缺的那格」輸入——executeCrafting 任一格不足即無聲跳過，
                                     // 只看第一格會得到 15/15 的假健康
                                     if (inv0 != null) {
@@ -813,6 +821,9 @@ public abstract class CraftingServiceSyncMixin {
                 if (waiting.isEmpty()) {
                     gtocraftfix$selfClaimFinal(logic, cluster, finalOut);
                 }
+                // 孤兒任務重綁：樣板實例失聯（getProviders 空 → executeCrafting 空轉不留痕、永凍）
+                // → 換綁到同產物＋同輸入簽名、有活供應器的現行樣板
+                gtocraftfix$rebindOrphanTasks(logic);
             } catch (Throwable t) {
                 int c = gtocraftfix$sitterLog.incrementAndGet();
                 if (c <= 5) {
@@ -929,6 +940,104 @@ public abstract class CraftingServiceSyncMixin {
             }
         } catch (Throwable ignored) {
             // 反射不可用 → 靜默略過（下一輪再試）
+        }
+    }
+
+    /**
+     * 孤兒任務重綁：job 的任務綁「算料當下的樣板實例」；樣板事後被重上傳／換機器／供應器
+     * 重整後，新樣板與舊實例對不上 → getProviders(舊實例) 永遠空 → executeCrafting 供應器
+     * 迴圈空轉、料取出又放回、不留任何紀錄（results 空、waiting 空、零進度）。GTO 無重綁機制。
+     * 救援：對供應器數 0 的任務，找同主產物＋同輸入簽名（逐格 key 與量相等）且有活供應器的
+     * 現行樣板，把任務換綁過去；目標樣板已在任務清單 → 併次數。每輪最多 4 筆，反射軟失敗。
+     */
+    private void gtocraftfix$rebindOrphanTasks(appeng.crafting.execution.CraftingCpuLogic logic) {
+        try {
+            if (gtocraftfix$fJob == null) {
+                var fj = logic.getClass().getDeclaredField("job");
+                fj.setAccessible(true);
+                gtocraftfix$fJob = fj;
+            }
+            Object job = gtocraftfix$fJob.get(logic);
+            if (job == null) {
+                return;
+            }
+            if (gtocraftfix$fTasks == null) {
+                var ft = job.getClass().getDeclaredField("tasks");
+                ft.setAccessible(true);
+                gtocraftfix$fTasks = ft;
+            }
+            Map<?, ?> tasks = (Map<?, ?>) gtocraftfix$fTasks.get(job);
+            if (tasks == null || tasks.isEmpty()) {
+                return;
+            }
+            var cs = (CraftingService) (Object) this;
+            java.util.List<Object[]> swaps = new java.util.ArrayList<>();
+            for (var en : tasks.entrySet()) {
+                if (swaps.size() >= 4) {
+                    break;
+                }
+                Object holder = en.getValue();
+                if (gtocraftfix$fHolderVal == null) {
+                    var fv = holder.getClass().getField("value");
+                    fv.setAccessible(true);
+                    gtocraftfix$fHolderVal = fv;
+                }
+                if (gtocraftfix$fHolderVal.getLong(holder) <= 0) {
+                    continue;
+                }
+                var pat = (IPatternDetails) en.getKey();
+                if (cs.getProviders(pat).iterator().hasNext()) {
+                    continue; // 有活供應器 → 不是孤兒
+                }
+                var outK = pat.getPrimaryOutput().what();
+                for (var cand : cs.getCraftingFor(outK)) {
+                    if (cand.equals(pat) || !cand.getPrimaryOutput().what().equals(outK)
+                            || !cs.getProviders(cand).iterator().hasNext()) {
+                        continue;
+                    }
+                    var pi = pat.getInputs();
+                    var ci = cand.getInputs();
+                    if (pi.length != ci.length) {
+                        continue;
+                    }
+                    boolean same = true;
+                    for (int i = 0; i < pi.length; i++) {
+                        var a = pi[i].getPossibleInputs();
+                        var b = ci[i].getPossibleInputs();
+                        if (a.length == 0 || b.length == 0 || !a[0].what().equals(b[0].what())
+                                || a[0].amount() * pi[i].getMultiplier() != b[0].amount() * ci[i].getMultiplier()) {
+                            same = false;
+                            break;
+                        }
+                    }
+                    if (same) {
+                        swaps.add(new Object[]{pat, cand});
+                        break;
+                    }
+                }
+            }
+            for (var sw : swaps) {
+                @SuppressWarnings("unchecked")
+                var tm = (Map<Object, Object>) tasks;
+                Object holder = tm.remove(sw[0]);
+                if (holder == null) {
+                    continue;
+                }
+                long times = gtocraftfix$fHolderVal.getLong(holder);
+                Object existing = tm.get(sw[1]);
+                if (existing != null) {
+                    gtocraftfix$fHolderVal.setLong(existing, gtocraftfix$fHolderVal.getLong(existing) + times);
+                } else {
+                    tm.put(sw[1], holder);
+                }
+                int c = gtocraftfix$sitterLog.incrementAndGet();
+                if (c <= 200) {
+                    LOG.info("[craftfix] 重綁孤兒任務 {} x{}（舊樣板失聯，已換綁現行樣板）",
+                            ((IPatternDetails) sw[0]).getPrimaryOutput().what(), times);
+                }
+            }
+        } catch (Throwable ignored) {
+            // 反射不可用 → 靜默略過
         }
     }
 
