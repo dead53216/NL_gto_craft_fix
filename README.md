@@ -34,7 +34,7 @@
   `gtodiag.lpcalc.snapshotBudgetNanos`（快照期伺服器緒預算，預設 1ms）、
   `gtodiag.lpcalc.solveBudgetNanos`（求解期背景緒預算，預設 100ms）、
   `gtodiag.lpcalc.maxKeys` / `maxPatterns`（閉包規模上限，預設 4096 / 16384）、
-  `gtodiag.lpcalc.topUpRoundsCap`（保母補輸入單次最多補幾輪份量，預設 4096——防長單把網路庫存整鍋吸進單一 CPU）。
+  `gtodiag.lpcalc.topUpRoundsCap`（保母補輸入單次最多補幾輪份量，預設 8192——防長單把網路庫存整鍋吸進單一 CPU）。
 - **CRAFT_LESS 已知次優性（非 bug）**：回傳的可做量 R 可能比理論最大值小
   ≤ `max(c_K/r_K)` 個單位（`c_K` = 批次取整餘數＋SCC 啟動料常數上界）——有界搜尋
   不依賴可行集對 R 單調；每個回傳值都經完整雙序波次重放驗證可執行。

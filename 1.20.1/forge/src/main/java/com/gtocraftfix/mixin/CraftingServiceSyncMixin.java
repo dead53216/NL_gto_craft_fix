@@ -96,7 +96,7 @@ public abstract class CraftingServiceSyncMixin {
     private static volatile long gtocraftfix$logWindow;
     // [重檢1] 補輸入輪數上限（系統屬性可調；沿用已公布的 gtodiag.lpcalc.* 前綴）
     private static final long gtocraftfix$TOPUP_ROUNDS_CAP =
-            Math.max(1L, Long.getLong("gtodiag.lpcalc.topUpRoundsCap", 4096L));
+            Math.max(1L, Long.getLong("gtodiag.lpcalc.topUpRoundsCap", 8192L));
     private int gtocraftfix$tickCounter;
     private Set<AEKey> gtocraftfix$noPatternLogged = new HashSet<>();
     /** [重檢14] 成品被 link 拒收的記憶改 per-cluster（cluster 弱鍵 → key → 拒收 tick）；10 分鐘內不再試。
@@ -203,7 +203,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.3.3：同步算料＋機器源 IgnoreMissing＋保母（成品基線防偽）＋配額解鎖＋link判死寬限；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.3.4：同步算料＋機器源 IgnoreMissing＋保母（基線防偽/預算16/補輸入8192）＋配額解鎖＋link判死寬限；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -862,14 +862,14 @@ public abstract class CraftingServiceSyncMixin {
         }
         var storage = grid.getStorageService().getInventory();
         int handled = 0;
-        // [重檢8] cluster 輪替起點：ReferenceOpenHashSet 迭代序輪輪相同＋handled≥8 中斷整圈，固定順序
+        // [重檢8] cluster 輪替起點：ReferenceOpenHashSet 迭代序輪輪相同＋handled≥16 中斷整圈，固定順序
         // 會讓後段 cluster 的餵料／補輸入／重綁永遠輪不到（前段大單每輪優先抽料）——每輪換起點。
         var clusterList = new java.util.ArrayList<>(craftingCPUClusters);
         int clusterN = clusterList.size();
         int startIdx = clusterN == 0 ? 0 : Math.floorMod(gtocraftfix$tickCounter / 100, clusterN);
         for (int cIdx = 0; cIdx < clusterN; cIdx++) {
             var cluster = clusterList.get((startIdx + cIdx) % clusterN);
-            if (handled >= 8) {
+            if (handled >= 16) {
                 break;
             }
             boolean acted = false;
@@ -886,7 +886,7 @@ public abstract class CraftingServiceSyncMixin {
                 logic.getAllWaitingFor(waiting);
                 int handledBefore = handled;
                 for (var key : waiting) {
-                    if (handled >= 8) {
+                    if (handled >= 16) {
                         break;
                     }
                     boolean isFinal = key.equals(finalOut.what());
@@ -1011,7 +1011,7 @@ public abstract class CraftingServiceSyncMixin {
                 // → 剩餘任務每 tick 取料失敗、無聲凍結。反射讀任務清單，短缺輸入直接從網路補進 CPU 庫存。
                 // v1.1.1：epoxy 案例證明「waiting 非空但無料可餵」的凍結同樣需要補輸入
                 // （陳舊等待擋住視線、真正缺的是任務輸入）→ 本 cluster 這輪餵料掛零時也跑。
-                if ((waiting.isEmpty() || handled == handledBefore) && handled < 8) {
+                if ((waiting.isEmpty() || handled == handledBefore) && handled < 16) {
                     acted |= gtocraftfix$topUpInputs(logic, storage, cluster);
                 }
                 // 陳舊等待解鎖：可證明無用的 waitingFor 帳目才清（無剩餘任務吃、網內無貨、滯留逾時）
