@@ -17,7 +17,7 @@
 | 機器源降量重算 | 大數量請求被 CRAFT_LESS 整張歸 0 → 砍半重算取最大可執行量。**機器源已由 lpcalc 接管（CRAFT_LESS 於 lpcalc 內處理），此段僅玩家路徑殘留、實際不觸發（玩家刻意不降量）** |
 | 無樣板守衛 | 無樣板物品的機器源請求直接擋下（原版語意），聊天室提示 |
 | 真缺料擋單 | 無樣板可補的硬缺口 → 擋下提交防凍結，聊天室點名缺什麼 |
-| 保母（只餵料）| 網路既有庫存不被 waitingFor 認領（GTO 認領只在插入事件觸發）→ 每 5 秒餵入。**訂單 job（`gtocore:order`／臨時訂單）的成品單據不代餵、不自我認領**：玩家單 link 的交付地就是網路儲存，「已交付舊單據」與「在途單據」同 key 無法區分，代餵＝收據充數銷 `remainingAmount` → 實推 4/10 輪就偽完單（下單十份剩四份案例）|
+| 保母（只餵料）| 網路既有庫存不被 waitingFor 認領（GTO 認領只在插入事件觸發）→ 每 5 秒餵入。**訂單 job（`gtocore:order`／臨時訂單）的成品單據不代餵、不自我認領**（收據充數偽完單）。**成品基線防偽（v1.3.3）**：成品只餵「開單後新增」的量（基線＝job 首見時網路存量）——餵到開單前現貨＝拿玩家庫存充產出銷帳：硫酸氫鉀粉實錄 emitable 頂層單 waitingFor 預填 774k、餵現貨→秒完單→requester 重下→再餵，每 40 秒一輪空轉 6 小時零產出（「停住又開始」）；me_pattern_buffer 救援（繞過認領的真產出＝基線之上）不受影響 |
 | 完單法醫 | 保母每輪記錄各 CPU 現任 job 的（交付帳剩、任務剩輪）；job 消失當下欠帳 >0 印「完單快照」並分流死因（`link 已取消→撤單棄殺` vs `link 未取消→執行器自行完單`）、requester 撤單當下即時 WARN、訂單交付帳每次變動印 `訂單交付帳 remaining X→Y`。探針缺口欄加 `料齊未推⚠` 與每任務最後 PushResult（`結果:[INSUFFICIENT_PRIORITY]`…）|
 | 配額解鎖 | GTO 優先名額（allocations）扣到剛好 0 就把樣板定義整本抹除（`purgePatternEverywhere`）→ 該樣板剩餘輪次過閘 `allocKey==null` → 永遠 `INSUFFICIENT_PRIORITY`、料在手上卻不推（料齊未推⚠ 指紋；lpcalc/修補包裝計畫配額帳空、天然免疫，只有 AE2 原生計畫踩雷）。滯留 ≥30 秒且全 job 零進度 → 清空配額帳退回原版行為 |
 | link 判死寬限 | **開機連殺真兇**：AE2 `CraftingLinkNexus.isDead` 兩側 link 任一側缺席（開機載入時序不齊的主路徑）`tickOfDeath++`、門檻 `>60` 即 cancel；兩側都在但 hasCpu/grid 錯配（chunk 邊界/子網重組）`+=60` 連續兩次掃描即死。GTO 大網開機要多 tick 拼 grid → **每次重開世界，進行中 job 幾秒內被 AE2 自己判死**（實錄開機 30 秒連殺 3 job、在途 66 萬 blaze 退回儲存）。修法（`CraftingLinkNexusMixin`）：缺席/錯配一律 +1、拔掉 +=60，門檻 60→1200 次掃描（GTOCore 偶數 tick 掐斷掃描＝半頻，實效 ≈2 分鐘）——真死 link 多掛 ~2 分鐘才回收，誤殺歸零 |

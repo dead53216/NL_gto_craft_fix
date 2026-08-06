@@ -203,7 +203,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.3.2：同步算料＋機器源 IgnoreMissing＋保母＋配額解鎖＋link判死寬限；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.3.3：同步算料＋機器源 IgnoreMissing＋保母（成品基線防偽）＋配額解鎖＋link判死寬限；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -876,7 +876,7 @@ public abstract class CraftingServiceSyncMixin {
             try {
                 var logic = cluster.craftingLogic;
                 Object jobNow = gtocraftfix$jobOf(logic);
-                gtocraftfix$trackJob(cluster, logic, jobNow); // [v1.2.0] 完單法醫＋訂單交付帳
+                gtocraftfix$trackJob(cluster, logic, jobNow, storage); // [v1.2.0] 完單法醫＋訂單交付帳＋[重檢19]成品基線
                 boolean orderJob = jobNow != null && gtocraftfix$isOrderJob(jobNow);
                 var finalOut = logic.getFinalJobOutput();
                 if (finalOut == null) {
@@ -908,6 +908,24 @@ public abstract class CraftingServiceSyncMixin {
                     long want = logic.getWaitingFor(key);
                     if (want <= 0) {
                         continue;
+                    }
+                    if (isFinal) {
+                        // [重檢19] 成品基線防偽：只餵「開單後新增」的量（基線＝本 job 首見時網路存量）。
+                        // 餵到開單前就有的現貨＝把玩家庫存充當產出銷帳——硫酸氫鉀粉實錄：emitable
+                        // 頂層單 waitingFor 預填 774k、零任務，餵現貨→秒完單→requester 重下→再餵，
+                        // 每 40 秒一輪空轉 6 小時、物料網路↔CPU 打轉零產出（「停住又開始」）。
+                        // me_pattern_buffer 救援不受影響：繞過認領的真產出＝開單後新增＝基線之上。
+                        long baseF = gtocraftfix$finalBaseline(cluster);
+                        if (baseF < 0) {
+                            continue; // 基線未知（trackJob 失敗）→ 保守不餵
+                        }
+                        long nowCount = storage.extract(key, Long.MAX_VALUE / 4,
+                                Actionable.SIMULATE, cluster.getSrc());
+                        long surplus = nowCount - baseF;
+                        if (surplus <= 0) {
+                            continue;
+                        }
+                        want = Math.min(want, surplus);
                     }
                     // 只餵料：網路有貨 → 直餵 CPU（補認領缺口）。不代下巢狀單——那會生一堆小任務佔 CPU。
                     long got = storage.extract(key, want, Actionable.MODULATE, cluster.getSrc());
@@ -1575,6 +1593,18 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
+    /** [重檢19] 讀本 cluster 現任 job 的成品基線（trackJob slot9）；未知回 -1。 */
+    private long gtocraftfix$finalBaseline(appeng.me.cluster.implementations.CraftingCPUCluster cluster) {
+        try {
+            Object[] t = gtocraftfix$jobTrack.get(cluster);
+            if (t != null && t.length > 9 && t[9] instanceof Long b) {
+                return b;
+            }
+        } catch (Throwable ignored) {
+        }
+        return -1L;
+    }
+
     /** [重檢18] 從 craftingResults（raw SetMultimap 活視圖）移除含指定字樣的結果項；全軟失敗。 */
     @SuppressWarnings({ "rawtypes", "unchecked" })
     private static void gtocraftfix$removeResult(com.google.common.collect.SetMultimap rm, Object key, String marker) {
@@ -1663,7 +1693,8 @@ public abstract class CraftingServiceSyncMixin {
      * 也印一行——十份剩四份類事件從此死得明明白白。純記錄，不動任何帳。
      */
     private void gtocraftfix$trackJob(appeng.me.cluster.implementations.CraftingCPUCluster cluster,
-                                      appeng.crafting.execution.CraftingCpuLogic logic, Object jobNow) {
+                                      appeng.crafting.execution.CraftingCpuLogic logic, Object jobNow,
+                                      appeng.api.storage.MEStorage storage) {
         try {
             Object[] prev = gtocraftfix$jobTrack.get(cluster);
             Object prevJob = prev == null ? null : ((java.lang.ref.WeakReference<?>) prev[0]).get();
@@ -1741,11 +1772,22 @@ public abstract class CraftingServiceSyncMixin {
                         outDesc, remaining, rounds);
             }
             Object linkObj = gtocraftfix$linkObjOf(jobNow); // 法醫用
+            // [重檢19] slot9 成品基線：本 job 首見時網路已有的成品量——保母餵成品只准餵基線之上
+            // 的新增（防拿既有庫存充產出銷帳）。同 job 沿用首見值，不隨庫存波動。
+            long baseline;
+            if (prev != null && prevJob == jobNow && prev.length > 9 && prev[9] instanceof Long b9) {
+                baseline = b9;
+            } else {
+                baseline = fo == null ? -1L
+                        : storage.extract(fo.what(), Long.MAX_VALUE / 4,
+                                Actionable.SIMULATE, cluster.getSrc());
+            }
             gtocraftfix$jobTrack.put(cluster, new Object[] {
                     new java.lang.ref.WeakReference<>(jobNow), outDesc, remaining, rounds, linkDead,
                     linkObj == null ? null : new java.lang.ref.WeakReference<>(linkObj),
                     inflight, fo == null ? null : fo.what(),
-                    gtocraftfix$isOrderJob(jobNow) }); // [v1.3.1] slot8：死後判訂單用
+                    gtocraftfix$isOrderJob(jobNow), // [v1.3.1] slot8：死後判訂單用
+                    baseline }); // [重檢19] slot9
         } catch (Throwable ignored) {
         }
     }
