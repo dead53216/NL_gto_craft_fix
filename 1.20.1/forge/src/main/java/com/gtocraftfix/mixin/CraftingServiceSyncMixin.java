@@ -61,7 +61,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       無限拒單。正解 = IgnoreMissing：取現有、缺的記 {@code missingIng} → {@code waitingFor}，
  *       回流認領。GTO 只讓「有 player」的來源走該分支 → 包一層 present-once：{@code player()} 首呼
  *       （trySubmitJob 的條件判斷）回 present 走 IgnoreMissing，其後回 empty 用 machine 身分取料。</li>
- *   <li><b>保母（只餵料）</b>（{@code onServerEndTick} 每 5 秒）：job 的 {@code waitingFor} 缺口
+ *   <li><b>保母（只餵料）</b>（{@code onServerEndTick} 每 1 秒）：job 的 {@code waitingFor} 缺口
  *       若網路有現貨（GTO 的認領只在「插入事件」觸發，既有庫存不會被回收），直接搬進 CPU 認領。
  *       不代下巢狀合成單——實測會生出大量小任務佔滿 CPU，反而害玩家下不了單。
  *       缺口若網路無貨（算料器批量餘數幻影，見 ISSUE.md 根因二），需玩家手動下該料的單，
@@ -203,7 +203,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.3.5：同步算料＋機器源 IgnoreMissing＋保母（基線防偽/預算16/補輸入8192）＋配額解鎖＋link判死寬限；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.3.6：同步算料＋機器源 IgnoreMissing＋保母（1秒/總成滿補/基線防偽）＋配額解鎖＋link判死寬限；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -670,7 +670,7 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
-    // ---- 修正 3：保母（每 5 秒掃孤兒 waitingFor）＋ 診斷探針（每 20 秒）----
+    // ---- 修正 3：保母（每 1 秒掃孤兒 waitingFor）＋ 診斷探針（每 20 秒）----
     // [重檢18] 掛 HEAD 不掛 TAIL：GTOCore 的 CraftingServiceMixin 在偶數 tick 於
     // craftingLinks.values() 呼叫前 ci.cancel() 掐斷本方法（節能半頻），TAIL 錨最後一個
     // RETURN、偶數 tick 永不執行——1.3.1 以前整段（算料泵/保母/探針）實跑半速
@@ -859,7 +859,7 @@ public abstract class CraftingServiceSyncMixin {
                 }
             }
         }
-        if (gtocraftfix$tickCounter % 100 != 0) {
+        if (gtocraftfix$tickCounter % 20 != 0) { // [v1.3.6] 保母 5 秒 → 1 秒（補貨太慢）
             return;
         }
         var storage = grid.getStorageService().getInventory();
@@ -868,7 +868,7 @@ public abstract class CraftingServiceSyncMixin {
         // 會讓後段 cluster 的餵料／補輸入／重綁永遠輪不到（前段大單每輪優先抽料）——每輪換起點。
         var clusterList = new java.util.ArrayList<>(craftingCPUClusters);
         int clusterN = clusterList.size();
-        int startIdx = clusterN == 0 ? 0 : Math.floorMod(gtocraftfix$tickCounter / 100, clusterN);
+        int startIdx = clusterN == 0 ? 0 : Math.floorMod(gtocraftfix$tickCounter / 20, clusterN);
         for (int cIdx = 0; cIdx < clusterN; cIdx++) {
             var cluster = clusterList.get((startIdx + cIdx) % clusterN);
             if (handled >= 16) {
@@ -2164,6 +2164,19 @@ public abstract class CraftingServiceSyncMixin {
                     continue;
                 }
                 var pat = (IPatternDetails) en.getKey();
+                // [v1.3.6] 樣板總成（PatternBuffer 系列，無限槽）供應器：一次補滿全部剩餘輪。
+                // cap 原為防「機器塞爆＋CPU 囤料鎖倉」；總成無限空間，塞好塞滿讓執行器
+                // 一次推完反而最快（涵蓋 MEPatternBuffer／Simple／Wildcard／Catalyst／Proxy）。
+                long roundsCap = gtocraftfix$TOPUP_ROUNDS_CAP;
+                try {
+                    for (var prov : ((CraftingService) (Object) this).getProviders(pat)) {
+                        if (prov != null && prov.getClass().getName().contains("PatternBuffer")) {
+                            roundsCap = times;
+                            break;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
                 for (var input : pat.getInputs()) {
                     var poss = input.getPossibleInputs();
                     if (poss.length == 0) {
@@ -2182,10 +2195,10 @@ public abstract class CraftingServiceSyncMixin {
                     // [重檢1] 輪數 cap：need=per×min(times,cap)。舊版 per×times 無上限（溢位還 fallback
                     // Long.MAX/4＝實質抽光全網）：x10M 常備單會把該料全量吸進單一 CPU 鎖到完單，
                     // 其他 CPU／機器全部餓死；job 存續期執行器只取不還，storeItems 只在完單後跑。
-                    // cap 內的量完單時由 storeItems 退回網路，不會遺失；每 100 tick 會再續補。
+                    // cap 內的量完單時由 storeItems 退回網路，不會遺失；每秒會再續補。
                     long need;
                     try {
-                        need = Math.multiplyExact(per, Math.min(times, gtocraftfix$TOPUP_ROUNDS_CAP));
+                        need = Math.multiplyExact(per, Math.min(times, roundsCap));
                     } catch (ArithmeticException e) {
                         need = per; // [重檢1] 溢位保底一輪（初始提料本來就會拿的合法量）
                     }
@@ -2206,7 +2219,7 @@ public abstract class CraftingServiceSyncMixin {
                         fed++;
                         if (gtocraftfix$logInfoOk()) {
                             LOG.info("[craftfix] 保母補輸入 {} x{}（剩餘 {} 輪、cap {}）",
-                                    ik, got, times, gtocraftfix$TOPUP_ROUNDS_CAP);
+                                    ik, got, times, roundsCap == times ? "總成滿補" : roundsCap);
                         }
                     }
                     if (have + got < per) {
