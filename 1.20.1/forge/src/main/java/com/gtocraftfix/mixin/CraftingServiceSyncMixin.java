@@ -203,7 +203,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.3.4：同步算料＋機器源 IgnoreMissing＋保母（基線防偽/預算16/補輸入8192）＋配額解鎖＋link判死寬限；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.3.5：同步算料＋機器源 IgnoreMissing＋保母（基線防偽/預算16/補輸入8192）＋配額解鎖＋link判死寬限；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -394,7 +394,8 @@ public abstract class CraftingServiceSyncMixin {
                 if (needOut > 0) {
                     deficits.add(new Object[] { outKey, needOut, Boolean.TRUE });
                     if (gtocraftfix$logInfoOk()) { // [重檢7] log 分流
-                        LOG.info("[craftfix] 最終產出短缺 {} x{}（out={}）", outKey, needOut, plan.finalOutput());
+                        LOG.info("[craftfix] 最終產出短缺 {} x{}（out={}）",
+                                outKey, gtocraftfix$fmtAmt(outKey, needOut), plan.finalOutput());
                     }
                 }
             }
@@ -450,7 +451,8 @@ public abstract class CraftingServiceSyncMixin {
                         blockSubmit = true; // 真缺料 → 擋下提交（否則 job 必凍）
                     }
                     if (gtocraftfix$logWarnOk()) { // [重檢7] log 分流
-                        LOG.warn("[craftfix] 計畫修補 無樣板可補：{} x{}（out={}）", key, shortAmt, plan.finalOutput());
+                        LOG.warn("[craftfix] 計畫修補 無樣板可補：{} x{}（out={}）",
+                                key, gtocraftfix$fmtAmt(key, shortAmt), plan.finalOutput());
                     }
                     if (gtocraftfix$noPatternLogged.add(key)) {
                         if (gtocraftfix$noPatternLogged.size() > 128) {
@@ -464,7 +466,7 @@ public abstract class CraftingServiceSyncMixin {
                                     net.minecraft.network.chat.Component.literal("[合成修復] 缺料且無樣板可做：")
                                             .append(key.getDisplayName())
                                             .append(net.minecraft.network.chat.Component
-                                                    .literal(" x" + shortAmt + "（合成 "))
+                                                    .literal(" x" + gtocraftfix$fmtAmt(key, shortAmt) + "（合成 "))
                                             .append(plan.finalOutput().what().getDisplayName())
                                             .append(net.minecraft.network.chat.Component.literal(" 需要，請補料或壓樣板）")),
                                     false);
@@ -1593,6 +1595,18 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
+    /** [v1.3.5] 缺料量人話化：液體 mB → B（去尾零）、物品 → 個。 */
+    private static String gtocraftfix$fmtAmt(AEKey key, long amount) {
+        try {
+            if (key instanceof appeng.api.stacks.AEFluidKey) {
+                return new java.math.BigDecimal(amount).movePointLeft(3)
+                        .stripTrailingZeros().toPlainString() + " B";
+            }
+        } catch (Throwable ignored) {
+        }
+        return amount + " 個";
+    }
+
     /** [重檢19] 讀本 cluster 現任 job 的成品基線（trackJob slot9）；未知回 -1。 */
     private long gtocraftfix$finalBaseline(appeng.me.cluster.implementations.CraftingCPUCluster cluster) {
         try {
@@ -2199,7 +2213,8 @@ public abstract class CraftingServiceSyncMixin {
                         // 連一輪都湊不齊且網路已乾 → 執行器會無聲跳過此任務；至少留下可見證據
                         if (gtocraftfix$logWarnOk()) {
                             LOG.warn("[craftfix] 任務缺料 {}：每輪需 {}、CPU 有 {}、網路已乾（{} 任務被無聲跳過）",
-                                    ik, per, have + got, pat.getPrimaryOutput().what());
+                                    ik, gtocraftfix$fmtAmt(ik, per), gtocraftfix$fmtAmt(ik, have + got),
+                                    pat.getPrimaryOutput().what());
                         }
                     }
                 }
