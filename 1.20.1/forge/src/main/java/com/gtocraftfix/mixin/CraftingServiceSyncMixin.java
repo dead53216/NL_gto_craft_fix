@@ -98,9 +98,6 @@ public abstract class CraftingServiceSyncMixin {
     // [重檢1] 補輸入輪數上限（系統屬性可調；沿用已公布的 gtodiag.lpcalc.* 前綴）
     private static final long gtocraftfix$TOPUP_ROUNDS_CAP =
             Math.max(1L, Long.getLong("gtodiag.lpcalc.topUpRoundsCap", 8192L));
-    // [v1.7.0] 最終產物任務在途輪深度（完單時點復原節流；0＝停用回全速）
-    private static final long gtocraftfix$FINAL_INFLIGHT_ROUNDS =
-            Math.max(0L, Long.getLong("gtodiag.lpcalc.finalInflightRounds", 64L));
     private int gtocraftfix$tickCounter;
     private Set<AEKey> gtocraftfix$noPatternLogged = new HashSet<>();
     /** [重檢14] 成品被 link 拒收的記憶改 per-cluster（cluster 弱鍵 → key → 拒收 tick）；10 分鐘內不再試。
@@ -247,8 +244,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.7.0：同步算料＋機器源 IgnoreMissing＋保母（1秒/總成滿補/基線防偽）＋配額解鎖＋link判死寬限＋斷料救援下單＋完單短交監看＋完單時點復原（終品在途{}輪節流）；lpcalc={}。",
-                                gtocraftfix$FINAL_INFLIGHT_ROUNDS,
+                        LOG.info("[craftfix] 已啟用 v1.7.1：同步算料＋機器源 IgnoreMissing＋保母（1秒/總成滿補/基線防偽/paused排除）＋配額解鎖＋link判死寬限＋斷料救援下單＋完單短交監看＋探針PushResult人話化；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -878,6 +874,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (out == null) {
                         continue;
                     }
+                    boolean pausedCpu = gtocraftfix$isPausedCpu(logic); // [v1.7.1]
                     Set<AEKey> waiting = new HashSet<>();
                     logic.getAllWaitingFor(waiting);
                     String waitStr = waiting.stream().limit(8).map(String::valueOf)
@@ -887,7 +884,7 @@ public abstract class CraftingServiceSyncMixin {
                     try {
                         Object r = logic.getClass().getMethod("getCraftingResults").invoke(logic);
                         resultsObj = r;
-                        results = String.valueOf(r);
+                        results = gtocraftfix$zhPush(String.valueOf(r)); // [v1.7.1] PushResult 人話化
                         if (results.length() > 300) {
                             results = results.substring(0, 300) + "…";
                         }
@@ -1005,19 +1002,47 @@ public abstract class CraftingServiceSyncMixin {
                                         if (worstK != null) {
                                             tb.append("(缺口:").append(worstK).append(' ')
                                                     .append(worstHave).append('/').append(worstNeed);
-                                            // [重檢18] ⚠ 需失敗碼佐證：料齊＋供應器在列＋結果集含
-                                            // INSUFFICIENT_PRIORITY／NOWHERE_TO_PUSH 才標——無證據的
-                                            //「機器忙碌中」是常態，舊版對健康任務每輪誤報
-                                            if (worstHave >= worstNeed && provN > 0 && rrStr != null
+                                            // [重檢18] ⚠ 需失敗碼佐證：料齊＋供應器在列＋結果集含負碼。
+                                            // [v1.7.1 覆核修正] 佐證碼只收 INSUFFICIENT_PRIORITY/
+                                            // NOWHERE_TO_PUSH/REJECTED——PATTERN_PROVIDER_LOCKED 是
+                                            // lock-until-result 阻塞流程的常態碼（機器整段加工期都在
+                                            // results 掛著），收進來會重演「健康任務每輪誤報」；
+                                            // REJECTED 落 results 的唯一路徑＝方向快取缺失（真異常）。
+                                            // BREAK 是成功收尾碼「推送完成」，不觸發任何懷疑。
+                                            // 暫停中 CPU 不標（殘留的是暫停前陳年快照）。
+                                            if (!pausedCpu && worstHave >= worstNeed && provN > 0 && rrStr != null
                                                     && (rrStr.contains("INSUFFICIENT_PRIORITY")
-                                                            || rrStr.contains("NOWHERE_TO_PUSH"))) {
+                                                            || rrStr.contains("NOWHERE_TO_PUSH")
+                                                            || rrStr.contains("REJECTED"))) {
                                                 tb.append(" 料齊未推⚠");
+                                                // [v1.7.1] 嘗試溯源：pendingRequests 記「產物 key→供應器
+                                                // GlobalPos」（公開 API getPendingRequests）。語意是
+                                                // 「最近『嘗試過』的供應器（可能失敗/陳舊）」而非實際送達
+                                                // 處——除 PATTERN_DOES_NOT_EXIST 外連失敗嘗試都記，
+                                                // 且只在該 key waitingFor 歸零時整組清除。列前 2 個座標。
+                                                try {
+                                                    Object pend = logic.getClass()
+                                                            .getMethod("getPendingRequests", AEKey.class)
+                                                            .invoke(logic, pat0.getPrimaryOutput().what());
+                                                    if (pend instanceof java.util.Collection<?> pc && !pc.isEmpty()) {
+                                                        tb.append(" 嘗試過:");
+                                                        int pn = 0;
+                                                        for (Object gp : pc) {
+                                                            if (pn++ >= 2) {
+                                                                tb.append('…');
+                                                                break;
+                                                            }
+                                                            tb.append(gp).append(' ');
+                                                        }
+                                                    }
+                                                } catch (Throwable ignored5) {
+                                                }
                                             }
                                             tb.append(')');
                                         }
                                     }
                                     if (rrStr != null) {
-                                        tb.append("結果:").append(rrStr);
+                                        tb.append("結果:").append(gtocraftfix$zhPush(rrStr)); // [v1.7.1] 人話化
                                     }
                                     tb.append("; ");
                                 }
@@ -1026,8 +1051,11 @@ public abstract class CraftingServiceSyncMixin {
                         }
                     } catch (Throwable ignored2) {
                     }
-                    LOG.info("[craftfix] CPU探針 out={} waiting[{}]={} held=[{}] 剩餘任務=[{}] results={}",
-                            out, waiting.size(), waitStr, held, tasksStr, results);
+                    // [v1.7.1 覆核修正] 暫停標記放 out= 之後：行首插字會破壞既有 grep 'CPU探針 out='，
+                    // 暫停中的 CPU 反而從濾出視圖消失（暫停恰是最需要看得到的狀態）
+                    LOG.info("[craftfix] CPU探針 out={}{} waiting[{}]={} held=[{}] 剩餘任務=[{}] results={}",
+                            out, pausedCpu ? "（已暫停）" : "",
+                            waiting.size(), waitStr, held, tasksStr, results);
                     // 欄位普查（每 cluster 一次）：waiting 空＋有剩餘任務＝執行器不推but料在——
                     // 閘門必在 gtolib 私有欄位裡（最可疑：隨存檔保留的在途計數器）。全部倒出來找。
                     if (waiting.isEmpty() && !"n/a".equals(tasksStr) && !"(無)".equals(tasksStr)) {
@@ -1068,6 +1096,19 @@ public abstract class CraftingServiceSyncMixin {
                 var logic = cluster.craftingLogic;
                 Object jobNow = gtocraftfix$jobOf(logic);
                 gtocraftfix$trackJob(cluster, logic, jobNow, storage); // [v1.2.0] 完單法醫＋訂單交付帳＋[重檢19]成品基線
+                if (gtocraftfix$isPausedCpu(logic)) {
+                    // [v1.7.1 覆核修正] 暫停期間各滯留計時表一併清除——否則首見 tick 照牆鐘老化，
+                    // 解除暫停後第一輪「滯留 N 秒」把整段暫停時長算入，斷料廣播/配額解鎖/
+                    // 陳舊等待立即誤觸發（時間門檻的證據力被暫停污染）
+                    gtocraftfix$starveNotice.remove(cluster);
+                    gtocraftfix$quotaStuck.remove(cluster);
+                    gtocraftfix$staleWait.remove(cluster);
+                    gtocraftfix$finalClaimTick.remove(cluster);
+                    gtocraftfix$staleHeld.remove(cluster);
+                    gtocraftfix$orphanSince.remove(cluster);
+                    continue; // 玩家暫停的 CPU（executeCrafting 直接 return 0）：零進度是預期，
+                              // 餵料/自庫認領/補輸入/斷料救援/配額解鎖全部跳過防誤判誤救（法醫照記）
+                }
                 boolean orderJob = jobNow != null && gtocraftfix$isOrderJob(jobNow);
                 var finalOut = logic.getFinalJobOutput();
                 if (finalOut == null) {
@@ -1827,6 +1868,56 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
+    private static volatile Method gtocraftfix$mIsPaused;
+    private static volatile boolean gtocraftfix$mIsPausedTried;
+
+    /** [v1.7.1] CPU 是否被玩家暫停（OptimizedCraftingCpuLogic.isPaused:760-765，隨 NBT 存檔；
+     *  paused 時 executeCrafting 直接 return 0）——零進度是預期而非凍結，保母/救援全要跳過。
+     *  只在 NoSuchMethod 時永久 fail-open（WARN 一次留痕）；其他例外允許下次重試。 */
+    private static boolean gtocraftfix$isPausedCpu(appeng.crafting.execution.CraftingCpuLogic logic) {
+        try {
+            var m = gtocraftfix$mIsPaused;
+            if (m == null) {
+                if (gtocraftfix$mIsPausedTried) {
+                    return false;
+                }
+                try {
+                    m = logic.getClass().getMethod("isPaused");
+                } catch (NoSuchMethodException e) {
+                    gtocraftfix$mIsPausedTried = true;
+                    LOG.warn("[craftfix] isPaused API 不存在（{}）→ 暫停偵測停用（fail-open）",
+                            logic.getClass().getName());
+                    return false;
+                }
+                gtocraftfix$mIsPaused = m;
+            }
+            return Boolean.TRUE.equals(m.invoke(logic));
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** [v1.7.1] PushResult 人話化（GTOCore 原始碼定案：正碼＝成功、負碼＝失敗；BREAK 是
+     *  「推送完成」成功收尾碼，不是機器忙碌）。括號保留原碼供既有 grep 流程延續；
+     *  用 \b 邊界防子串誤傷（底線是 word char，\bBREAK\b 不會命中 BREAK_TASK_LOOP，
+     *  也不會二次替換前一條規則插入的括號原碼）。NOWHERE_TO_PUSH 依 GTO 官方 zh 語意
+     *  ＝機器滿載（忙碌常態）；REJECTED 落進 results 的唯一路徑＝供應器方向快取缺失
+     *  （各面忙碌的 REJECTED 在 provider 迴圈內被折疊成 NOWHERE_TO_PUSH）。 */
+    private static String gtocraftfix$zhPush(String s) {
+        if (s == null) {
+            return null;
+        }
+        return s.replaceAll("\\bBREAK_TASK_LOOP\\b", "本tick推滿(BREAK_TASK_LOOP)")
+                .replaceAll("\\bBREAK\\b", "已派完(BREAK)")
+                .replaceAll("\\bSUCCESS\\b", "推送中(SUCCESS)")
+                .replaceAll("\\bNOWHERE_TO_PUSH\\b", "機器滿載(NOWHERE_TO_PUSH)")
+                .replaceAll("\\bPATTERN_PROVIDER_LOCKED\\b", "供應器鎖定(PATTERN_PROVIDER_LOCKED)")
+                .replaceAll("\\bPATTERN_DOES_NOT_EXIST\\b", "樣板不存在(PATTERN_DOES_NOT_EXIST)")
+                .replaceAll("\\bGRID_NODE_MISSING\\b", "節點離線(GRID_NODE_MISSING)")
+                .replaceAll("\\bREJECTED\\b", "讀不到相鄰機器(REJECTED)")
+                .replaceAll("\\bINSUFFICIENT_PRIORITY\\b", "配額拒推(INSUFFICIENT_PRIORITY)");
+    }
+
     /** [v1.2.0] logic.job 反射直讀（懶初始化共用 fJob）；全軟失敗回 null。 */
     private static Object gtocraftfix$jobOf(appeng.crafting.execution.CraftingCpuLogic logic) {
         try {
@@ -2397,31 +2488,11 @@ public abstract class CraftingServiceSyncMixin {
                     }
                 } catch (Throwable ignored) {
                 }
-                // [v1.7.0] 完單時點復原：1.1.6 補輸入全額化（→1.3.4 吞吐加倍→1.3.6 總成滿補）讓
-                // 最終產物任務的輪次瞬間全數派進機器/總成，GTO「全部派完即 finishJob」→ 開跑
-                // 沒多久就提前收單（1.1.0 小額慢補、派單被產能自然節流時看不到——使用者實證，
-                // 1.2.0「下單十份剩四份」時間點吻合）。只對「主產物＝job 最終產物」的任務節流：
-                // 在途 ≥ P 輪（gtodiag.lpcalc.finalInflightRounds，預設 64）暫停補其輸入，產出
-                // 回流沖帳再續 → 最後一輪派出時帳已幾乎清空，收單≈真完單。中間產物任務不受
-                // 影響（吞吐保持）；訂單 job 與帳面異常（在途輪＞剩餘輪＝waitingFor 預填/髒帳）
-                // 不節流，fail-open 回全速。
-                try {
-                    var finalOut0 = logic.getFinalJobOutput();
-                    if (finalOut0 != null && gtocraftfix$FINAL_INFLIGHT_ROUNDS > 0
-                            && finalOut0.what().equals(pat.getPrimaryOutput().what())
-                            && !gtocraftfix$isOrderJob(job)) {
-                        long batchOut0 = Math.max(1, pat.getPrimaryOutput().amount());
-                        long inflightRounds = logic.getWaitingFor(finalOut0.what()) / batchOut0;
-                        if (inflightRounds <= times) { // 帳面正常才節流
-                            long allowed = gtocraftfix$FINAL_INFLIGHT_ROUNDS - inflightRounds;
-                            if (allowed <= 0) {
-                                continue; // 在途夠深：暫停補此任務輸入（不進缺料/斷料判定，防誤報）
-                            }
-                            roundsCap = Math.min(roundsCap, allowed);
-                        }
-                    }
-                } catch (Throwable ignored) {
-                }
+                // [v1.7.1] v1.7.0 的「完單時點復原」節流已撤：原始碼證實非訂單 job 根本沒有
+                // 「全部派完即 finishJob」路徑（唯一收單點＝insert() 實際交付最終產物打穿
+                // remainingAmount，OptimizedCraftingCpuLogic.java:470-475）——節流改不了收單
+                // 時點，卻會卡住 >64 台並行產線的餵料窗口。「機器還在做就收單」屬訂單收據制
+                //（:134-155，刻意設計）；完單快照的「帳剩 N」多為保母取樣滯後假象。
                 for (var input : pat.getInputs()) {
                     var poss = input.getPossibleInputs();
                     if (poss.length == 0) {
