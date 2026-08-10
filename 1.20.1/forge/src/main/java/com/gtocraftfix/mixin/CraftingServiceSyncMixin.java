@@ -98,6 +98,9 @@ public abstract class CraftingServiceSyncMixin {
     // [重檢1] 補輸入輪數上限（系統屬性可調；沿用已公布的 gtodiag.lpcalc.* 前綴）
     private static final long gtocraftfix$TOPUP_ROUNDS_CAP =
             Math.max(1L, Long.getLong("gtodiag.lpcalc.topUpRoundsCap", 8192L));
+    // [v1.7.0] 最終產物任務在途輪深度（完單時點復原節流；0＝停用回全速）
+    private static final long gtocraftfix$FINAL_INFLIGHT_ROUNDS =
+            Math.max(0L, Long.getLong("gtodiag.lpcalc.finalInflightRounds", 64L));
     private int gtocraftfix$tickCounter;
     private Set<AEKey> gtocraftfix$noPatternLogged = new HashSet<>();
     /** [重檢14] 成品被 link 拒收的記憶改 per-cluster（cluster 弱鍵 → key → 拒收 tick）；10 分鐘內不再試。
@@ -244,7 +247,8 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.6.1：同步算料＋機器源 IgnoreMissing＋保母（1秒/總成滿補/基線防偽）＋配額解鎖＋link判死寬限＋斷料救援下單＋完單短交監看（玩家單/真損失才補）；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.7.0：同步算料＋機器源 IgnoreMissing＋保母（1秒/總成滿補/基線防偽）＋配額解鎖＋link判死寬限＋斷料救援下單＋完單短交監看＋完單時點復原（終品在途{}輪節流）；lpcalc={}。",
+                                gtocraftfix$FINAL_INFLIGHT_ROUNDS,
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -2389,6 +2393,31 @@ public abstract class CraftingServiceSyncMixin {
                         if (prov != null && prov.getClass().getName().contains("PatternBuffer")) {
                             roundsCap = times;
                             break;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                // [v1.7.0] 完單時點復原：1.1.6 補輸入全額化（→1.3.4 吞吐加倍→1.3.6 總成滿補）讓
+                // 最終產物任務的輪次瞬間全數派進機器/總成，GTO「全部派完即 finishJob」→ 開跑
+                // 沒多久就提前收單（1.1.0 小額慢補、派單被產能自然節流時看不到——使用者實證，
+                // 1.2.0「下單十份剩四份」時間點吻合）。只對「主產物＝job 最終產物」的任務節流：
+                // 在途 ≥ P 輪（gtodiag.lpcalc.finalInflightRounds，預設 64）暫停補其輸入，產出
+                // 回流沖帳再續 → 最後一輪派出時帳已幾乎清空，收單≈真完單。中間產物任務不受
+                // 影響（吞吐保持）；訂單 job 與帳面異常（在途輪＞剩餘輪＝waitingFor 預填/髒帳）
+                // 不節流，fail-open 回全速。
+                try {
+                    var finalOut0 = logic.getFinalJobOutput();
+                    if (finalOut0 != null && gtocraftfix$FINAL_INFLIGHT_ROUNDS > 0
+                            && finalOut0.what().equals(pat.getPrimaryOutput().what())
+                            && !gtocraftfix$isOrderJob(job)) {
+                        long batchOut0 = Math.max(1, pat.getPrimaryOutput().amount());
+                        long inflightRounds = logic.getWaitingFor(finalOut0.what()) / batchOut0;
+                        if (inflightRounds <= times) { // 帳面正常才節流
+                            long allowed = gtocraftfix$FINAL_INFLIGHT_ROUNDS - inflightRounds;
+                            if (allowed <= 0) {
+                                continue; // 在途夠深：暫停補此任務輸入（不進缺料/斷料判定，防誤報）
+                            }
+                            roundsCap = Math.min(roundsCap, allowed);
                         }
                     }
                 } catch (Throwable ignored) {
