@@ -145,6 +145,12 @@ public abstract class CraftingServiceSyncMixin {
     private Map<CraftingCPUCluster, Object[]> gtocraftfix$quotaStuck = new WeakHashMap<>();
     /** [重檢18] 訂單提前收單廣播冷卻：cluster（弱鍵）→ 上次廣播 tick（10 分鐘內不重發）。 */
     private Map<CraftingCPUCluster, Integer> gtocraftfix$orderNoticeTick = new WeakHashMap<>();
+    /** [v1.4.0] 跑單斷料廣播：cluster（弱鍵）→ {job 弱參照, 「任務主產物|缺料」→ int[]{首見 tick, 上次廣播 tick}}。
+     *  計時鍵含任務主產物：同一缺料 key 可能同時是 A 任務的硬缺口、B 任務的已滿足輸入，
+     *  只按 key 記會被 B 的清零抹掉 A 的計時。換 job 即重計（[重檢18] 紀律）。 */
+    private Map<CraftingCPUCluster, Object[]> gtocraftfix$starveNotice = new WeakHashMap<>();
+    /** [v1.4.0] 玩家定向訊息節流：uuid|產物|錯誤碼 → 上次發送 ms（3 秒窗防連點；伺服器執行緒單寫）。 */
+    private static Map<String, Long> gtocraftfix$playerNoticeMs = new HashMap<>();
 
     /**
      * [重檢17] Mixin 實例欄位初始化式不保證併入目標建構子（1.1.8 實測 feedRefused 為 null、
@@ -188,6 +194,12 @@ public abstract class CraftingServiceSyncMixin {
         if (gtocraftfix$orderNoticeTick == null) {
             gtocraftfix$orderNoticeTick = new WeakHashMap<>();
         }
+        if (gtocraftfix$starveNotice == null) {
+            gtocraftfix$starveNotice = new WeakHashMap<>();
+        }
+        if (gtocraftfix$playerNoticeMs == null) {
+            gtocraftfix$playerNoticeMs = new HashMap<>();
+        }
     }
 
     // ---- 修正 1：算料同步化（修好終端 ctrl+左鍵多步卡死）----
@@ -203,7 +215,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.3.6：同步算料＋機器源 IgnoreMissing＋保母（1秒/總成滿補/基線防偽）＋配額解鎖＋link判死寬限；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.4.0：同步算料＋機器源 IgnoreMissing＋保母（1秒/總成滿補/基線防偽）＋配額解鎖＋link判死寬限＋斷料/下單聊天提示；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -342,6 +354,9 @@ public abstract class CraftingServiceSyncMixin {
             return;
         }
         boolean blockSubmit = false;
+        // [v1.4.0] 硬缺口收集（key → 合併量），玩家單被擋時定向點名用——刻意不查 noPatternLogged
+        // 全域去重（機器源先踩過的 key 會讓玩家永遠看不到廣播），玩家每次點擊都該有回饋。
+        var hardNoPattern = new java.util.LinkedHashMap<AEKey, Long>();
         try {
             var storage = grid.getStorageService().getInventory();
             var used = plan.usedItems();
@@ -449,6 +464,7 @@ public abstract class CraftingServiceSyncMixin {
                     // 無樣板可補＝真缺料（網路沒貨、也沒有樣板能做）→ log ＋ 聊天室提示玩家補料
                     if (hard) {
                         blockSubmit = true; // 真缺料 → 擋下提交（否則 job 必凍）
+                        hardNoPattern.merge(key, shortAmt, Long::sum); // [v1.4.0] 玩家擋單點名用
                     }
                     if (gtocraftfix$logWarnOk()) { // [重檢7] log 分流
                         LOG.warn("[craftfix] 計畫修補 無樣板可補：{} x{}（out={}）",
@@ -575,8 +591,10 @@ public abstract class CraftingServiceSyncMixin {
             }
         }
         // 真缺料（無樣板可補的硬缺口）→ 擋下提交：提交了必凍。機器每 2 秒重試（聊天室/log 已去重）；
-        // 玩家按確認會沒反應，但聊天室已說明缺什麼。
+        // 玩家單另走定向點名（[v1.4.0]——擋單走 HEAD setReturnValue 短路，RETURN 注入不保證跑到，
+        // 回饋必須在這裡發）。
         if (blockSubmit) {
+            gtocraftfix$notifyPlayerBlocked(plan, src, hardNoPattern);
             cir.setReturnValue(appeng.crafting.execution.CraftingSubmitResult.INCOMPLETE_PLAN);
             return;
         }
@@ -598,6 +616,7 @@ public abstract class CraftingServiceSyncMixin {
                                              CallbackInfoReturnable<ICraftingSubmitResult> cir) {
         gtocraftfix$ensureState(); // [重檢17]
         if (src.player().isPresent()) {
+            gtocraftfix$playerSubmitFeedback(job, src, cir.getReturnValue()); // [v1.4.0] 玩家單不再沉默
             return;
         }
         var r = cir.getReturnValue();
@@ -612,6 +631,137 @@ public abstract class CraftingServiceSyncMixin {
             }
             LOG.warn("[craftfix] 機器源提交失敗 err={} sim={} missing={} out={}",
                     r.errorCode(), job.simulation(), job.missingItems().size(), job.finalOutput());
+        }
+    }
+
+    // ---- [v1.4.0] 玩家下單回饋：缺料/失敗不再沉默 ----
+
+    /** 玩家定向訊息 3 秒窗節流（同 uuid|產物|錯誤碼；手動操作每次點擊都該有回饋，窗刻意短）。 */
+    private static boolean gtocraftfix$playerNoticeOk(String sig) {
+        if (gtocraftfix$playerNoticeMs == null) {
+            gtocraftfix$playerNoticeMs = new HashMap<>();
+        }
+        long now = System.currentTimeMillis();
+        Long last = gtocraftfix$playerNoticeMs.get(sig);
+        if (last != null && now - last < 3000L) {
+            return false;
+        }
+        if (gtocraftfix$playerNoticeMs.size() > 256) {
+            gtocraftfix$playerNoticeMs.clear();
+        }
+        gtocraftfix$playerNoticeMs.put(sig, now);
+        return true;
+    }
+
+    /** 提交錯誤碼人話化（字串比對，免依賴 enum 常數集）。 */
+    private static String gtocraftfix$errZh(Object code) {
+        String c = String.valueOf(code);
+        return switch (c) {
+            case "INCOMPLETE_PLAN" -> "計畫缺料";
+            case "NO_SUITABLE_CPU_FOUND" -> "找不到可用的合成 CPU（全忙或容量不足）";
+            case "NO_CPU_FOUND" -> "網路沒有合成 CPU";
+            case "CPU_BUSY" -> "指定的 CPU 忙碌中";
+            case "CPU_OFFLINE" -> "指定的 CPU 離線";
+            case "CPU_TOO_SMALL" -> "指定的 CPU 容量不足";
+            case "MISSING_INGREDIENT" -> "取料時缺原料";
+            default -> c;
+        };
+    }
+
+    /** 取真人玩家（排除 FakePlayer——機器源 present-once 包裝只活在 @Redirect 內層不會外漏，
+     *  但其他 mod 的 FakePlayer 源可能流入）；非真人回 null。 */
+    private static net.minecraft.server.level.ServerPlayer gtocraftfix$realPlayer(IActionSource src) {
+        var p = src == null ? null : src.player().orElse(null);
+        if (p instanceof net.minecraft.server.level.ServerPlayer sp
+                && !(p instanceof net.minecraftforge.common.util.FakePlayer)) {
+            return sp;
+        }
+        return null;
+    }
+
+    /** 缺料清單 → 「顯示名 x量」前 4 項串接（超出以總項數收尾）。 */
+    private static net.minecraft.network.chat.MutableComponent gtocraftfix$itemList(
+            java.util.List<Map.Entry<AEKey, Long>> entries) {
+        var msg = net.minecraft.network.chat.Component.empty();
+        int shown = 0;
+        for (var e : entries) {
+            if (shown >= 4) {
+                msg.append(net.minecraft.network.chat.Component.literal(" …等共 " + entries.size() + " 項"));
+                break;
+            }
+            if (shown++ > 0) {
+                msg.append(net.minecraft.network.chat.Component.literal("、"));
+            }
+            msg.append(e.getKey().getDisplayName())
+                    .append(net.minecraft.network.chat.Component.literal(
+                            " x" + gtocraftfix$fmtAmt(e.getKey(), e.getValue())));
+        }
+        return msg;
+    }
+
+    /** 真缺料擋單時，若是玩家手動下單 → 定向告知缺什麼（不受 noPatternLogged 全域去重影響）。 */
+    private void gtocraftfix$notifyPlayerBlocked(CraftingPlan plan, IActionSource src,
+                                                 Map<AEKey, Long> hardNoPattern) {
+        try {
+            var sp = gtocraftfix$realPlayer(src);
+            if (sp == null || plan.finalOutput() == null) {
+                return;
+            }
+            if (!gtocraftfix$playerNoticeOk(sp.getUUID() + "|" + plan.finalOutput().what() + "|INCOMPLETE_PLAN")) {
+                return;
+            }
+            var msg = net.minecraft.network.chat.Component.literal("[合成修復] 已擋下你的訂單 ")
+                    .append(plan.finalOutput().what().getDisplayName())
+                    .append(net.minecraft.network.chat.Component.literal("：缺 "));
+            if (hardNoPattern.isEmpty()) {
+                msg.append(net.minecraft.network.chat.Component.literal("料（硬缺口，詳見伺服器紀錄）"));
+            } else {
+                msg.append(gtocraftfix$itemList(new java.util.ArrayList<>(hardNoPattern.entrySet())))
+                        .append(net.minecraft.network.chat.Component.literal("（無樣板可做，請補料或壓樣板後再下單）"));
+            }
+            sp.sendSystemMessage(msg);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 玩家提交結果回饋：失敗說人話原因；成功但帶缺料（修補例外時的罕見放行路徑）也提醒。 */
+    private void gtocraftfix$playerSubmitFeedback(ICraftingPlan job, IActionSource src, ICraftingSubmitResult r) {
+        try {
+            var sp = gtocraftfix$realPlayer(src);
+            if (sp == null || r == null || job == null || job.finalOutput() == null) {
+                return;
+            }
+            var outKey = job.finalOutput().what();
+            var missing = job.missingItems();
+            var entries = new java.util.ArrayList<Map.Entry<AEKey, Long>>();
+            if (missing != null) {
+                for (var e : missing) {
+                    if (e.getLongValue() > 0) {
+                        entries.add(Map.entry(e.getKey(), e.getLongValue()));
+                    }
+                }
+            }
+            if (!r.successful()) {
+                if (!gtocraftfix$playerNoticeOk(sp.getUUID() + "|" + outKey + "|" + r.errorCode())) {
+                    return;
+                }
+                var msg = net.minecraft.network.chat.Component
+                        .literal("[合成修復] 下單失敗（" + gtocraftfix$errZh(r.errorCode()) + "）：")
+                        .append(outKey.getDisplayName());
+                if (!entries.isEmpty()) {
+                    msg.append(net.minecraft.network.chat.Component.literal("，缺 "))
+                            .append(gtocraftfix$itemList(entries));
+                }
+                sp.sendSystemMessage(msg);
+            } else if (!entries.isEmpty()) {
+                if (!gtocraftfix$playerNoticeOk(sp.getUUID() + "|" + outKey + "|ACCEPTED_MISSING")) {
+                    return;
+                }
+                sp.sendSystemMessage(net.minecraft.network.chat.Component.literal("[合成修復] 已接單但缺料：")
+                        .append(gtocraftfix$itemList(entries))
+                        .append(net.minecraft.network.chat.Component.literal("（貨到 ME 後保母會自動餵入續作）")));
+            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -2204,6 +2354,7 @@ public abstract class CraftingServiceSyncMixin {
                     }
                     long have = inv.list.get(ik);
                     if (have >= need) {
+                        gtocraftfix$starveClear(cluster, pat.getPrimaryOutput().what(), ik); // [v1.4.0] 料齊歸零計時
                         continue;
                     }
                     long got = storage.extract(ik, need - have, Actionable.MODULATE, src);
@@ -2229,6 +2380,12 @@ public abstract class CraftingServiceSyncMixin {
                                     ik, gtocraftfix$fmtAmt(ik, per), gtocraftfix$fmtAmt(ik, have + got),
                                     pat.getPrimaryOutput().what());
                         }
+                        // [v1.4.0] 斷料持續 60 秒 → 聊天室點名（液態氦全網斷供實錄：兩張大單靜默凍結，
+                        // log 每秒刷 WARN 玩家全程無感）
+                        gtocraftfix$noteStarve(cluster, logic, job, pat.getPrimaryOutput().what(),
+                                ik, per, have + got);
+                    } else {
+                        gtocraftfix$starveClear(cluster, pat.getPrimaryOutput().what(), ik); // [v1.4.0]
                     }
                 }
             }
@@ -2238,6 +2395,69 @@ public abstract class CraftingServiceSyncMixin {
             }
         }
         return acted;
+    }
+
+    /** [v1.4.0] 跑單斷料聊天室點名：同 job 同（任務主產物|缺料）連續 60 秒「連一輪都湊不齊且
+     *  網路已乾」才首播，之後 10 分鐘冷卻重提醒；換 job／料補齊即重計（[重檢18] 計時綁 job 身分）。
+     *  設計上保母不代下巢狀單（會生出大量小任務佔滿 CPU），斷料的正解就是玩家補料 →
+     *  保母自動餵入解凍——這行廣播是把「該補什麼」從 log 搬到玩家眼前。
+     *  聊天節流獨立於 logWarnOk 額度：log 額度耗盡不得吞聊天提示。 */
+    private void gtocraftfix$noteStarve(appeng.me.cluster.implementations.CraftingCPUCluster cluster,
+                                        appeng.crafting.execution.CraftingCpuLogic logic,
+                                        Object job, AEKey patOut, AEKey ik, long per, long have) {
+        try {
+            Object[] st = gtocraftfix$starveNotice.get(cluster);
+            Object stJob = st == null ? null : ((java.lang.ref.WeakReference<?>) st[0]).get();
+            if (st == null || stJob != job) { // [重檢18] 換單即重計，防跨 job 殘留計時
+                st = new Object[] { new java.lang.ref.WeakReference<>(job), new HashMap<String, int[]>() };
+                gtocraftfix$starveNotice.put(cluster, st);
+            }
+            @SuppressWarnings("unchecked")
+            var m = (HashMap<String, int[]>) st[1];
+            if (m.size() > 64) {
+                m.clear();
+            }
+            var rec = m.computeIfAbsent(patOut + "|" + ik,
+                    k -> new int[] { gtocraftfix$tickCounter, Integer.MIN_VALUE / 2 });
+            int stuck = gtocraftfix$tickCounter - rec[0];
+            if (stuck < 1200 || gtocraftfix$tickCounter - rec[1] < 12000) {
+                return; // 60 秒凍結門檻＋10 分鐘廣播冷卻
+            }
+            rec[1] = gtocraftfix$tickCounter;
+            var server = grid.getPivot() != null && grid.getPivot().getLevel() != null
+                    ? grid.getPivot().getLevel().getServer()
+                    : null;
+            if (server == null) {
+                return;
+            }
+            var fo = logic.getFinalJobOutput();
+            var head = fo != null ? fo.what().getDisplayName()
+                    : net.minecraft.network.chat.Component.literal("(未知產物)");
+            server.getPlayerList().broadcastSystemMessage(
+                    net.minecraft.network.chat.Component.literal("[合成修復] 跑單斷料：合成 ")
+                            .append(head)
+                            .append(net.minecraft.network.chat.Component.literal(
+                                    " 的單已卡 " + (stuck / 20) + " 秒——缺 "))
+                            .append(ik.getDisplayName())
+                            .append(net.minecraft.network.chat.Component.literal(
+                                    "（每輪需 " + gtocraftfix$fmtAmt(ik, per) + "、CPU 只有 "
+                                            + gtocraftfix$fmtAmt(ik, have)
+                                            + "、網路無貨；把料補進 ME 後會自動續作）")),
+                    false);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** [v1.4.0] 料補齊 → 歸零該（任務主產物|缺料）的斷料計時。 */
+    private void gtocraftfix$starveClear(appeng.me.cluster.implementations.CraftingCPUCluster cluster,
+                                         AEKey patOut, AEKey ik) {
+        try {
+            Object[] st = gtocraftfix$starveNotice.get(cluster);
+            if (st != null) {
+                ((Map<?, ?>) st[1]).remove(patOut + "|" + ik);
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     /**
