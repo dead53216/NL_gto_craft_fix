@@ -159,6 +159,12 @@ public abstract class CraftingServiceSyncMixin {
     private Map<AEKey, ICraftingLink> gtocraftfix$rescueActive = new HashMap<>();
     /** [v1.5.0] 斷料救援算料中：{AEKey key, Future&lt;ICraftingPlan&gt;, Long amount}。 */
     private java.util.List<Object[]> gtocraftfix$rescuePending = new java.util.ArrayList<>();
+    /** [v1.6.1] 完單短交監看：{AEKey out, Long 應到未到, Long 已到帳, Long 上次存量, Integer 起始 tick}。
+     *  每 tick 以 cachedInventory 正差分累計到貨；蓋過應到結案、5 分鐘期滿未到的餘額才補產。 */
+    private java.util.List<Object[]> gtocraftfix$shortWatch = new java.util.ArrayList<>();
+    /** [v1.6.1] 玩家單 link 標記（弱鍵，link 回收即忘）：完單短交監看只看玩家單——機器源
+     *  有 requester 水位制自我修復，代補反而重複生產。 */
+    private Map<ICraftingLink, Boolean> gtocraftfix$playerLinks = new WeakHashMap<>();
 
     /**
      * [重檢17] Mixin 實例欄位初始化式不保證併入目標建構子（1.1.8 實測 feedRefused 為 null、
@@ -217,6 +223,12 @@ public abstract class CraftingServiceSyncMixin {
         if (gtocraftfix$rescuePending == null) {
             gtocraftfix$rescuePending = new java.util.ArrayList<>();
         }
+        if (gtocraftfix$shortWatch == null) {
+            gtocraftfix$shortWatch = new java.util.ArrayList<>();
+        }
+        if (gtocraftfix$playerLinks == null) {
+            gtocraftfix$playerLinks = new WeakHashMap<>();
+        }
     }
 
     // ---- 修正 1：算料同步化（修好終端 ctrl+左鍵多步卡死）----
@@ -232,7 +244,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.6.0：同步算料＋機器源 IgnoreMissing＋保母（1秒/總成滿補/基線防偽）＋配額解鎖＋link判死寬限＋斷料救援下單＋完單短交補單；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.6.1：同步算料＋機器源 IgnoreMissing＋保母（1秒/總成滿補/基線防偽）＋配額解鎖＋link判死寬限＋斷料救援下單＋完單短交監看（玩家單/真損失才補）；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -633,6 +645,10 @@ public abstract class CraftingServiceSyncMixin {
                                              CallbackInfoReturnable<ICraftingSubmitResult> cir) {
         gtocraftfix$ensureState(); // [重檢17]
         if (src.player().isPresent()) {
+            var pr = cir.getReturnValue();
+            if (pr != null && pr.successful() && pr.link() != null && gtocraftfix$realPlayer(src) != null) {
+                gtocraftfix$playerLinks.put(pr.link(), Boolean.TRUE); // [v1.6.1] 標記玩家單（短交監看限定）
+            }
             gtocraftfix$playerSubmitFeedback(job, src, cir.getReturnValue()); // [v1.4.0] 玩家單不再沉默
             return;
         }
@@ -849,6 +865,7 @@ public abstract class CraftingServiceSyncMixin {
         com.gtocraftfix.lpcalc.LpFallbackQueue.drainOnServerTick(); // LP 晚期回退/影子驗證的伺服器緒建構點（鐵則5/8）
         gtocraftfix$tickCounter++;
         gtocraftfix$rescueDrain(); // [v1.5.0] 斷料救援：收割算料結果→提交、清理完結的在途 link
+        gtocraftfix$shortWatchTick(); // [v1.6.1] 完單短交監看：累計到貨、期滿補真損失
         if (gtocraftfix$tickCounter % 400 == 0) {
             for (var cluster : craftingCPUClusters) {
                 try {
@@ -1926,38 +1943,34 @@ public abstract class CraftingServiceSyncMixin {
                         }
                     }
                 }
-                // [v1.6.0] 非訂單完單短交自動補單：GTO 執行器預測性收單攔不到（fork 把
-                // CraftingCpuLogic 挖成抽象殼、finishJob 在 gtolib 閉源子類，mixin 無聲失效實證）
-                // → 改從結果端補正：job 消失且 link 未取消、交付帳剩 lr、在途 pinf 會自行落庫，
-                // 淨短交 lr−pinf > 0 ＝玩家實際少拿 → 走救援管線補一張差額頂層單（hssg 兩次
-                // 完單各短交 1568 實錄）。訂單 job 維持 GTO 收據制（每張皆帳未清收單，擋了
-                // 週期訂單全變殭屍）；撤單死法不補（尊重玩家取消）。
-                if (!pOrder && !liveCanceled && lr > 0 && prev.length > 7 && prev[7] instanceof AEKey outK) {
-                    long shortNet = lr - Math.max(0, pinf);
-                    if (shortNet > 0) {
-                        String tail = gtocraftfix$rescueOrder(outK, shortNet);
-                        if (tail.isEmpty()) {
-                            tail = "；補單冷卻中，稍後自動重試";
+                // [v1.6.1] 非訂單完單短交「監看後補」：GTO 執行器預測性收單攔不到（fork 把
+                // CraftingCpuLogic 挖成抽象殼、finishJob 在 gtolib 閉源子類，mixin 無聲失效實證），
+                // 而帳差「多半不是損失」——單據全數推入機器就關帳，成品稍後自行落庫（v1.6.0
+                // 立即補差額＝重複生產，鈦/鎵類完單常態帳剩 55 萬/911 萬會被誤補到爆——使用者
+                // 實測指正）。改為登記監看：帳差視為「應到未到」，5 分鐘內每 tick 累計該產物
+                // 網路到貨（正差分），到帳蓋過帳差即結案；期滿未到的部分才是真損失 → 補產。
+                // 訂單 job 維持 GTO 收據制；撤單死法不看（尊重玩家取消）；同 key 監看中跳過
+                //（寧漏勿重）。
+                if (!pOrder && !liveCanceled && lr > 0 && prev.length > 7 && prev[7] instanceof AEKey outK
+                        && lref instanceof appeng.api.networking.crafting.ICraftingLink plink
+                        && Boolean.TRUE.equals(gtocraftfix$playerLinks.get(plink))) {
+                    // 只看玩家單（機器源有 requester 水位制自我修復，代補反而重複生產）；
+                    // 先扣完單瞬間網路現貨（CPU 抱的成品 storeItems 已退庫、帳早死名存實亡的
+                    // 鎵/鈦類大單帳差在這裡直接歸零）——寧漏勿重。
+                    long s0 = Math.max(0, grid.getStorageService().getCachedInventory().get(outK));
+                    long need = lr - s0;
+                    boolean dup = false;
+                    for (var w : gtocraftfix$shortWatch) {
+                        if (outK.equals(w[0])) {
+                            dup = true;
+                            break;
                         }
-                        var server2 = grid.getPivot() != null && grid.getPivot().getLevel() != null
-                                ? grid.getPivot().getLevel().getServer()
-                                : null;
-                        if (server2 != null) {
-                            server2.getPlayerList().broadcastSystemMessage(
-                                    net.minecraft.network.chat.Component.literal("[合成修復] 完單短交：")
-                                            .append(outK.getDisplayName())
-                                            .append(net.minecraft.network.chat.Component.literal(
-                                                    " 帳差 " + gtocraftfix$fmtAmt(outK, shortNet)
-                                                            + (pinf > 0
-                                                                    ? "（另有 " + gtocraftfix$fmtAmt(outK, pinf)
-                                                                            + " 在途將自行落庫）"
-                                                                    : "")
-                                                            + tail)),
-                                    false);
-                        }
-                        if (gtocraftfix$logWarnOk()) { // [重檢7]
-                            LOG.warn("[craftfix] 完單短交 out={}：帳差 {}、在途 {}{}",
-                                    prev[1], shortNet, pinf, tail);
+                    }
+                    if (need > 0 && !dup && gtocraftfix$shortWatch.size() < 8) {
+                        gtocraftfix$shortWatch.add(new Object[] { outK, need, 0L, s0, gtocraftfix$tickCounter });
+                        if (gtocraftfix$logInfoOk()) {
+                            LOG.info("[craftfix] 完單短交監看 out={}：帳差 {}、現貨已抵 {}、應到 {}（在途取樣 {}）——5 分鐘內到帳即結案",
+                                    prev[1], lr, s0, need, pinf);
                         }
                     }
                 }
@@ -2647,6 +2660,70 @@ public abstract class CraftingServiceSyncMixin {
         } catch (Throwable t) {
             if (gtocraftfix$logErrOk()) { // [重檢7]
                 LOG.error("[craftfix] 斷料救援輪詢例外", t);
+            }
+        }
+    }
+
+    /** [v1.6.1] 完單短交監看泵（每 tick）：GTO 預測性收單（機器還在做就關帳）攔不到也**不該擋**
+     *  ——帳差多半稍後自行落庫。這裡只對「玩家單、扣掉現貨後仍應到未到」的量做 5 分鐘到貨
+     *  監看（cachedInventory 正差分累計，同 tick 進出會互抵→低估到貨→高估損失的方向性誤差
+     *  由現貨抵帳與玩家單限定兜住）；期滿仍未到帳的餘額才視為真損失 → 走救援管線補產。 */
+    private void gtocraftfix$shortWatchTick() {
+        try {
+            if (gtocraftfix$shortWatch.isEmpty()) {
+                return;
+            }
+            var cached = grid.getStorageService().getCachedInventory();
+            var it = gtocraftfix$shortWatch.iterator();
+            while (it.hasNext()) {
+                var w = it.next();
+                var out = (AEKey) w[0];
+                long need = (Long) w[1];
+                long accum = (Long) w[2];
+                long last = (Long) w[3];
+                long now = cached.get(out);
+                if (now > last) {
+                    accum += now - last;
+                }
+                w[2] = accum;
+                w[3] = now;
+                if (accum >= need) {
+                    it.remove();
+                    if (gtocraftfix$logInfoOk()) {
+                        LOG.info("[craftfix] 完單短交監看結案 {}：應到 {} 已全數到帳", out, need);
+                    }
+                    continue;
+                }
+                if (gtocraftfix$tickCounter - (Integer) w[4] < 6000) {
+                    continue; // 監看窗 5 分鐘
+                }
+                it.remove();
+                long loss = need - accum;
+                String tail = gtocraftfix$rescueOrder(out, loss);
+                if (tail.isEmpty()) {
+                    tail = "；補產冷卻中，稍後自動重試";
+                }
+                var server = grid.getPivot() != null && grid.getPivot().getLevel() != null
+                        ? grid.getPivot().getLevel().getServer()
+                        : null;
+                if (server != null) {
+                    server.getPlayerList().broadcastSystemMessage(
+                            net.minecraft.network.chat.Component.literal("[合成修復] 完單短交確認：")
+                                    .append(out.getDisplayName())
+                                    .append(net.minecraft.network.chat.Component.literal(
+                                            " 提前收單後 5 分鐘僅到帳 " + gtocraftfix$fmtAmt(out, accum)
+                                                    + "／應到 " + gtocraftfix$fmtAmt(out, need)
+                                                    + "，實際少 " + gtocraftfix$fmtAmt(out, loss) + tail)),
+                            false);
+                }
+                if (gtocraftfix$logWarnOk()) { // [重檢7]
+                    LOG.warn("[craftfix] 完單短交確認 {}：應到 {}、到帳 {}、真損失 {}{}",
+                            out, need, accum, loss, tail);
+                }
+            }
+        } catch (Throwable t) {
+            if (gtocraftfix$logErrOk()) { // [重檢7]
+                LOG.error("[craftfix] 完單短交監看例外", t);
             }
         }
     }
