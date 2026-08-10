@@ -232,7 +232,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.5.0：同步算料＋機器源 IgnoreMissing＋保母（1秒/總成滿補/基線防偽）＋配額解鎖＋link判死寬限＋斷料聊天提示/自動救援下單；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.6.0：同步算料＋機器源 IgnoreMissing＋保母（1秒/總成滿補/基線防偽）＋配額解鎖＋link判死寬限＋斷料救援下單＋完單短交補單；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -1926,6 +1926,41 @@ public abstract class CraftingServiceSyncMixin {
                         }
                     }
                 }
+                // [v1.6.0] 非訂單完單短交自動補單：GTO 執行器預測性收單攔不到（fork 把
+                // CraftingCpuLogic 挖成抽象殼、finishJob 在 gtolib 閉源子類，mixin 無聲失效實證）
+                // → 改從結果端補正：job 消失且 link 未取消、交付帳剩 lr、在途 pinf 會自行落庫，
+                // 淨短交 lr−pinf > 0 ＝玩家實際少拿 → 走救援管線補一張差額頂層單（hssg 兩次
+                // 完單各短交 1568 實錄）。訂單 job 維持 GTO 收據制（每張皆帳未清收單，擋了
+                // 週期訂單全變殭屍）；撤單死法不補（尊重玩家取消）。
+                if (!pOrder && !liveCanceled && lr > 0 && prev.length > 7 && prev[7] instanceof AEKey outK) {
+                    long shortNet = lr - Math.max(0, pinf);
+                    if (shortNet > 0) {
+                        String tail = gtocraftfix$rescueOrder(outK, shortNet);
+                        if (tail.isEmpty()) {
+                            tail = "；補單冷卻中，稍後自動重試";
+                        }
+                        var server2 = grid.getPivot() != null && grid.getPivot().getLevel() != null
+                                ? grid.getPivot().getLevel().getServer()
+                                : null;
+                        if (server2 != null) {
+                            server2.getPlayerList().broadcastSystemMessage(
+                                    net.minecraft.network.chat.Component.literal("[合成修復] 完單短交：")
+                                            .append(outK.getDisplayName())
+                                            .append(net.minecraft.network.chat.Component.literal(
+                                                    " 帳差 " + gtocraftfix$fmtAmt(outK, shortNet)
+                                                            + (pinf > 0
+                                                                    ? "（另有 " + gtocraftfix$fmtAmt(outK, pinf)
+                                                                            + " 在途將自行落庫）"
+                                                                    : "")
+                                                            + tail)),
+                                    false);
+                        }
+                        if (gtocraftfix$logWarnOk()) { // [重檢7]
+                            LOG.warn("[craftfix] 完單短交 out={}：帳差 {}、在途 {}{}",
+                                    prev[1], shortNet, pinf, tail);
+                        }
+                    }
+                }
             }
             if (jobNow == null) {
                 if (prev != null) {
@@ -2485,13 +2520,33 @@ public abstract class CraftingServiceSyncMixin {
             if (fo != null && gtocraftfix$rescueActive.containsKey(fo.what())) {
                 return "；此單本身是救援單，不再自動加開，請手動處理上游缺料";
             }
+            long amount;
+            try {
+                amount = Math.multiplyExact(per, Math.max(1L, times));
+            } catch (ArithmeticException e) {
+                amount = per * 8192; // 溢位保底：先補一批，完單後冷卻過再續
+            }
+            return gtocraftfix$rescueOrder(ik, amount);
+        } catch (Throwable t) {
+            if (gtocraftfix$logErrOk()) { // [重檢7]
+                LOG.error("[craftfix] 斷料救援開算例外", t);
+            }
+            return "";
+        }
+    }
+
+    /** [v1.6.0] 救援下單核心（斷料救援與完單短交補單共用）：在途/算料中去重 → per-key 冷卻 →
+     *  上限 4 → 無樣板不代下（原版語意）→ 開算掛 pending（rescueDrain 收割提交）。
+     *  @return 聊天訊息尾註（空字串＝冷卻中無可報） */
+    private String gtocraftfix$rescueOrder(AEKey ik, long amount) {
+        try {
             // 在途救援單還活著 → 等它做完
             var live = gtocraftfix$rescueActive.get(ik);
             if (live != null && !live.isDone() && !live.isCanceled()) {
                 return "；補產救援單已在途";
             }
             gtocraftfix$rescueActive.remove(ik);
-            // 算料中也算在途（防 60 秒門檻與慢算料重疊時重複開單）
+            // 算料中也算在途（防觸發點與慢算料重疊時重複開單）
             for (var p : gtocraftfix$rescuePending) {
                 if (ik.equals(p[0])) {
                     return "；補產救援單算料中";
@@ -2511,12 +2566,6 @@ public abstract class CraftingServiceSyncMixin {
             if (pivot == null || pivot.getLevel() == null) {
                 return "";
             }
-            long amount;
-            try {
-                amount = Math.multiplyExact(per, Math.max(1L, times));
-            } catch (ArithmeticException e) {
-                amount = per * 8192; // 溢位保底：先補一批，完單後冷卻過再續
-            }
             if (gtocraftfix$rescueTried.size() > 64) {
                 gtocraftfix$rescueTried.clear();
             }
@@ -2526,13 +2575,12 @@ public abstract class CraftingServiceSyncMixin {
                     CalculationStrategy.REPORT_MISSING_ITEMS);
             gtocraftfix$rescuePending.add(new Object[] { ik, fut, amount });
             if (gtocraftfix$logInfoOk()) {
-                LOG.info("[craftfix] 斷料救援開算 {} x{}（每輪 {} × 剩 {} 輪）",
-                        ik, gtocraftfix$fmtAmt(ik, amount), per, times);
+                LOG.info("[craftfix] 救援開算 {} x{}", ik, gtocraftfix$fmtAmt(ik, amount));
             }
             return "；已啟動自動補產 x" + gtocraftfix$fmtAmt(ik, amount) + "（算料中）";
         } catch (Throwable t) {
             if (gtocraftfix$logErrOk()) { // [重檢7]
-                LOG.error("[craftfix] 斷料救援開算例外", t);
+                LOG.error("[craftfix] 救援開算例外", t);
             }
             return "";
         }
