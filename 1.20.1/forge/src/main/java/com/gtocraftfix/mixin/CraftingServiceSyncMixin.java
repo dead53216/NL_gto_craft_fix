@@ -152,13 +152,6 @@ public abstract class CraftingServiceSyncMixin {
     private Map<CraftingCPUCluster, Object[]> gtocraftfix$starveNotice = new WeakHashMap<>();
     /** [v1.4.0] 玩家定向訊息節流：uuid|產物|錯誤碼 → 上次發送 ms（3 秒窗防連點；伺服器執行緒單寫）。 */
     private static Map<String, Long> gtocraftfix$playerNoticeMs = new HashMap<>();
-    /** [v1.5.0] 斷料救援嘗試冷卻：key → int[]{嘗試 tick, 冷卻長度}（下單成功 10 分鐘、其餘 2 分鐘）。 */
-    private Map<AEKey, int[]> gtocraftfix$rescueTried = new HashMap<>();
-    /** [v1.5.0] 斷料救援在途單：key → link（done/canceled 每 tick 清理；亦作深度 1 判定—
-     *  救援單自己斷料不再往下開，防連鎖風暴）。 */
-    private Map<AEKey, ICraftingLink> gtocraftfix$rescueActive = new HashMap<>();
-    /** [v1.5.0] 斷料救援算料中：{AEKey key, Future&lt;ICraftingPlan&gt;, Long amount}。 */
-    private java.util.List<Object[]> gtocraftfix$rescuePending = new java.util.ArrayList<>();
     /** [v1.6.1] 完單短交監看：{AEKey out, Long 應到未到, Long 已到帳, Long 上次存量, Integer 起始 tick}。
      *  每 tick 以 cachedInventory 正差分累計到貨；蓋過應到結案、5 分鐘期滿未到的餘額才補產。 */
     private java.util.List<Object[]> gtocraftfix$shortWatch = new java.util.ArrayList<>();
@@ -214,15 +207,6 @@ public abstract class CraftingServiceSyncMixin {
         if (gtocraftfix$playerNoticeMs == null) {
             gtocraftfix$playerNoticeMs = new HashMap<>();
         }
-        if (gtocraftfix$rescueTried == null) {
-            gtocraftfix$rescueTried = new HashMap<>();
-        }
-        if (gtocraftfix$rescueActive == null) {
-            gtocraftfix$rescueActive = new HashMap<>();
-        }
-        if (gtocraftfix$rescuePending == null) {
-            gtocraftfix$rescuePending = new java.util.ArrayList<>();
-        }
         if (gtocraftfix$shortWatch == null) {
             gtocraftfix$shortWatch = new java.util.ArrayList<>();
         }
@@ -244,7 +228,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.7.1：同步算料＋機器源 IgnoreMissing＋保母（1秒/總成滿補/基線防偽/paused排除）＋配額解鎖＋link判死寬限＋斷料救援下單＋完單短交監看＋探針PushResult人話化；lpcalc={}。",
+                        LOG.info("[craftfix] 已啟用 v1.8.0：同步算料＋機器源 IgnoreMissing＋保母（1秒/總成滿補/基線防偽/paused排除）＋配額解鎖＋link判死寬限＋斷料整併點名（不自動補單）＋完單短交通知＋探針PushResult人話化；lpcalc={}。",
                                 com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
@@ -864,8 +848,7 @@ public abstract class CraftingServiceSyncMixin {
         com.gtocraftfix.calc.CalcTicker.tick(); // 內置原版算料器的預算泵（每 tick）
         com.gtocraftfix.lpcalc.LpFallbackQueue.drainOnServerTick(); // LP 晚期回退/影子驗證的伺服器緒建構點（鐵則5/8）
         gtocraftfix$tickCounter++;
-        gtocraftfix$rescueDrain(); // [v1.5.0] 斷料救援：收割算料結果→提交、清理完結的在途 link
-        gtocraftfix$shortWatchTick(); // [v1.6.1] 完單短交監看：累計到貨、期滿補真損失
+        gtocraftfix$shortWatchTick(); // [v1.6.1] 完單短交監看：累計到貨、期滿通知真損失（v1.8.0 不代補）
         if (gtocraftfix$tickCounter % 400 == 0) {
             for (var cluster : craftingCPUClusters) {
                 try {
@@ -2460,6 +2443,7 @@ public abstract class CraftingServiceSyncMixin {
                 return false;
             }
             int fed = 0;
+            var starveDue = new java.util.ArrayList<Object[]>(); // [v1.8.0] 斷料條目收集（整併廣播用）
             for (var en : tasks.entrySet()) {
                 if (fed >= 16) {
                     break;
@@ -2546,15 +2530,19 @@ public abstract class CraftingServiceSyncMixin {
                                     ik, gtocraftfix$fmtAmt(ik, per), gtocraftfix$fmtAmt(ik, have + got),
                                     pat.getPrimaryOutput().what());
                         }
-                        // [v1.4.0] 斷料持續 60 秒 → 聊天室點名＋[v1.5.0] 自動救援下單（液態氦全網斷供
-                        // 實錄：兩張大單靜默凍結，log 每秒刷 WARN 玩家全程無感）
-                        gtocraftfix$noteStarve(cluster, logic, job, pat.getPrimaryOutput().what(),
-                                ik, per, have + got, times);
+                        // [v1.4.0→v1.8.0] 斷料持續 60 秒 → 收集、迴圈後整併成單則聊天訊息
+                        //（不再自動下單救援）
+                        var due = gtocraftfix$starveDue(cluster, job, pat.getPrimaryOutput().what(),
+                                ik, per, have + got);
+                        if (due != null) {
+                            starveDue.add(due);
+                        }
                     } else {
                         gtocraftfix$starveClear(cluster, pat.getPrimaryOutput().what(), ik); // [v1.4.0]
                     }
                 }
             }
+            gtocraftfix$starveBroadcast(logic, starveDue); // [v1.8.0] 一 cluster 一則整併訊息
         } catch (Throwable t) {
             if (gtocraftfix$logErrOk()) { // [重檢7]
                 LOG.error("[craftfix] 補輸入例外", t);
@@ -2563,13 +2551,16 @@ public abstract class CraftingServiceSyncMixin {
         return acted;
     }
 
-    /** [v1.4.0] 跑單斷料聊天室點名：同 job 同（任務主產物|缺料）連續 60 秒「連一輪都湊不齊且
-     *  網路已乾」才首播，之後 10 分鐘冷卻重提醒；換 job／料補齊即重計（[重檢18] 計時綁 job 身分）。
-     *  [v1.5.0] 同時嘗試斷料救援自動下單（見 tryRescue），訊息尾註回報救援狀態。
-     *  聊天節流獨立於 logWarnOk 額度：log 額度耗盡不得吞聊天提示。 */
-    private void gtocraftfix$noteStarve(appeng.me.cluster.implementations.CraftingCPUCluster cluster,
-                                        appeng.crafting.execution.CraftingCpuLogic logic,
-                                        Object job, AEKey patOut, AEKey ik, long per, long have, long times) {
+    /** [v1.4.0→v1.8.0] 跑單斷料計時：同 job 同（任務主產物|缺料）連續 60 秒「連一輪都湊不齊且
+     *  網路已乾」且過 10 分鐘冷卻 → 回報條目（由 starveBroadcast 整併成單則訊息——深層連鎖
+     *  斷料一次 30+ 種料同時過門檻的洗版實錄）；未達門檻回 null。換 job／料補齊即重計
+     *  （[重檢18] 計時綁 job 身分）。
+     *  [v1.8.0] 自動救援下單（v1.5.0）已整套移除：深層斷鏈場景「每輪需求×剩餘輪數」的補單量
+     *  不可控——實錄一小時內滾動開出 19+ 張巨量救援單（NOR 晶片 x60000、陶瓷磚 x79040、
+     *  鋼錠 x35376、量子位晶片 x31878…）把 CPU/產線塞爆、伺服器過載。回歸「點名＋玩家自行
+     *  補料、保母自動餵入解凍」。 */
+    private Object[] gtocraftfix$starveDue(appeng.me.cluster.implementations.CraftingCPUCluster cluster,
+                                           Object job, AEKey patOut, AEKey ik, long per, long have) {
         try {
             Object[] st = gtocraftfix$starveNotice.get(cluster);
             Object stJob = st == null ? null : ((java.lang.ref.WeakReference<?>) st[0]).get();
@@ -2586,12 +2577,22 @@ public abstract class CraftingServiceSyncMixin {
                     k -> new int[] { gtocraftfix$tickCounter, Integer.MIN_VALUE / 2 });
             int stuck = gtocraftfix$tickCounter - rec[0];
             if (stuck < 1200 || gtocraftfix$tickCounter - rec[1] < 12000) {
-                return; // 60 秒凍結門檻＋10 分鐘廣播冷卻
+                return null; // 60 秒凍結門檻＋10 分鐘廣播冷卻
             }
             rec[1] = gtocraftfix$tickCounter;
-            String tail = gtocraftfix$tryRescue(logic, ik, per, times); // [v1.5.0]
-            if (tail.isEmpty()) {
-                tail = "；把料補進 ME 後會自動續作";
+            return new Object[] { ik, per, have, stuck };
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /** [v1.8.0] 斷料整併廣播：一 cluster 一則，前 3 項含量、其餘計數（各料細節見任務缺料 WARN）。
+     *  聊天節流獨立於 logWarnOk 額度：log 額度耗盡不得吞聊天提示。 */
+    private void gtocraftfix$starveBroadcast(appeng.crafting.execution.CraftingCpuLogic logic,
+                                             java.util.List<Object[]> due) {
+        try {
+            if (due.isEmpty()) {
+                return;
             }
             var server = grid.getPivot() != null && grid.getPivot().getLevel() != null
                     ? grid.getPivot().getLevel().getServer()
@@ -2602,172 +2603,38 @@ public abstract class CraftingServiceSyncMixin {
             var fo = logic.getFinalJobOutput();
             var head = fo != null ? fo.what().getDisplayName()
                     : net.minecraft.network.chat.Component.literal("(未知產物)");
-            server.getPlayerList().broadcastSystemMessage(
-                    net.minecraft.network.chat.Component.literal("[合成修復] 跑單斷料：合成 ")
-                            .append(head)
-                            .append(net.minecraft.network.chat.Component.literal(
-                                    " 的單已卡 " + (stuck / 20) + " 秒——缺 "))
-                            .append(ik.getDisplayName())
-                            .append(net.minecraft.network.chat.Component.literal(
-                                    "（每輪需 " + gtocraftfix$fmtAmt(ik, per) + "、CPU 只有 "
-                                            + gtocraftfix$fmtAmt(ik, have)
-                                            + "、網路無貨" + tail + "）")),
-                    false);
+            int stuck = (Integer) due.get(0)[3];
+            var msg = net.minecraft.network.chat.Component.literal("[合成修復] 跑單斷料：合成 ")
+                    .append(head)
+                    .append(net.minecraft.network.chat.Component.literal(
+                            " 的單已卡 " + (stuck / 20) + " 秒——缺 "));
+            int shown = 0;
+            for (var d : due) {
+                if (shown >= 3) {
+                    msg.append(net.minecraft.network.chat.Component.literal(
+                            " …等共 " + due.size() + " 項（其餘見伺服器紀錄）"));
+                    break;
+                }
+                if (shown++ > 0) {
+                    msg.append(net.minecraft.network.chat.Component.literal("、"));
+                }
+                var k = (AEKey) d[0];
+                msg.append(k.getDisplayName())
+                        .append(net.minecraft.network.chat.Component.literal(
+                                "（每輪 " + gtocraftfix$fmtAmt(k, (Long) d[1])
+                                        + "、CPU " + gtocraftfix$fmtAmt(k, (Long) d[2]) + "）"));
+            }
+            msg.append(net.minecraft.network.chat.Component.literal("；網路無貨，補進 ME 後會自動續作"));
+            server.getPlayerList().broadcastSystemMessage(msg, false);
         } catch (Throwable ignored) {
-        }
-    }
-
-    /** [v1.5.0] 斷料救援自動下單。鐵則「禁止生成巢狀合成請求」的唯一豁免——當年災難是
-     *  「保母對每個 waitingFor 缺口每秒代下」生出大量小任務佔滿 CPU；本路徑五道閘避開：
-     *  ①只在斷料 60 秒的罕見時機觸發（非每缺口每秒）②一個缺料 key 只開一張涵蓋全部剩餘
-     *  需求的頂層單（非碎單）③深度 1——救援單自己斷料不再往下開（防連鎖風暴）④算料中＋
-     *  在途合計上限 4 ⑤per-key 冷卻（成功 10 分鐘、失敗 2 分鐘）。無樣板不代下（原版語意）。
-     *  提交走正規機器源管線（lpcalc→repairPlan 守衛→present-once IgnoreMissing），產出落
-     *  網路後保母自動餵入凍結單解凍。
-     *  @return 聊天訊息尾註（空字串＝無可報） */
-    private String gtocraftfix$tryRescue(appeng.crafting.execution.CraftingCpuLogic logic,
-                                         AEKey ik, long per, long times) {
-        try {
-            // 深度 1：斷料的 job 本身就是救援單 → 不再往下開
-            var fo = logic.getFinalJobOutput();
-            if (fo != null && gtocraftfix$rescueActive.containsKey(fo.what())) {
-                return "；此單本身是救援單，不再自動加開，請手動處理上游缺料";
-            }
-            long amount;
-            try {
-                amount = Math.multiplyExact(per, Math.max(1L, times));
-            } catch (ArithmeticException e) {
-                amount = per * 8192; // 溢位保底：先補一批，完單後冷卻過再續
-            }
-            return gtocraftfix$rescueOrder(ik, amount);
-        } catch (Throwable t) {
-            if (gtocraftfix$logErrOk()) { // [重檢7]
-                LOG.error("[craftfix] 斷料救援開算例外", t);
-            }
-            return "";
-        }
-    }
-
-    /** [v1.6.0] 救援下單核心（斷料救援與完單短交補單共用）：在途/算料中去重 → per-key 冷卻 →
-     *  上限 4 → 無樣板不代下（原版語意）→ 開算掛 pending（rescueDrain 收割提交）。
-     *  @return 聊天訊息尾註（空字串＝冷卻中無可報） */
-    private String gtocraftfix$rescueOrder(AEKey ik, long amount) {
-        try {
-            // 在途救援單還活著 → 等它做完
-            var live = gtocraftfix$rescueActive.get(ik);
-            if (live != null && !live.isDone() && !live.isCanceled()) {
-                return "；補產救援單已在途";
-            }
-            gtocraftfix$rescueActive.remove(ik);
-            // 算料中也算在途（防觸發點與慢算料重疊時重複開單）
-            for (var p : gtocraftfix$rescuePending) {
-                if (ik.equals(p[0])) {
-                    return "；補產救援單算料中";
-                }
-            }
-            var tried = gtocraftfix$rescueTried.get(ik);
-            if (tried != null && gtocraftfix$tickCounter - tried[0] < tried[1]) {
-                return ""; // 冷卻中，沿用預設提示
-            }
-            if (gtocraftfix$rescuePending.size() + gtocraftfix$rescueActive.size() >= 4) {
-                return "；救援單額度已滿（4），稍後自動重試";
-            }
-            if (((ICraftingService) (Object) this).getCraftingFor(ik).isEmpty()) {
-                return "；無樣板可自動補產，請補料或壓樣板";
-            }
-            var pivot = grid.getPivot();
-            if (pivot == null || pivot.getLevel() == null) {
-                return "";
-            }
-            if (gtocraftfix$rescueTried.size() > 64) {
-                gtocraftfix$rescueTried.clear();
-            }
-            gtocraftfix$rescueTried.put(ik, new int[] { gtocraftfix$tickCounter, 2400 }); // 先記失敗冷卻，提交成功再改 10 分鐘
-            var fut = ((ICraftingService) (Object) this).beginCraftingCalculation(
-                    pivot.getLevel(), IActionSource::empty, ik, amount,
-                    CalculationStrategy.REPORT_MISSING_ITEMS);
-            gtocraftfix$rescuePending.add(new Object[] { ik, fut, amount });
-            if (gtocraftfix$logInfoOk()) {
-                LOG.info("[craftfix] 救援開算 {} x{}", ik, gtocraftfix$fmtAmt(ik, amount));
-            }
-            return "；已啟動自動補產 x" + gtocraftfix$fmtAmt(ik, amount) + "（算料中）";
-        } catch (Throwable t) {
-            if (gtocraftfix$logErrOk()) { // [重檢7]
-                LOG.error("[craftfix] 救援開算例外", t);
-            }
-            return "";
-        }
-    }
-
-    /** [v1.5.0] 每 tick：清理完結的救援 link、收割算完的救援計畫並提交。 */
-    private void gtocraftfix$rescueDrain() {
-        try {
-            if (!gtocraftfix$rescueActive.isEmpty()) {
-                gtocraftfix$rescueActive.values().removeIf(l -> l == null || l.isDone() || l.isCanceled());
-            }
-            if (gtocraftfix$rescuePending.isEmpty()) {
-                return;
-            }
-            var it = gtocraftfix$rescuePending.iterator();
-            while (it.hasNext()) {
-                var p = it.next();
-                var fut = (Future<?>) p[1];
-                if (!fut.isDone()) {
-                    continue;
-                }
-                it.remove();
-                var ik = (AEKey) p[0];
-                try {
-                    var plan = (ICraftingPlan) fut.get();
-                    if (plan == null || plan.finalOutput() == null || plan.patternTimes().isEmpty()) {
-                        if (gtocraftfix$logWarnOk()) { // 退化/失敗計畫：不提交（冷卻後自動重試）
-                            LOG.warn("[craftfix] 斷料救援放棄（計畫無合成任務）{}", ik);
-                        }
-                        continue;
-                    }
-                    var res = ((ICraftingService) (Object) this).submitJob(
-                            plan, null, null, false, IActionSource.empty());
-                    if (res != null && res.successful()) {
-                        if (res.link() != null) {
-                            gtocraftfix$rescueActive.put(ik, res.link());
-                        }
-                        gtocraftfix$rescueTried.put(ik, new int[] { gtocraftfix$tickCounter, 12000 });
-                        var server = grid.getPivot() != null && grid.getPivot().getLevel() != null
-                                ? grid.getPivot().getLevel().getServer()
-                                : null;
-                        if (server != null) {
-                            server.getPlayerList().broadcastSystemMessage(
-                                    net.minecraft.network.chat.Component.literal("[合成修復] 斷料救援：已自動下單 ")
-                                            .append(ik.getDisplayName())
-                                            .append(net.minecraft.network.chat.Component.literal(
-                                                    " x" + gtocraftfix$fmtAmt(ik, (Long) p[2])
-                                                            + "，做完會自動續作凍結中的單")),
-                                    false);
-                        }
-                        if (gtocraftfix$logInfoOk()) {
-                            LOG.info("[craftfix] 斷料救援已提交 {} x{}", ik, (Long) p[2]);
-                        }
-                    } else if (gtocraftfix$logWarnOk()) { // 提交失敗：2 分鐘冷卻後自動重試
-                        LOG.warn("[craftfix] 斷料救援提交失敗 err={} {} x{}",
-                                res == null ? "null" : res.errorCode(), ik, (Long) p[2]);
-                    }
-                } catch (Throwable t) {
-                    if (gtocraftfix$logErrOk()) { // [重檢7]
-                        LOG.error("[craftfix] 斷料救援提交例外", t);
-                    }
-                }
-            }
-        } catch (Throwable t) {
-            if (gtocraftfix$logErrOk()) { // [重檢7]
-                LOG.error("[craftfix] 斷料救援輪詢例外", t);
-            }
         }
     }
 
     /** [v1.6.1] 完單短交監看泵（每 tick）：GTO 預測性收單（機器還在做就關帳）攔不到也**不該擋**
      *  ——帳差多半稍後自行落庫。這裡只對「玩家單、扣掉現貨後仍應到未到」的量做 5 分鐘到貨
      *  監看（cachedInventory 正差分累計，同 tick 進出會互抵→低估到貨→高估損失的方向性誤差
-     *  由現貨抵帳與玩家單限定兜住）；期滿仍未到帳的餘額才視為真損失 → 走救援管線補產。 */
+     *  由現貨抵帳與玩家單限定兜住）；期滿仍未到帳的餘額才視為真損失 → [v1.8.0] 只聊天通知、
+     *  不代補（自動補單整套移除）。 */
     private void gtocraftfix$shortWatchTick() {
         try {
             if (gtocraftfix$shortWatch.isEmpty()) {
@@ -2799,10 +2666,7 @@ public abstract class CraftingServiceSyncMixin {
                 }
                 it.remove();
                 long loss = need - accum;
-                String tail = gtocraftfix$rescueOrder(out, loss);
-                if (tail.isEmpty()) {
-                    tail = "；補產冷卻中，稍後自動重試";
-                }
+                // [v1.8.0] 只通知不代補（自動補單整套移除）：真損失罕見，交玩家決定
                 var server = grid.getPivot() != null && grid.getPivot().getLevel() != null
                         ? grid.getPivot().getLevel().getServer()
                         : null;
@@ -2813,12 +2677,13 @@ public abstract class CraftingServiceSyncMixin {
                                     .append(net.minecraft.network.chat.Component.literal(
                                             " 提前收單後 5 分鐘僅到帳 " + gtocraftfix$fmtAmt(out, accum)
                                                     + "／應到 " + gtocraftfix$fmtAmt(out, need)
-                                                    + "，實際少 " + gtocraftfix$fmtAmt(out, loss) + tail)),
+                                                    + "，實際少 " + gtocraftfix$fmtAmt(out, loss)
+                                                    + "——如有需要請自行補單")),
                             false);
                 }
                 if (gtocraftfix$logWarnOk()) { // [重檢7]
-                    LOG.warn("[craftfix] 完單短交確認 {}：應到 {}、到帳 {}、真損失 {}{}",
-                            out, need, accum, loss, tail);
+                    LOG.warn("[craftfix] 完單短交確認 {}：應到 {}、到帳 {}、真損失 {}（不代補）",
+                            out, need, accum, loss);
                 }
             }
         } catch (Throwable t) {
