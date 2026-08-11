@@ -2386,14 +2386,15 @@ public abstract class CraftingServiceSyncMixin {
                     }
                     if (have + got < per) {
                         // 連一輪都湊不齊且網路已乾 → 執行器會無聲跳過此任務；留下可見證據
+                        long flying = gtocraftfix$inFlightAmt(job, ik); // [v1.8.1] 在途生產＝慢，非卡
                         if (gtocraftfix$logWarnOk()) {
-                            LOG.warn("[craftfix] 任務缺料 {}：每輪需 {}、CPU 有 {}、網路已乾（{} 任務被無聲跳過）",
+                            LOG.warn("[craftfix] 任務缺料 {}：每輪需 {}、CPU 有 {}、在途 {}、網路已乾（{} 任務被無聲跳過）",
                                     ik, gtocraftfix$fmtAmt(ik, per), gtocraftfix$fmtAmt(ik, have + got),
-                                    pat.getPrimaryOutput().what());
+                                    gtocraftfix$fmtAmt(ik, flying), pat.getPrimaryOutput().what());
                         }
                         // [v1.8.0] 斷料持續 60 秒 → 收集、迴圈後整併成單則聊天訊息（不自動下單）
                         var due = gtocraftfix$starveDue(cluster, job, pat.getPrimaryOutput().what(),
-                                ik, per, have + got);
+                                ik, per, have + got, flying);
                         if (due != null) {
                             starveDue.add(due);
                         }
@@ -2411,11 +2412,12 @@ public abstract class CraftingServiceSyncMixin {
         return acted;
     }
 
-    /** [v1.8.0] 跑單斷料計時：同 job 同（任務主產物|缺料）連續 60 秒湊不齊且網路已乾、過 10 分鐘
-     *  冷卻 → 回報條目（由 starveBroadcast 整併，防深層斷鏈多料同時過門檻洗版）；未達門檻回 null。
-     *  換 job／料補齊即重計。自動救援下單已移除：補單量不可控，會塞爆 CPU/產線。 */
+    /** [v1.8.0] 跑單斷料計時：同 job 同（任務主產物|缺料）連續 60 秒湊不齊、網路已乾**且全網零在途
+     *  生產**、過 10 分鐘冷卻 → 回報條目（由 starveBroadcast 整併）；未達門檻回 null。
+     *  換 job／料補齊即重計；[v1.8.1] 有在途生產＝機器在做只是慢，凍結計時不點名。
+     *  自動救援下單已移除：補單量不可控，會塞爆 CPU/產線。 */
     private Object[] gtocraftfix$starveDue(appeng.me.cluster.implementations.CraftingCPUCluster cluster,
-                                           Object job, AEKey patOut, AEKey ik, long per, long have) {
+                                           Object job, AEKey patOut, AEKey ik, long per, long have, long flying) {
         try {
             Object[] st = gtocraftfix$starveNotice.get(cluster);
             Object stJob = st == null ? null : ((java.lang.ref.WeakReference<?>) st[0]).get();
@@ -2430,6 +2432,10 @@ public abstract class CraftingServiceSyncMixin {
             }
             var rec = m.computeIfAbsent(patOut + "|" + ik,
                     k -> new int[] { gtocraftfix$tickCounter, Integer.MIN_VALUE / 2 });
+            if (flying > 0) {
+                rec[0] = gtocraftfix$tickCounter; // [v1.8.1] 凍結：60 秒門檻只累計「零在途」時間
+                return null;
+            }
             int stuck = gtocraftfix$tickCounter - rec[0];
             if (stuck < 1200 || gtocraftfix$tickCounter - rec[1] < 12000) {
                 return null; // 60 秒凍結門檻＋10 分鐘廣播冷卻
@@ -2439,6 +2445,28 @@ public abstract class CraftingServiceSyncMixin {
         } catch (Throwable ignored) {
             return null;
         }
+    }
+
+    /** [v1.8.1] 全網在途生產量：GTO 版 getRequestedAmount＝各 CPU waitingFor 合計（涵蓋玩家另開的
+     *  補料單）；API 例外時退看本單 waitingFor。>0＝有機器正在做這個料。 */
+    private long gtocraftfix$inFlightAmt(Object job, AEKey ik) {
+        try {
+            return ((CraftingService) (Object) this).getRequestedAmount(ik);
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (gtocraftfix$fWaitingFor == null) {
+                var fw = job.getClass().getDeclaredField("waitingFor");
+                fw.setAccessible(true);
+                gtocraftfix$fWaitingFor = fw;
+            }
+            Object wf = gtocraftfix$fWaitingFor.get(job);
+            if (wf instanceof appeng.crafting.inv.ListCraftingInventory li) {
+                return li.list.get(ik);
+            }
+        } catch (Throwable ignored) {
+        }
+        return 0;
     }
 
     /** [v1.8.0] 斷料整併廣播：一 cluster 一則，前 3 項含量、其餘計數（各料細節見任務缺料 WARN）。
@@ -2462,7 +2490,7 @@ public abstract class CraftingServiceSyncMixin {
             var msg = net.minecraft.network.chat.Component.literal("[合成修復] 跑單斷料：合成 ")
                     .append(head)
                     .append(net.minecraft.network.chat.Component.literal(
-                            " 的單已卡 " + (stuck / 20) + " 秒——缺 "));
+                            " 的單已卡 " + (stuck / 20) + " 秒（期間無任何機器在製）——缺 "));
             int shown = 0;
             for (var d : due) {
                 if (shown >= 3) {
