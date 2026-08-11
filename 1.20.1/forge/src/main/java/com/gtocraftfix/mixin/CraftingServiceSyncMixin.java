@@ -51,22 +51,12 @@ import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 修好 GTO 環境「合成樹超過一步就無法（正確）自動合成」，三個修正：
+ * 修 GTO 環境「合成樹超過一步就無法正確自動合成」：
  * <ol>
- *   <li><b>算料同步化</b>（{@code @Inject beginCraftingCalculation}）：GTO 把算料丟單一背景執行緒 async，
- *       多步（遞迴）時 {@code Future} 不返回、終端 ctrl+左鍵卡死。改成呼叫端（伺服器執行緒）同步執行
- *       同一 {@code OptimizedCalculation.executeV2}。反射呼叫閉源 gtolib，找不到就退回原本 async。</li>
- *   <li><b>機器源 present-once 走 IgnoreMissing</b>（{@code @Redirect submitJob → cpuCluster.submitJob}）：
- *       實測 GTO 計畫的 {@code usedItems} 含「執行期間才回流的中間產物」（庫存快照 0 也照列），
- *       開局一次取齊（嚴格取料）必失敗 → 機器源（接口/請求器/合成卡）被 MISSING_INGREDIENT
- *       無限拒單。正解 = IgnoreMissing：取現有、缺的記 {@code missingIng} → {@code waitingFor}，
- *       回流認領。GTO 只讓「有 player」的來源走該分支 → 包一層 present-once：{@code player()} 首呼
- *       （trySubmitJob 的條件判斷）回 present 走 IgnoreMissing，其後回 empty 用 machine 身分取料。</li>
- *   <li><b>保母（只餵料）</b>（{@code onServerEndTick} 每 1 秒）：job 的 {@code waitingFor} 缺口
- *       若網路有現貨（GTO 的認領只在「插入事件」觸發，既有庫存不會被回收），直接搬進 CPU 認領。
- *       不代下巢狀合成單——實測會生出大量小任務佔滿 CPU，反而害玩家下不了單。
- *       缺口若網路無貨（算料器批量餘數幻影，見 ISSUE.md 根因二），需玩家手動下該料的單，
- *       貨一落網路保母即自動餵入解凍。</li>
+ *   <li>算料同步化（beginCraftingCalculation）：GTO 單背景緒 async 算料多步時 Future 不返回 → 改伺服器執行緒同步執行。</li>
+ *   <li>機器源 present-once（submitJob @Redirect）：GTO 計畫 usedItems 含執行期間才回流的中間產物，嚴格取料必失敗；
+ *       IgnoreMissing 分支只對「有 player」的來源開放 → 包一層 player() 首呼回 present、其後 empty。</li>
+ *   <li>保母（onServerEndTick 每秒）：GTO 認領只在插入事件觸發 → 孤兒 waitingFor 有貨直餵；不代下巢狀單（會塞爆 CPU）。</li>
  * </ol>
  */
 @Mixin(value = CraftingService.class, priority = 1500, remap = false)
@@ -82,15 +72,13 @@ public abstract class CraftingServiceSyncMixin {
     @Final
     private Set<CraftingCPUCluster> craftingCPUClusters;
 
-    // [重檢12] 目標類即 CraftingService，直接 @Shadow 免反射：保母改帳後設 -1，強制下一 tick 重算
-    // currentlyCrafting／isRequesting（TAIL 的修改晚於本 tick 重算、postChange 戳同 tick 值會被跳過）
+    // [重檢12] 保母改帳後設 -1，強制下一 tick 重算 currentlyCrafting（同 tick 戳 postChange 會被跳過）
     @Shadow(remap = false)
     private long lastProcessedCraftingLogicChangeTick;
 
     private static volatile Method gtocraftfix$executeV2;
     private static volatile boolean gtocraftfix$resolved;
-    // [重檢7] log 計數器分流：info／warn／例外 各自獨立、5 分鐘窗重置——舊單一 sitterLog 累積 200 後全部
-    // 靜默、例外站（≤5）被一般 log 搶額度幾乎從不觸發，半套回滾等災難完全不可診斷。
+    // [重檢7] log 計數器分流：info／warn／例外各自獨立、5 分鐘窗重置（共用單一計數器時例外會被一般 log 搶光額度）
     private static final AtomicInteger gtocraftfix$logInfo = new AtomicInteger();
     private static final AtomicInteger gtocraftfix$logWarn = new AtomicInteger();
     private static final AtomicInteger gtocraftfix$logErr = new AtomicInteger();
@@ -100,8 +88,7 @@ public abstract class CraftingServiceSyncMixin {
             Math.max(1L, Long.getLong("gtodiag.lpcalc.topUpRoundsCap", 8192L));
     private int gtocraftfix$tickCounter;
     private Set<AEKey> gtocraftfix$noPatternLogged = new HashSet<>();
-    /** [重檢14] 成品被 link 拒收的記憶改 per-cluster（cluster 弱鍵 → key → 拒收 tick）；10 分鐘內不再試。
-     *  舊版全 grid 共用單一 key 表：A cluster 的死 link 會誤封 B cluster 同成品的救援。 */
+    /** [重檢14] 成品被 link 拒收的記憶，per-cluster（弱鍵 → key → 拒收 tick）；10 分鐘內不再試。 */
     private Map<CraftingCPUCluster, HashMap<AEKey, Integer>> gtocraftfix$feedRefused = new WeakHashMap<>();
     /** 內置原版算料器的背景執行緒池（daemon）。 */
     private static final java.util.concurrent.ExecutorService gtocraftfix$CALC_POOL =
@@ -122,48 +109,34 @@ public abstract class CraftingServiceSyncMixin {
     private static volatile boolean gtocraftfix$fAllocMissing;
     private static volatile Method gtocraftfix$mPendReq;
     private static volatile boolean gtocraftfix$mPendReqTried;
-    /** [重檢14] 陳舊等待偵測：cluster（弱鍵，重建即回收——舊 identityHashCode 字串鍵會洩漏＋撞號）→
-     *  key → 首見 tick。網內無貨、無剩餘任務消費、滯留逾時才視為陳舊（epoxy 案例）。 */
+    /** [重檢14] 陳舊等待偵測：cluster（弱鍵）→ key → 首見 tick。 */
     private Map<CraftingCPUCluster, HashMap<AEKey, Integer>> gtocraftfix$staleWait = new WeakHashMap<>();
-    /** [重檢16] 孤兒觀測計時：cluster（弱鍵）→ 樣板 → 首見「無供應器」tick；持續 60 秒才換綁
-     *  （供應器 chunk 卸載／節點暫離的暫態 unmount 不該立刻觸發換綁）。 */
+    /** [重檢16] 孤兒觀測計時：cluster（弱鍵）→ 樣板 → 首見「無供應器」tick；持續 60 秒才換綁（防暫態 unmount 誤觸發）。 */
     private Map<CraftingCPUCluster, HashMap<IPatternDetails, Integer>> gtocraftfix$orphanSince = new WeakHashMap<>();
-    /** [重檢3] 已銷帳成品留庫量：job（弱鍵，完單即隨 GC 歸零）→ 帳已被 GTO insert 銷掉、
-     *  物理留在 CPU 庫存待 storeItems 退網的成品數——selfClaimFinal 不得對這部分再燒帳。 */
+    /** [重檢3] 已銷帳但物理留在 CPU 庫存的成品量（job 弱鍵）；selfClaimFinal 不得對這部分再燒帳。 */
     private Map<Object, long[]> gtocraftfix$claimedFinalHeld = new WeakHashMap<>();
     /** [重檢14] 成品自我認領計時：cluster（弱鍵）→ 首見滯留 tick（與陳舊等待分表，互不誤清）。 */
     private Map<CraftingCPUCluster, Integer> gtocraftfix$finalClaimTick = new WeakHashMap<>();
     private Set<String> gtocraftfix$failLogged = new HashSet<>();
-    /** [v1.2.0] 完單法醫：cluster（弱鍵）→ {job 弱參照, out 描述, 交付帳剩, 任務剩輪}。
-     *  job 消失/更換當下印「完單快照」——十份剩四份類提早完單的死亡瞬間存證。 */
+    /** [v1.2.0] 完單法醫：cluster（弱鍵）→ {job 弱參照, out 描述, 交付帳剩, 任務剩輪, …}；job 消失當下印完單快照。 */
     private Map<CraftingCPUCluster, Object[]> gtocraftfix$jobTrack = new WeakHashMap<>();
     private static volatile java.lang.reflect.Field gtocraftfix$fRemaining;
     private static volatile boolean gtocraftfix$fRemainingTried;
-    /** [v1.2.1] 配額死鎖計時：cluster（弱鍵）→ {job 弱參照, 首見 tick, 當時總剩輪}。
-     *  [重檢18] 加 job 身分（跨 job 殘留計時會讓新單被秒清）；掛號當下先拔掉該 key 的
-     *  INSUFFICIENT_PRIORITY 殘留——活的配額鎖每 tick 會被 GTO 重寫回來、陳舊的不會，
-     *  下輪還在即證明非殘留。 */
+    /** [v1.2.1] 配額死鎖計時：cluster（弱鍵）→ {job 弱參照, 首見 tick, 當時總剩輪}；[重檢18] 含 job 身分防跨 job 殘留計時。 */
     private Map<CraftingCPUCluster, Object[]> gtocraftfix$quotaStuck = new WeakHashMap<>();
     /** [重檢18] 訂單提前收單廣播冷卻：cluster（弱鍵）→ 上次廣播 tick（10 分鐘內不重發）。 */
     private Map<CraftingCPUCluster, Integer> gtocraftfix$orderNoticeTick = new WeakHashMap<>();
-    /** [v1.4.0] 跑單斷料廣播：cluster（弱鍵）→ {job 弱參照, 「任務主產物|缺料」→ int[]{首見 tick, 上次廣播 tick}}。
-     *  計時鍵含任務主產物：同一缺料 key 可能同時是 A 任務的硬缺口、B 任務的已滿足輸入，
-     *  只按 key 記會被 B 的清零抹掉 A 的計時。換 job 即重計（[重檢18] 紀律）。 */
+    /** [v1.4.0] 跑單斷料廣播：cluster（弱鍵）→ {job 弱參照, 「任務主產物|缺料」→ int[]{首見, 上次廣播}}；
+     *  鍵含任務主產物，防別的任務把同 key 計時清零。 */
     private Map<CraftingCPUCluster, Object[]> gtocraftfix$starveNotice = new WeakHashMap<>();
     /** [v1.4.0] 玩家定向訊息節流：uuid|產物|錯誤碼 → 上次發送 ms（3 秒窗防連點；伺服器執行緒單寫）。 */
     private static Map<String, Long> gtocraftfix$playerNoticeMs = new HashMap<>();
-    /** [v1.6.1] 完單短交監看：{AEKey out, Long 應到未到, Long 已到帳, Long 上次存量, Integer 起始 tick}。
-     *  每 tick 以 cachedInventory 正差分累計到貨；蓋過應到結案、5 分鐘期滿未到的餘額才補產。 */
+    /** [v1.6.1] 完單短交監看：{AEKey out, 應到未到, 已到帳, 上次存量, 起始 tick}；正差分累計到貨、蓋過應到即結案。 */
     private java.util.List<Object[]> gtocraftfix$shortWatch = new java.util.ArrayList<>();
-    /** [v1.6.1] 玩家單 link 標記（弱鍵，link 回收即忘）：完單短交監看只看玩家單——機器源
-     *  有 requester 水位制自我修復，代補反而重複生產。 */
+    /** [v1.6.1] 玩家單 link 標記（弱鍵）：短交監看只看玩家單——機器源有水位制自我修復，代補反而重複生產。 */
     private Map<ICraftingLink, Boolean> gtocraftfix$playerLinks = new WeakHashMap<>();
 
-    /**
-     * [重檢17] Mixin 實例欄位初始化式不保證併入目標建構子（1.1.8 實測 feedRefused 為 null、
-     * 保母每輪 NPE 全滅）——所有狀態表進場先過這裡懶初始化，對合併雷免疫。
-     * 只在伺服器執行緒呼叫，無並發問題。
-     */
+    /** [重檢17] mixin 實例欄位初始化不保證執行；狀態表一律先過這裡懶初始化。只在伺服器執行緒呼叫。 */
     private void gtocraftfix$ensureState() {
         if (gtocraftfix$noPatternLogged == null) {
             gtocraftfix$noPatternLogged = new HashSet<>();
@@ -240,9 +213,8 @@ public abstract class CraftingServiceSyncMixin {
             return; // 不接管 → 走原本 async
         }
         try {
-            // 無樣板守衛：原版語意＝無樣板即不可合成、根本不該生任務。GTO 的 executeV2 卻會對
-            // 無樣板物品硬生「從網路拿 N 顆」的退化計畫 → 無謂的算料/修補/拒單循環。
-            // 機器源請求前先查索引，查無 → 直接回誠實 sim 計畫（缺 N、零任務），不進 executeV2。
+            // 無樣板守衛：GTO executeV2 會對無樣板物品硬生「從網路拿 N 顆」的退化計畫；
+            // 機器源查無樣板 → 直接回誠實 sim 計畫（缺 N、零任務），不進 executeV2。
             var actionSrc0 = simRequester.getActionSource();
             boolean machineSrc0 = actionSrc0 == null || actionSrc0.player().isEmpty();
             if (machineSrc0 && ((ICraftingService) (Object) this).getCraftingFor(what).isEmpty()) {
@@ -308,11 +280,8 @@ public abstract class CraftingServiceSyncMixin {
                 }));
                 return;
             }
-            // 機器源優先走 lpcalc 結構化需求傳播算料器（SCC 縮點＋批量傳播）；不支援/失敗
-            // 由 LpEntry 內部回退 com.gtocraftfix.calc 樹狀版（快照期當場建、求解期走 LpFallbackQueue
-            // +1 tick），-Dgtodiag.lpcalc.enabled=false 一鍵停用（機器路徑完全回樹狀版）。
-            // LpEntry 全包 try-catch 不外拋；外層 catch（不 setReturnValue → 退 GTO async）當最後防線。
-            // 玩家維持 GTO executeV2（快，且玩家路徑在現有防線下運作正常）。
+            // 機器源走 lpcalc 算料器（失敗由 LpEntry 內部回退樹狀版；-Dgtodiag.lpcalc.enabled=false 停用）。
+            // LpEntry 不外拋；外層 catch（不 setReturnValue → 退 GTO async）當最後防線。玩家維持 GTO executeV2。
             if (machineSrc0) {
                 cir.setReturnValue(com.gtocraftfix.lpcalc.LpEntry.beginMachineCalc(
                         level, grid, (ICraftingService) (Object) this, simRequester,
@@ -322,9 +291,8 @@ public abstract class CraftingServiceSyncMixin {
             var inventory = grid.getStorageService().getCachedInventory().copy();
             var plan = (ICraftingPlan) m.invoke(null, grid, inventory, simRequester, what, amount, strategy);
 
-            // 機器源降量重算：executeV2 的 CRAFT_LESS 對大量會直接回 amount=0＋sim（實測 10000 鈦錠
-            // 因鎂循環記帳差 2 而整張歸 0，1000 卻可以）。正常 CRAFT_LESS 語意應回「最多可做的量」——
-            // 外部重現：砍半重算直到可執行；做多少先交多少，追蹤器下輪自然補餘量。玩家不降（要看缺料畫面）。
+            // 機器源降量重算：executeV2 的 CRAFT_LESS 對大量會直接回 amount=0＋sim（而非「最多可做的量」）
+            // → 砍半重算直到可執行，追蹤器下輪自然補餘量。玩家不降（要看缺料畫面）。
             var actionSrc = simRequester.getActionSource();
             boolean machineSrc = actionSrc == null || actionSrc.player().isEmpty();
             if (machineSrc && plan != null && amount > 1
@@ -334,8 +302,7 @@ public abstract class CraftingServiceSyncMixin {
                     tryAmount /= 2;
                     var inv2 = grid.getStorageService().getCachedInventory().copy();
                     var p2 = (ICraftingPlan) m.invoke(null, grid, inv2, simRequester, what, tryAmount, strategy);
-                    // 拒收「退化計畫」（usedItems 吃現貨、patternTimes 空＝啥都不合成）：GTO 沒有
-                    // 「把開局吸入的成品交給 link」的步驟，這種 job 會抱著現貨永凍（實測 NAND 625）。
+                    // 拒收退化計畫（吃現貨、零任務）：GTO 沒有「開局吸入的成品交給 link」的步驟，這種 job 永凍。
                     if (p2 != null && !p2.simulation() && p2.finalOutput() != null && p2.finalOutput().amount() > 0
                             && !p2.patternTimes().isEmpty()) {
                         if (gtocraftfix$logInfoOk()) { // [重檢7] log 分流
@@ -352,12 +319,9 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
-    // ---- 修正 4：計畫修補（最接近根源的外部解）----
-    // 病灶（ISSUE.md 根因二）：算料器把「網路裡拿不到的量」寫進 usedItems（批量餘數幻影），
-    // 且不排樣板 → job 等一個沒人會做的料 → 永久凍結。
-    // 修補：提交前重算帳——usedItems 超出網路實際可取的缺口，直接把該料的樣板 runs 補進
-    // 「同一張計畫」（不生新任務、不佔額外 CPU）；新增 runs 的輸入遞迴同法補平：
-    // 網路夠 → 記進 usedItems；不夠 → 繼續補樣板。有界迴圈，任何失敗放行原計畫。
+    // ---- 修正 4：計畫修補 ----
+    // 算料器會把拿不到的量寫進 usedItems 而不排樣板（批量餘數幻影）→ job 永凍。提交前重算帳：
+    // 缺口把樣板 runs 補進同一張計畫、新增輸入遞迴補平。有界迴圈，任何失敗放行原計畫。
     @Inject(method = "submitJob", at = @At("HEAD"), cancellable = true, remap = false)
     private void gtocraftfix$repairPlan(ICraftingPlan job, ICraftingRequester requestingMachine, ICraftingCPU target,
                                         boolean prioritizePower, IActionSource src,
@@ -367,8 +331,7 @@ public abstract class CraftingServiceSyncMixin {
             return;
         }
         boolean blockSubmit = false;
-        // [v1.4.0] 硬缺口收集（key → 合併量），玩家單被擋時定向點名用——刻意不查 noPatternLogged
-        // 全域去重（機器源先踩過的 key 會讓玩家永遠看不到廣播），玩家每次點擊都該有回饋。
+        // [v1.4.0] 硬缺口收集（玩家擋單點名用）；刻意不查 noPatternLogged 去重——玩家每次點擊都該有回饋
         var hardNoPattern = new java.util.LinkedHashMap<AEKey, Long>();
         try {
             var storage = grid.getStorageService().getInventory();
@@ -381,8 +344,7 @@ public abstract class CraftingServiceSyncMixin {
             Map<AEKey, Long> reserved = new HashMap<>();
             var deficits = new ArrayDeque<Object[]>(); // {AEKey, Long short}
 
-            // ① missingItems：算料器標「缺」的量——有樣板就能補排（sim 計畫的病灶）。
-            //    機器源的 sim 計畫會被 submitJob 守衛靜默拒單（玩家反而放行），全補完就把 sim 翻回 false。
+            // ① missingItems：有樣板就能補排；全補完會把 sim 翻回 false（機器源 sim 計畫會被守衛靜默拒單）
             for (var e : missing) {
                 var key = e.getKey();
                 long want = e.getLongValue();
@@ -402,8 +364,7 @@ public abstract class CraftingServiceSyncMixin {
                 }
                 reserved.merge(key, Math.max(0, take), Long::sum);
             }
-            // ③ 最終產出量檢查：整條鏈 runs 取整後總產出可能 < 需求（實測 flake 差 19 →
-            //    所有任務做完仍交不齊、永凍）。產出＋現貨＋放射 < 需求 → 差額列缺口補樣板。
+            // ③ 最終產出量檢查：整條鏈 runs 取整後總產出可能 < 需求（做完仍交不齊 → 永凍）→ 差額列缺口補樣板
             if (plan.finalOutput() != null) {
                 var outKey = plan.finalOutput().what();
                 long supply = used.get(outKey) + plan.emittedItems().get(outKey);
@@ -474,7 +435,7 @@ public abstract class CraftingServiceSyncMixin {
                     }
                 }
                 if (pat == null) {
-                    // 無樣板可補＝真缺料（網路沒貨、也沒有樣板能做）→ log ＋ 聊天室提示玩家補料
+                    // 無樣板可補＝真缺料 → log＋聊天室提示玩家補料
                     if (hard) {
                         blockSubmit = true; // 真缺料 → 擋下提交（否則 job 必凍）
                         hardNoPattern.merge(key, shortAmt, Long::sum); // [v1.4.0] 玩家擋單點名用
@@ -506,9 +467,8 @@ public abstract class CraftingServiceSyncMixin {
                 long batch = Math.max(1, batchOut);
                 long runs = (shortAmt + batch - 1) / batch; // ceil
                 pt.merge(pat, runs, Long::sum);
-                // [重檢11] 玩家單（executeV2 帶 gtocore$allocations）配額補登：executeCrafting 以樣板
-                // definition 查配額，補進的 runs 若樣板不在該輸入 key 的配額表 → INSUFFICIENT_PRIORITY
-                // 永拒（與重綁不遷配額同根因的第二個入口）。lpcalc 機器單 allocations 恆 null 天然跳過。
+                // [重檢11] 玩家單配額補登：補進的 runs 若不在該輸入 key 的配額表 → INSUFFICIENT_PRIORITY
+                // 永拒。lpcalc 機器單 allocations 恆 null 天然跳過。
                 try {
                     var allocMap = plan.getGtocore$allocations();
                     if (allocMap != null && !allocMap.isEmpty()) {
@@ -562,9 +522,8 @@ public abstract class CraftingServiceSyncMixin {
                     }
                 }
             }
-            // 可執行性模擬：紙上執行整張計畫（usedItems 當起始庫存、逐輪跑可跑的樣板）。
-            // 跑不完＝有樣板被「0 庫存的輸入」卡死＝循環自舉缺口（如 H₂O₂ 蒽醌工作液：
-            // 帳面淨消耗 0 → 不在 usedItems/missing → 但執行要有第一桶才轉得起來）→ 補進缺口再解。
+            // 可執行性模擬：紙上跑整張計畫，跑不完＝循環自舉缺口（帳面淨消耗 0 但執行要有第一份
+            // 才轉得起來，不在 usedItems/missing）→ 補進缺口再解
             var bootstrap = gtocraftfix$findBootstrapDeficits(plan);
             if (bootstrap.isEmpty()) {
                 break;
@@ -603,17 +562,14 @@ public abstract class CraftingServiceSyncMixin {
                 LOG.error("[craftfix] 計畫修補例外（放行原計畫）", t);
             }
         }
-        // 真缺料（無樣板可補的硬缺口）→ 擋下提交：提交了必凍。機器每 2 秒重試（聊天室/log 已去重）；
-        // 玩家單另走定向點名（[v1.4.0]——擋單走 HEAD setReturnValue 短路，RETURN 注入不保證跑到，
-        // 回饋必須在這裡發）。
+        // 真缺料 → 擋下提交（提交了必凍）。玩家回饋必須在這裡發：HEAD setReturnValue 短路後
+        // RETURN 注入不保證跑到。
         if (blockSubmit) {
             gtocraftfix$notifyPlayerBlocked(plan, src, hardNoPattern);
             cir.setReturnValue(appeng.crafting.execution.CraftingSubmitResult.INCOMPLETE_PLAN);
             return;
         }
-        // 機器源退化計畫（修補後仍無任何合成任務）→ 拒單。GTO 沒有「開局吸入的現貨交給 link」
-        // 的步驟，這種 job 會抱著現貨永凍（實測 NAND 625）。拒掉後接口下一輪 acquireFromNetwork
-        // 會自己拉現貨，自然收斂。
+        // 機器源退化計畫（修補後仍零任務）→ 拒單；接口下一輪 acquireFromNetwork 會自己拉現貨。
         if (src.player().isEmpty() && plan.patternTimes().isEmpty()) {
             if (gtocraftfix$logWarnOk()) { // [重檢7] log 分流
                 LOG.warn("[craftfix] 拒收退化計畫（無合成任務）out={}", plan.finalOutput());
@@ -685,8 +641,7 @@ public abstract class CraftingServiceSyncMixin {
         };
     }
 
-    /** 取真人玩家（排除 FakePlayer——機器源 present-once 包裝只活在 @Redirect 內層不會外漏，
-     *  但其他 mod 的 FakePlayer 源可能流入）；非真人回 null。 */
+    /** 取真人玩家（排除 FakePlayer——其他 mod 的 FakePlayer 源可能流入）；非真人回 null。 */
     private static net.minecraft.server.level.ServerPlayer gtocraftfix$realPlayer(IActionSource src) {
         var p = src == null ? null : src.player().orElse(null);
         if (p instanceof net.minecraft.server.level.ServerPlayer sp
@@ -837,16 +792,13 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
-    // ---- 修正 3：保母（每 1 秒掃孤兒 waitingFor）＋ 診斷探針（每 20 秒）----
-    // [重檢18] 掛 HEAD 不掛 TAIL：GTOCore 的 CraftingServiceMixin 在偶數 tick 於
-    // craftingLinks.values() 呼叫前 ci.cancel() 掐斷本方法（節能半頻），TAIL 錨最後一個
-    // RETURN、偶數 tick 永不執行——1.3.1 以前整段（算料泵/保母/探針）實跑半速
-    //（保母 10 秒、探針 40 秒，log 間隔實證）。HEAD 在取消點之前，恢復全速。
+    // ---- 修正 3：保母（每秒掃孤兒 waitingFor）＋ 診斷探針（每 20 秒）----
+    // [重檢18] 掛 HEAD 不掛 TAIL：GTOCore 在偶數 tick 提前 ci.cancel() 本方法，TAIL 偶數 tick 永不執行（整段半速）。
     @Inject(method = "onServerEndTick", at = @At("HEAD"), remap = false)
     private void gtocraftfix$tick(MinecraftServer server, CallbackInfo ci) {
         gtocraftfix$ensureState(); // [重檢17]
         com.gtocraftfix.calc.CalcTicker.tick(); // 內置原版算料器的預算泵（每 tick）
-        com.gtocraftfix.lpcalc.LpFallbackQueue.drainOnServerTick(); // LP 晚期回退/影子驗證的伺服器緒建構點（鐵則5/8）
+        com.gtocraftfix.lpcalc.LpFallbackQueue.drainOnServerTick(); // LP 回退/影子驗證只准在伺服器緒建構
         gtocraftfix$tickCounter++;
         gtocraftfix$shortWatchTick(); // [v1.6.1] 完單短交監看：累計到貨、期滿通知真損失（v1.8.0 不代補）
         if (gtocraftfix$tickCounter % 400 == 0) {
@@ -892,8 +844,7 @@ public abstract class CraftingServiceSyncMixin {
                     } catch (Throwable t) {
                         held = "n/a";
                     }
-                    // 剩餘任務 X 光：主產物×次數＋首輸入「CPU庫存量/每輪需求」——
-                    // 分辨「缺料不推」（庫存<需求）與「料齊未推」（庫存≥需求＝執行器死角）
+                    // 剩餘任務 X 光：分辨「缺料不推」（庫存<需求）與「料齊未推」（執行器死角）
                     String tasksStr = "n/a";
                     try {
                         if (gtocraftfix$fJob == null) {
@@ -938,8 +889,7 @@ public abstract class CraftingServiceSyncMixin {
                                         }
                                     }
                                     tb.append(",prov:").append(provN);
-                                    // [v1.2.1] 每任務最後推送結果字串（identity-keyed multimap，
-                                    // 用同一 pattern 實例的主產物 key 才撈得到）——先取，供⚠佐證用
+                                    // [v1.2.1] 每任務最後推送結果字串（用同一 pattern 實例的主產物 key 撈）；供⚠佐證
                                     String rrStr = null;
                                     try {
                                         if (resultsObj != null) {
@@ -952,8 +902,7 @@ public abstract class CraftingServiceSyncMixin {
                                         }
                                     } catch (Throwable ignored4) {
                                     }
-                                    // 印「最缺的那格」輸入——executeCrafting 任一格不足即無聲跳過，
-                                    // 只看第一格會得到 15/15 的假健康
+                                    // 印「最缺的那格」輸入——executeCrafting 任一格不足即無聲跳過
                                     if (inv0 != null) {
                                         AEKey worstK = null;
                                         long worstHave = 0;
@@ -968,8 +917,7 @@ public abstract class CraftingServiceSyncMixin {
                                             if (need1 <= 0) {
                                                 continue;
                                             }
-                                            // [重檢18] 含全部替代品加總（對齊 extractPatternInputs 取料語意，
-                                            // 只讀 ps[0] 會把「庫存持替代品」誤報成缺料）
+                                            // [重檢18] 含全部替代品加總（只讀 ps[0] 會把持替代品誤報成缺料）
                                             long have1 = 0;
                                             for (var p1 : ps) {
                                                 have1 += inv0.list.get(p1.what());
@@ -985,24 +933,17 @@ public abstract class CraftingServiceSyncMixin {
                                         if (worstK != null) {
                                             tb.append("(缺口:").append(worstK).append(' ')
                                                     .append(worstHave).append('/').append(worstNeed);
-                                            // [重檢18] ⚠ 需失敗碼佐證：料齊＋供應器在列＋結果集含負碼。
-                                            // [v1.7.1 覆核修正] 佐證碼只收 INSUFFICIENT_PRIORITY/
-                                            // NOWHERE_TO_PUSH/REJECTED——PATTERN_PROVIDER_LOCKED 是
-                                            // lock-until-result 阻塞流程的常態碼（機器整段加工期都在
-                                            // results 掛著），收進來會重演「健康任務每輪誤報」；
-                                            // REJECTED 落 results 的唯一路徑＝方向快取缺失（真異常）。
-                                            // BREAK 是成功收尾碼「推送完成」，不觸發任何懷疑。
-                                            // 暫停中 CPU 不標（殘留的是暫停前陳年快照）。
+                                            // [重檢18] ⚠ 需失敗碼佐證：料齊＋供應器在列＋結果集含負碼。只收
+                                            // INSUFFICIENT_PRIORITY/NOWHERE_TO_PUSH/REJECTED——
+                                            // PATTERN_PROVIDER_LOCKED 是阻塞流程常態碼、BREAK 是成功收尾碼。
+                                            // 暫停中 CPU 不標（殘留的是暫停前快照）。
                                             if (!pausedCpu && worstHave >= worstNeed && provN > 0 && rrStr != null
                                                     && (rrStr.contains("INSUFFICIENT_PRIORITY")
                                                             || rrStr.contains("NOWHERE_TO_PUSH")
                                                             || rrStr.contains("REJECTED"))) {
                                                 tb.append(" 料齊未推⚠");
-                                                // [v1.7.1] 嘗試溯源：pendingRequests 記「產物 key→供應器
-                                                // GlobalPos」（公開 API getPendingRequests）。語意是
-                                                // 「最近『嘗試過』的供應器（可能失敗/陳舊）」而非實際送達
-                                                // 處——除 PATTERN_DOES_NOT_EXIST 外連失敗嘗試都記，
-                                                // 且只在該 key waitingFor 歸零時整組清除。列前 2 個座標。
+                                                // [v1.7.1] 溯源：getPendingRequests 記「最近嘗試過的供應器
+                                                // 座標」（含失敗嘗試，非實際送達處），列前 2 個
                                                 try {
                                                     Object pend = logic.getClass()
                                                             .getMethod("getPendingRequests", AEKey.class)
@@ -1034,13 +975,11 @@ public abstract class CraftingServiceSyncMixin {
                         }
                     } catch (Throwable ignored2) {
                     }
-                    // [v1.7.1 覆核修正] 暫停標記放 out= 之後：行首插字會破壞既有 grep 'CPU探針 out='，
-                    // 暫停中的 CPU 反而從濾出視圖消失（暫停恰是最需要看得到的狀態）
+                    // [v1.7.1] 暫停標記放 out= 之後：行首插字會破壞既有 grep 'CPU探針 out='
                     LOG.info("[craftfix] CPU探針 out={}{} waiting[{}]={} held=[{}] 剩餘任務=[{}] results={}",
                             out, pausedCpu ? "（已暫停）" : "",
                             waiting.size(), waitStr, held, tasksStr, results);
-                    // 欄位普查（每 cluster 一次）：waiting 空＋有剩餘任務＝執行器不推but料在——
-                    // 閘門必在 gtolib 私有欄位裡（最可疑：隨存檔保留的在途計數器）。全部倒出來找。
+                    // 欄位普查（每 cluster 一次）：waiting 空＋有剩餘任務＝閘門在 gtolib 私有欄位裡，全部倒出來找
                     if (waiting.isEmpty() && !"n/a".equals(tasksStr) && !"(無)".equals(tasksStr)) {
                         if (gtocraftfix$censusDone.add(cluster)) { // [重檢14] cluster 弱鍵集合（防洩漏）
                             try {
@@ -1059,13 +998,12 @@ public abstract class CraftingServiceSyncMixin {
                 }
             }
         }
-        if (gtocraftfix$tickCounter % 20 != 0) { // [v1.3.6] 保母 5 秒 → 1 秒（補貨太慢）
+        if (gtocraftfix$tickCounter % 20 != 0) { // 保母每秒一輪
             return;
         }
         var storage = grid.getStorageService().getInventory();
         int handled = 0;
-        // [重檢8] cluster 輪替起點：ReferenceOpenHashSet 迭代序輪輪相同＋handled≥16 中斷整圈，固定順序
-        // 會讓後段 cluster 的餵料／補輸入／重綁永遠輪不到（前段大單每輪優先抽料）——每輪換起點。
+        // [重檢8] cluster 輪替起點：固定迭代序＋handled≥16 中斷會讓後段 cluster 永遠輪不到——每輪換起點
         var clusterList = new java.util.ArrayList<>(craftingCPUClusters);
         int clusterN = clusterList.size();
         int startIdx = clusterN == 0 ? 0 : Math.floorMod(gtocraftfix$tickCounter / 20, clusterN);
@@ -1080,17 +1018,14 @@ public abstract class CraftingServiceSyncMixin {
                 Object jobNow = gtocraftfix$jobOf(logic);
                 gtocraftfix$trackJob(cluster, logic, jobNow, storage); // [v1.2.0] 完單法醫＋訂單交付帳＋[重檢19]成品基線
                 if (gtocraftfix$isPausedCpu(logic)) {
-                    // [v1.7.1 覆核修正] 暫停期間各滯留計時表一併清除——否則首見 tick 照牆鐘老化，
-                    // 解除暫停後第一輪「滯留 N 秒」把整段暫停時長算入，斷料廣播/配額解鎖/
-                    // 陳舊等待立即誤觸發（時間門檻的證據力被暫停污染）
+                    // [v1.7.1] 暫停期間清空各滯留計時表——否則解除暫停後把暫停時長算入，時間門檻全部立即誤觸發
                     gtocraftfix$starveNotice.remove(cluster);
                     gtocraftfix$quotaStuck.remove(cluster);
                     gtocraftfix$staleWait.remove(cluster);
                     gtocraftfix$finalClaimTick.remove(cluster);
                     gtocraftfix$staleHeld.remove(cluster);
                     gtocraftfix$orphanSince.remove(cluster);
-                    continue; // 玩家暫停的 CPU（executeCrafting 直接 return 0）：零進度是預期，
-                              // 餵料/自庫認領/補輸入/斷料救援/配額解鎖全部跳過防誤判誤救（法醫照記）
+                    continue; // paused 時執行器不跑、零進度是預期：餵料/認領/救援全跳過（法醫照記）
                 }
                 boolean orderJob = jobNow != null && gtocraftfix$isOrderJob(jobNow);
                 var finalOut = logic.getFinalJobOutput();
@@ -1106,15 +1041,12 @@ public abstract class CraftingServiceSyncMixin {
                     }
                     boolean isFinal = key.equals(finalOut.what());
                     if (isFinal) {
-                        // [v1.2.0] 訂單成品（gtocore:order 單據）一律不代餵：玩家單 link 的交付地
-                        // 就是網路儲存——儲存裡「已交付舊單據」與「繞過認領的在途單據」同 key
-                        // 無法區分，餵到舊單據＝收據充數銷 remainingAmount → 實推 4 輪就偽完單
-                        //（下單十份剩四份案例）。訂單鏈認領走機器 ME 回流的正規 insert，不需代餵。
+                        // [v1.2.0] 訂單成品不代餵：儲存裡舊單據與在途單據同 key 無法區分，
+                        // 餵到舊單據＝收據充數偽完單；訂單鏈認領走正規 insert。
                         if (orderJob) {
                             continue;
                         }
-                        // 成品也要餵（成品回流網路但 CPU 沒攔到認領時，唯一救援路徑）；
-                        // 拒收記憶改 per-cluster（[重檢14]），10 分鐘內不再試。
+                        // 成品也要餵（成品回流但 CPU 沒攔到認領時的唯一救援）；拒收記憶 10 分鐘內不再試
                         Integer ru = gtocraftfix$refusedGet(cluster, key);
                         if (ru != null && gtocraftfix$tickCounter - ru < 12000) {
                             continue;
@@ -1125,11 +1057,8 @@ public abstract class CraftingServiceSyncMixin {
                         continue;
                     }
                     if (isFinal) {
-                        // [重檢19] 成品基線防偽：只餵「開單後新增」的量（基線＝本 job 首見時網路存量）。
-                        // 餵到開單前就有的現貨＝把玩家庫存充當產出銷帳——硫酸氫鉀粉實錄：emitable
-                        // 頂層單 waitingFor 預填 774k、零任務，餵現貨→秒完單→requester 重下→再餵，
-                        // 每 40 秒一輪空轉 6 小時、物料網路↔CPU 打轉零產出（「停住又開始」）。
-                        // me_pattern_buffer 救援不受影響：繞過認領的真產出＝開單後新增＝基線之上。
+                        // [重檢19] 成品基線防偽：只餵「開單後新增」的量（基線＝job 首見時網路存量）——
+                        // 餵到既有現貨＝充當產出銷帳 → 秒完單、requester 重下、無限空轉。
                         long baseF = gtocraftfix$finalBaseline(cluster);
                         if (baseF < 0) {
                             continue; // 基線未知（trackJob 失敗）→ 保守不餵
@@ -1145,19 +1074,16 @@ public abstract class CraftingServiceSyncMixin {
                     // 只餵料：網路有貨 → 直餵 CPU（補認領缺口）。不代下巢狀單——那會生一堆小任務佔 CPU。
                     long got = storage.extract(key, want, Actionable.MODULATE, cluster.getSrc());
                     if (got <= 0) {
-                        // [重檢4] 自庫認領跳過成品：GTO insert 對成品「先按全額銷帳、後問 link」，此處認領
-                        // 會與 selfClaimFinal 對同一批物品重複燒 remainingAmount——成品滯留由 selfClaimFinal
-                        // 專責（該處有已銷帳留庫／冷卻防護）。
+                        // [重檢4] 自庫認領跳過成品：會與 selfClaimFinal 對同一批物品重複燒帳，成品滯留由該處專責
                         if (isFinal) {
                             continue;
                         }
-                        // v1.1.3 自庫認領：網內無貨，但貨可能已在 CPU 自己的庫存——繞過認領 hook
-                        // 進來的（液態釹案例：waiting 要 9216mB、庫存正好持有 9216mB）。
+                        // 自庫認領：網內無貨，但貨可能繞過認領 hook 已在 CPU 自己的庫存
                         var inv0 = gtocraftfix$invOf(logic);
                         if (inv0 != null) {
                             long heldHere = inv0.list.get(key);
-                            // [重檢13] 只認領超出「剩餘任務 capped 需求」的超額部分：topUp 塞進來的工作備料
-                            // 不是繞過認領的交付品，銷了帳會讓在途真交付被拒、物流空轉（液態釹案例需求=0 → 照舊全認領）。
+                            // [重檢13] 只認領超出「剩餘任務 capped 需求」的超額：topUp 塞的工作備料不是交付品，
+                            // 銷了帳會讓在途真交付被拒
                             long claimable = Math.min(heldHere - gtocraftfix$remainingDemand(logic, key), want);
                             if (claimable > 0) {
                                 long g2 = inv0.extract(key, claimable, Actionable.MODULATE);
@@ -1195,10 +1121,8 @@ public abstract class CraftingServiceSyncMixin {
                     }
                     if (accepted < got) {
                         if (isFinal) {
-                            // [重檢3] 成品餘額不回插網路：storage.insert 會經 CraftingServiceStorage→insertIntoCpus
-                            // 再進同一顆 CPU，GTO insert「先按全額銷帳後問 link」→ got<want 時殘帳被同批物品
-                            // 二次銷帳、remainingAmount 二次遞減 → 提早完單／requester 短收。改留 CPU 庫存
-                            //（完單 storeItems 自然退網），並記入 claimedFinalHeld 防 selfClaimFinal 之後再燒。
+                            // [重檢3] 成品餘額不回插網路（會再進同一顆 CPU 被二次銷帳 → 提早完單）；
+                            // 改留 CPU 庫存（完單 storeItems 自然退網）並記入 claimedFinalHeld。
                             var invF = gtocraftfix$invOf(logic);
                             if (invF != null) {
                                 invF.insert(key, got - accepted, Actionable.MODULATE);
@@ -1207,25 +1131,22 @@ public abstract class CraftingServiceSyncMixin {
                                 storage.insert(key, got - accepted, Actionable.MODULATE, cluster.getSrc());
                             }
                         } else {
-                            // 非成品：GTO insert 恆全額吃下（此分支實為死碼），保留作 job 同 tick 消失時的退料安全網
+                            // 非成品：GTO insert 恆全額吃下（實為死碼），保留作退料安全網
                             storage.insert(key, got - accepted, Actionable.MODULATE, cluster.getSrc());
                         }
                     }
                     if (accepted <= 0 && !isFinal) {
                         continue;
                     }
-                    // [重檢5] 成品 accepted==0 ≠ 拒收：GTO insert 在問 link 前已按全額銷帳（帳已推進；
-                    // standalone 玩家單 link 恆回 0），不記 feedRefused——記了只會拖慢正常收斂。
+                    // [重檢5] 成品 accepted==0 ≠ 拒收：GTO insert 問 link 前已按全額銷帳（帳已推進），不記 feedRefused
                     handled++;
                     acted = true;
                     if (gtocraftfix$logInfoOk()) {
                         LOG.info("[craftfix] 保母餵料 {} x{}", key, got);
                     }
                 }
-                // 輸入補給：waiting 空（無在途）但仍有未完成任務＝執行中帳漂移把某任務輸入吃到不足一輪
-                // → 剩餘任務每 tick 取料失敗、無聲凍結。反射讀任務清單，短缺輸入直接從網路補進 CPU 庫存。
-                // v1.1.1：epoxy 案例證明「waiting 非空但無料可餵」的凍結同樣需要補輸入
-                // （陳舊等待擋住視線、真正缺的是任務輸入）→ 本 cluster 這輪餵料掛零時也跑。
+                // 輸入補給：帳漂移可把任務輸入吃到不足一輪 → 每 tick 取料失敗、無聲凍結；
+                // 短缺輸入從網路補進 CPU 庫存。waiting 空、或本輪餵料掛零時都要跑。
                 if ((waiting.isEmpty() || handled == handledBefore) && handled < 16) {
                     acted |= gtocraftfix$topUpInputs(logic, storage, cluster);
                 }
@@ -1233,17 +1154,14 @@ public abstract class CraftingServiceSyncMixin {
                 if (!waiting.isEmpty()) {
                     acted |= gtocraftfix$clearStaleWaits(logic, storage, cluster, waiting, finalOut);
                 }
-                // 成品自我認領：waiting 空但成品躺在 CPU 庫存不被交付帳認領（me_pattern_buffer 案例：
-                // 做成品的機器自帶 ME 連接，產物繞過認領 hook 直進 CPU 庫存）→ 補帳＋重插觸發認領
+                // 成品自我認領：產物繞過認領 hook 直進 CPU 庫存（機器自帶 ME 連接）→ 補帳＋重插觸發認領
                 if (waiting.isEmpty()) {
                     acted |= gtocraftfix$selfClaimFinal(logic, cluster, finalOut);
                 }
-                // 孤兒任務重綁：樣板實例失聯（getProviders 空 → executeCrafting 空轉不留痕、永凍）
-                // → 換綁到同產物＋同輸入簽名、有活供應器的現行樣板
+                // 孤兒任務重綁：樣板實例失聯（getProviders 空 → 空轉永凍）→ 換綁到同簽名現行樣板
                 acted |= gtocraftfix$rebindOrphanTasks(logic, cluster);
-                // [v1.2.1] 配額解鎖：GTO 配額扣到剛好 0 就把樣板定義整本抹除（purgePatternEverywhere）
-                // → 該樣板剩餘輪次永遠 INSUFFICIENT_PRIORITY（料在手上、只差名額）→ 任務凍死
-                //（探針指紋「料齊未推⚠」）。滯留 ≥30 秒且零進度 → 清空 job 配額帳退回原版行為。
+                // [v1.2.1] 配額解鎖：GTO 配額扣到 0 會抹除該樣板定義 → 剩餘輪次永遠 INSUFFICIENT_PRIORITY；
+                // 滯留 ≥30 秒且零進度 → 清空 job 配額帳退回原版行為
                 acted |= gtocraftfix$unlockQuota(logic, cluster);
             } catch (Throwable t) {
                 if (gtocraftfix$logErrOk()) { // [重檢7] 例外計數器獨立
@@ -1251,9 +1169,8 @@ public abstract class CraftingServiceSyncMixin {
                 }
             } finally {
                 if (acted) {
-                    // [重檢12] 保母寫入收尾：標髒 cluster（ListCraftingInventory 只回呼 listener 不標髒——
-                    // 否則崩潰／未存檔卸載時 CPU 側已收的料不落盤＝物品蒸發，網路側扣帳卻已存），
-                    // 並強制下一 tick 重算 currentlyCrafting（防 isRequesting 幻影殘留）。
+                    // [重檢12] 標髒 cluster（ListCraftingInventory 不標髒，崩潰時 CPU 側已收的料不落盤＝蒸發），
+                    // 並強制下一 tick 重算 currentlyCrafting
                     cluster.markDirty();
                     lastProcessedCraftingLogicChangeTick = -1;
                 }
@@ -1262,11 +1179,9 @@ public abstract class CraftingServiceSyncMixin {
     }
 
     /**
-     * 陳舊等待解鎖：gtolib 的 waitingFor 認領只在插入事件觸發，執行中帳漂移可留下「永遠等不到、
-     * 也不再需要」的帳目（epoxy 案例：電金板早已到貨並全數加工成箔，waitingFor 卻仍掛著板）。
-     * 四重證明缺一不可才清：(1) 該 key 滯留 ≥300 秒；(2) 網內無貨（有貨歸餵料處理）；
-     * (3) 剩餘任務（times>0）沒有任何一個把該 key 列為可能輸入；(4) 無機器 pending 在做該 key。
-     * 訂單型 job 整顆跳過；最終產物永不清。反射全軟失敗。
+     * 陳舊等待解鎖：認領只在插入事件觸發，帳漂移可留下「永遠等不到、也不再需要」的 waitingFor。
+     * 四重證明缺一不可才清：滯留 ≥300 秒、網內無貨、剩餘任務不消費該 key、無機器 pending。
+     * 訂單 job 整顆跳過；最終產物永不清。反射全軟失敗。
      */
     private boolean gtocraftfix$clearStaleWaits(appeng.crafting.execution.CraftingCpuLogic logic,
                                              appeng.api.storage.MEStorage storage,
@@ -1283,14 +1198,13 @@ public abstract class CraftingServiceSyncMixin {
             if (job == null) {
                 return false;
             }
-            // [重檢9] 訂單守衛：order/temp-order 的完單條件＝waitingFor 空∧tasks==1，清掉訂單依賴品的帳
-            // 會讓訂單提早回報完成（子單成品之後才落網路）→ isOrder 反射直讀，整顆 CPU 跳過清帳。
+            // [重檢9] 訂單守衛：清掉訂單依賴品的帳會讓訂單提早回報完成 → 整顆 CPU 跳過清帳
             if (gtocraftfix$isOrderJob(job)) {
                 return false;
             }
             var sw = gtocraftfix$staleWait.computeIfAbsent(cluster, c -> new HashMap<>());
             if (sw.size() > 256) {
-                // [重檢14] 只清本 cluster 子表（舊版 >512 整張全清會把所有 cluster 年齡一起歸零、兩層武器同滅）
+                // [重檢14] 只清本 cluster 子表（整張全清會把所有 cluster 年齡一起歸零）
                 sw.clear();
             }
             int cleared = 0;
@@ -1311,12 +1225,11 @@ public abstract class CraftingServiceSyncMixin {
                     continue;
                 }
                 Integer first = sw.putIfAbsent(key, gtocraftfix$tickCounter);
-                // [重檢9] 門檻 1200→6000 tick：GT 配方常 1-10 分鐘，60 秒會清掉仍在機器內加工的真在途帳
+                // [重檢9] 門檻 6000 tick：GT 配方常數分鐘，太短會清掉仍在機器內加工的真在途帳
                 if (first == null || gtocraftfix$tickCounter - first < 6000) {
                     continue;
                 }
-                // [重檢9] 證明 (4)：pendingRequests 非空＝仍有機器在做該 key → 不清
-                //（僅輔助條件：餵滿全額會清該標記、且只記主產物，不可取代其餘證明）
+                // [重檢9] 證明 (4)：pendingRequests 非空＝仍有機器在做該 key → 不清（僅輔助，不可取代其餘證明）
                 if (gtocraftfix$hasPendingRequest(logic, key)) {
                     continue;
                 }
@@ -1392,12 +1305,10 @@ public abstract class CraftingServiceSyncMixin {
     }
 
     /**
-     * 孤兒任務重綁：job 的任務綁「算料當下的樣板實例」；樣板事後被重上傳／換機器／供應器
-     * 重整後，新樣板與舊實例對不上 → getProviders(舊實例) 永遠空 → executeCrafting 供應器
-     * 迴圈空轉、料取出又放回、不留任何紀錄（results 空、waiting 空、零進度）。GTO 無重綁機制。
-     * 救援：對供應器數 0 且持續 60 秒的任務，找「全部產出逐項相等＋逐格輸入簽名相等（含替代品
-     * 集合）」且有活供應器的現行樣板，先遷移 allocations 配額再換綁；目標樣板已在任務清單 →
-     * 併次數。每輪最多 4 筆，反射軟失敗。
+     * 孤兒任務重綁：任務綁「算料當下的樣板實例」，樣板重上傳／換機器後 getProviders(舊實例)
+     * 永遠空 → executeCrafting 空轉不留痕。對供應器數 0 持續 60 秒的任務，換綁到「全部產出＋
+     * 逐格輸入簽名（含替代品）相等」且有活供應器的現行樣板；先遷配額再換綁，已在清單則併次數。
+     * 每輪最多 4 筆，反射軟失敗。
      */
     private boolean gtocraftfix$rebindOrphanTasks(appeng.crafting.execution.CraftingCpuLogic logic,
                                                   appeng.me.cluster.implementations.CraftingCPUCluster cluster) {
@@ -1452,8 +1363,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (cand.equals(pat) || !cs.getProviders(cand).iterator().hasNext()) {
                         continue;
                     }
-                    // [重檢15] 全部產出逐項 key＋amount 相等：只比主產物 key 會換到產量配比不同的樣板
-                    //（times 不換算 → 總產出短缺、永湊不齊 remainingAmount）；配比不同一律不綁。
+                    // [重檢15] 全部產出逐項 key＋amount 相等：times 不換算，配比不同一律不綁
                     if (!gtocraftfix$sameOutputs(pat, cand)) {
                         continue;
                     }
@@ -1468,8 +1378,7 @@ public abstract class CraftingServiceSyncMixin {
                         var b = cin[i].getPossibleInputs();
                         if (a.length == 0 || b.length == 0 || !a[0].what().equals(b[0].what())
                                 || a[0].amount() * pi[i].getMultiplier() != b[0].amount() * cin[i].getMultiplier()
-                                // [重檢15] 替代品清單（poss[1..]）key 集合也要相等——否則陳舊解鎖證明(3)
-                                // 與執行器取料的替代品語意在換綁後漂移
+                                // [重檢15] 替代品 key 集合也要相等——否則取料語意換綁後漂移
                                 || !gtocraftfix$samePossibleKeySet(a, b)) {
                             same = false;
                             break;
@@ -1486,9 +1395,8 @@ public abstract class CraftingServiceSyncMixin {
                 var tm = (Map<Object, Object>) tasks;
                 var oldPat = (IPatternDetails) sw[0];
                 var cand2 = (IPatternDetails) sw[1];
-                // [重檢2] 先遷移 allocations 配額再換綁：executeCrafting 以樣板 definition 查配額，查無即
-                // INSUFFICIENT_PRIORITY＋跳過任務；舊 def 配額只會被「執行中同 def 樣板」遞減、purge 只清
-                // ≤0、且隨 NBT 跨重啟 → 不遷移＝玩家單永凍。遷移失敗（反射不可用）放棄本筆換綁。
+                // [重檢2] 先遷配額再換綁：executeCrafting 以樣板 definition 查配額，查無即
+                // INSUFFICIENT_PRIORITY 跳過任務（不遷移＝玩家單永凍）；遷移失敗放棄本筆換綁。
                 if (!gtocraftfix$migrateAllocations(job, oldPat, cand2)) {
                     continue;
                 }
@@ -1576,8 +1484,7 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
-    // ---- [重檢7] log 分流：info（窗內 200）／warn（窗內 50）／例外（窗內 20，絕不與一般共用額度），
-    //      每 5 分鐘窗重置——取代舊單一 sitterLog（200 後全靜默、例外站 ≤5 幾乎從不觸發）。
+    // ---- [重檢7] log 分流：info 200／warn 50／例外 20（不共用額度），每 5 分鐘窗重置 ----
     private static boolean gtocraftfix$logOk(AtomicInteger counter, int cap) {
         long now = System.currentTimeMillis();
         if (now - gtocraftfix$logWindow > 300_000L) {
@@ -1698,15 +1605,9 @@ public abstract class CraftingServiceSyncMixin {
     }
 
     /**
-     * [v1.2.1] 配額死鎖解鎖。GTO executeCrafting 的優先名額（allocations）在
-     * pushPatternSuccess 扣到 newQ<=0 時呼叫 purgePatternEverywhere 把該樣板定義從
-     * 整本配額帳抹除；之後同樣板剩餘輪次過閘時 allocKey==null → 記
-     * INSUFFICIENT_PRIORITY 直接跳過——料明明取出手上（extractPatternInputs 已成功）
-     * 卻永遠不推。配額帳只在 plan 是 AE2 原生 CraftingPlan 時存在（lpcalc／修補包裝計畫
-     * 帳空、天然免疫），所以只有原生計畫踩雷。
-     * 救援：某剩輪任務主產物的最後結果含 INSUFFICIENT_PRIORITY、持續 ≥30 秒且
-     * 全 job 總輪數零進度 → 清空配額帳（名額是優化不是正確性條件，清了＝原版行為）。
-     * 反射全軟失敗。
+     * [v1.2.1] 配額死鎖解鎖：GTO 配額扣到 0 時 purgePatternEverywhere 抹除該樣板定義，之後同樣板
+     * 剩餘輪次永遠 INSUFFICIENT_PRIORITY（料在手上卻不推）。結果含該碼、持續 ≥30 秒且全 job 零進度
+     * → 清空配額帳（名額是優化不是正確性條件，清了＝原版行為）。反射全軟失敗。
      */
     private boolean gtocraftfix$unlockQuota(appeng.crafting.execution.CraftingCpuLogic logic,
                                             appeng.me.cluster.implementations.CraftingCPUCluster cluster) {
@@ -1783,9 +1684,8 @@ public abstract class CraftingServiceSyncMixin {
             Object[] st = gtocraftfix$quotaStuck.get(cluster);
             Object stJob = st == null ? null : ((java.lang.ref.WeakReference<?>) st[0]).get();
             if (st == null || stJob != job || (Long) st[2] != totalRounds) {
-                // [重檢18] 首見／換單／有進度 → 重新計時；掛號當下把該 key 的 INSUFFICIENT_PRIORITY
-                // 從 craftingResults 拔掉：活的配額鎖每 tick 被 GTO 重寫、下輪必在；陳舊殘留
-                //（忙碌/失聯等不寫結果的停滯路徑不會清舊帳）拔掉就不回來 → 下輪 stuckOut==null 自動解除。
+                // [重檢18] 首見／換單／有進度 → 重新計時；掛號當下先拔該 key 的 INSUFFICIENT_PRIORITY
+                // 殘留——活的配額鎖每 tick 會被 GTO 重寫回來，陳舊殘留拔了就不回來。
                 gtocraftfix$removeResult(rm, stuckOut, "INSUFFICIENT_PRIORITY");
                 gtocraftfix$quotaStuck.put(cluster, new Object[] {
                         new java.lang.ref.WeakReference<>(job), (long) gtocraftfix$tickCounter, totalRounds });
@@ -1854,9 +1754,8 @@ public abstract class CraftingServiceSyncMixin {
     private static volatile Method gtocraftfix$mIsPaused;
     private static volatile boolean gtocraftfix$mIsPausedTried;
 
-    /** [v1.7.1] CPU 是否被玩家暫停（OptimizedCraftingCpuLogic.isPaused:760-765，隨 NBT 存檔；
-     *  paused 時 executeCrafting 直接 return 0）——零進度是預期而非凍結，保母/救援全要跳過。
-     *  只在 NoSuchMethod 時永久 fail-open（WARN 一次留痕）；其他例外允許下次重試。 */
+    /** [v1.7.1] CPU 是否被玩家暫停（paused 時執行器不跑、零進度是預期）；
+     *  NoSuchMethod 永久 fail-open（WARN 一次），其他例外允許下次重試。 */
     private static boolean gtocraftfix$isPausedCpu(appeng.crafting.execution.CraftingCpuLogic logic) {
         try {
             var m = gtocraftfix$mIsPaused;
@@ -1880,12 +1779,8 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
-    /** [v1.7.1] PushResult 人話化（GTOCore 原始碼定案：正碼＝成功、負碼＝失敗；BREAK 是
-     *  「推送完成」成功收尾碼，不是機器忙碌）。括號保留原碼供既有 grep 流程延續；
-     *  用 \b 邊界防子串誤傷（底線是 word char，\bBREAK\b 不會命中 BREAK_TASK_LOOP，
-     *  也不會二次替換前一條規則插入的括號原碼）。NOWHERE_TO_PUSH 依 GTO 官方 zh 語意
-     *  ＝機器滿載（忙碌常態）；REJECTED 落進 results 的唯一路徑＝供應器方向快取缺失
-     *  （各面忙碌的 REJECTED 在 provider 迴圈內被折疊成 NOWHERE_TO_PUSH）。 */
+    /** [v1.7.1] PushResult 人話化（正碼＝成功、負碼＝失敗；BREAK 是「推送完成」成功收尾碼）。
+     *  括號保留原碼供既有 grep；\b 邊界防子串誤傷與二次替換（底線是 word char）。 */
     private static String gtocraftfix$zhPush(String s) {
         if (s == null) {
             return null;
@@ -1965,9 +1860,8 @@ public abstract class CraftingServiceSyncMixin {
     }
 
     /**
-     * [v1.2.0] 完單法醫＋訂單交付帳：每輪保母記錄 cluster 現任 job 的（交付帳剩、任務剩輪）；
-     * job 消失/更換當下欠帳 >0 就印「完單快照」（提早完單存證），訂單 job 交付帳每次變動
-     * 也印一行——十份剩四份類事件從此死得明明白白。純記錄，不動任何帳。
+     * [v1.2.0] 完單法醫：每輪記錄 cluster 現任 job 的（交付帳剩、任務剩輪）；job 消失/更換當下
+     * 欠帳 >0 印「完單快照」，訂單交付帳變動也印。純記錄，不動任何帳。
      */
     private void gtocraftfix$trackJob(appeng.me.cluster.implementations.CraftingCPUCluster cluster,
                                       appeng.crafting.execution.CraftingCpuLogic logic, Object jobNow,
@@ -1975,14 +1869,12 @@ public abstract class CraftingServiceSyncMixin {
         try {
             Object[] prev = gtocraftfix$jobTrack.get(cluster);
             Object prevJob = prev == null ? null : ((java.lang.ref.WeakReference<?>) prev[0]).get();
-            // [重檢18] prevJob 弱參照被 GC 清掉 ⟺ job 確實換過（prev[0] 恆以非 null job 建構）——
-            // 舊條件 jobNow != prevJob 在「job 死＋GC」時 null==null 誤判沒換單，訃聞/廣播被無聲吞掉
+            // [重檢18] prevJob 弱參照被 GC 清掉 ⟺ job 確實換過（單比 jobNow != prevJob 在 null==null 時誤判沒換單）
             if (prev != null && (jobNow != prevJob || prevJob == null)) {
                 long lr = (Long) prev[2];
                 long rounds = (Long) prev[3];
-                // [重檢18] 死亡時刻現讀 link 狀態：slot4 取樣滯後最多一輪保母，而取消→job 死亡
-                // 同 tick 完成（GTO 每 tick 檢 isCanceled 即殺）——舊快照對 cancel 死法恆 false。
-                // link 物件受 nexus/CraftingService 強持有，死後仍可靠讀。
+                // [重檢18] 死亡時刻現讀 link 狀態：取消→job 死亡同 tick 完成，slot4 快照對 cancel 死法恆 false；
+                // link 物件受強持有，死後仍可靠讀。
                 boolean liveCanceled = prev.length > 4 && Boolean.TRUE.equals(prev[4]);
                 Object lref = prev.length > 5 && prev[5] instanceof java.lang.ref.WeakReference<?> w5
                         ? w5.get() : null;
@@ -1994,10 +1886,8 @@ public abstract class CraftingServiceSyncMixin {
                             prev[1], lr, rounds,
                             liveCanceled ? "link 已取消→撤單/玩家取消" : "link 未取消→執行器自行完單");
                 }
-                // [v1.3.1] 手動訂單提前收單提示：GTO isOrder 預計數在單據全數推入機器後即收單
-                //（remaining−在途≤0 → finishJob），終端上 job 消失但單據仍在機器裡做、完成後落
-                // ME 儲存——廣播告知玩家免得重複下單。[重檢18] 取消死法不播（在途未推部分不會補做，
-                // 播「勿重複下單」反而誤導）；per-cluster 10 分鐘冷卻防刷版；用顯示名不用 raw id。
+                // [v1.3.1] 訂單提前收單提示：GTO 在單據全數推入機器後即收單，成品稍後才落 ME
+                // ——廣播防玩家重複下單。[重檢18] 取消死法不播（在途未推部分不會補做）；10 分鐘冷卻。
                 long pinf = prev.length > 6 && prev[6] instanceof Long l6 ? l6 : 0L;
                 boolean pOrder = prev.length > 8 && Boolean.TRUE.equals(prev[8]);
                 if (pOrder && lr > 0 && pinf > 0 && !liveCanceled) {
@@ -2021,20 +1911,13 @@ public abstract class CraftingServiceSyncMixin {
                         }
                     }
                 }
-                // [v1.6.1] 非訂單完單短交「監看後補」：GTO 執行器預測性收單攔不到（fork 把
-                // CraftingCpuLogic 挖成抽象殼、finishJob 在 gtolib 閉源子類，mixin 無聲失效實證），
-                // 而帳差「多半不是損失」——單據全數推入機器就關帳，成品稍後自行落庫（v1.6.0
-                // 立即補差額＝重複生產，鈦/鎵類完單常態帳剩 55 萬/911 萬會被誤補到爆——使用者
-                // 實測指正）。改為登記監看：帳差視為「應到未到」，5 分鐘內每 tick 累計該產物
-                // 網路到貨（正差分），到帳蓋過帳差即結案；期滿未到的部分才是真損失 → 補產。
-                // 訂單 job 維持 GTO 收據制；撤單死法不看（尊重玩家取消）；同 key 監看中跳過
-                //（寧漏勿重）。
+                // [v1.6.1] 非訂單完單短交「監看後補」：GTO 預測性收單攔不到（finishJob 在 gtolib
+                // 閉源子類），且帳差多半稍後自行落庫、立即補差額＝重複生產。改登記監看：5 分鐘內
+                // 累計到貨，期滿未到的餘額才是真損失。撤單死法不看；同 key 監看中跳過（寧漏勿重）。
                 if (!pOrder && !liveCanceled && lr > 0 && prev.length > 7 && prev[7] instanceof AEKey outK
                         && lref instanceof appeng.api.networking.crafting.ICraftingLink plink
                         && Boolean.TRUE.equals(gtocraftfix$playerLinks.get(plink))) {
-                    // 只看玩家單（機器源有 requester 水位制自我修復，代補反而重複生產）；
-                    // 先扣完單瞬間網路現貨（CPU 抱的成品 storeItems 已退庫、帳早死名存實亡的
-                    // 鎵/鈦類大單帳差在這裡直接歸零）——寧漏勿重。
+                    // 只看玩家單；先扣完單瞬間網路現貨（storeItems 已退庫的帳差在這裡歸零）——寧漏勿重
                     long s0 = Math.max(0, grid.getStorageService().getCachedInventory().get(outK));
                     long need = lr - s0;
                     boolean dup = false;
@@ -2071,8 +1954,7 @@ public abstract class CraftingServiceSyncMixin {
                             outDesc, lr, remaining, inflight, rounds);
                 }
             }
-            // [v1.2.1] link 取消偵測：requester（訂單機器/接口）撤單當下先警告一次——
-            // GTO 下一 tick 會 cancel 整張 job、剩餘任務全棄（十份剩四份的死因候選）
+            // [v1.2.1] link 取消偵測：requester 撤單當下警告一次——GTO 下一 tick 會棄殺整張 job
             boolean linkDead = gtocraftfix$linkCanceled(jobNow);
             if (linkDead && !(prev != null && prevJob == jobNow && prev.length > 4
                     && Boolean.TRUE.equals(prev[4]))) {
@@ -2080,8 +1962,7 @@ public abstract class CraftingServiceSyncMixin {
                         outDesc, remaining, rounds);
             }
             Object linkObj = gtocraftfix$linkObjOf(jobNow); // 法醫用
-            // [重檢19] slot9 成品基線：本 job 首見時網路已有的成品量——保母餵成品只准餵基線之上
-            // 的新增（防拿既有庫存充產出銷帳）。同 job 沿用首見值，不隨庫存波動。
+            // [重檢19] slot9 成品基線：job 首見時網路已有的成品量；同 job 沿用首見值，不隨庫存波動
             long baseline;
             if (prev != null && prevJob == jobNow && prev.length > 9 && prev[9] instanceof Long b9) {
                 baseline = b9;
@@ -2100,9 +1981,8 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
-    // [v1.3.0] deliverStranded 已移除：requester（merequester）為存量水位制，成品落 ME 儲存
-    // 即正確歸宿；且該實作在 link.insert 拋例外時未回補已抽出的貨（貨損 bug，1.2.2 實錄
-    // "No CraftingLinkState found" 蒸發最多 6588 個 ULV 電路）。
+    // [v1.3.0] deliverStranded 已移除：requester 為存量水位制，成品落 ME 儲存即正確歸宿
+    //（且舊實作在 link.insert 拋例外時未回補已抽出的貨）。
 
     /** [v1.2.2] job.link 物件反射直讀；讀不到回 null。 */
     private static Object gtocraftfix$linkObjOf(Object job) {
@@ -2144,8 +2024,7 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
-    /** [重檢9] job.isOrder 反射直讀。[重檢18] 反射失效改走 registry id 後援——三層訂單守衛
-     *  （不代餵/不認領/不清帳）不可被一次反射失敗（fail-open 回 false）無聲全滅。 */
+    /** [重檢9] job.isOrder 反射直讀；[重檢18] 反射失效走 registry id 後援（訂單守衛不可被一次反射失敗無聲全滅）。 */
     private static boolean gtocraftfix$isOrderJob(Object job) {
         try {
             if (gtocraftfix$fIsOrder == null) {
@@ -2225,9 +2104,8 @@ public abstract class CraftingServiceSyncMixin {
         return sa.equals(sb);
     }
 
-    /** [重檢2] 把 job.allocations 裡掛在舊樣板 definition 的配額條目移除、以新樣板為 key 併回（quota 相加）。
-     *  配額為空（lpcalc 機器單恆空）或欄位不存在（無配額機制的 GTO 版本）回 true；反射失敗回 false
-     *  （呼叫端放棄該筆換綁——保持孤兒勝過換綁後被 INSUFFICIENT_PRIORITY 永凍）。 */
+    /** [重檢2] 把 job.allocations 裡掛在舊樣板 definition 的配額條目移到新樣板（quota 相加）。
+     *  配額為空或欄位不存在回 true；反射失敗回 false（呼叫端放棄換綁——保持孤兒勝過換綁後永凍）。 */
     private static boolean gtocraftfix$migrateAllocations(Object job, IPatternDetails oldPat, IPatternDetails cand) {
         try {
             if (gtocraftfix$fAlloc == null && !gtocraftfix$fAllocTried) {
@@ -2286,13 +2164,10 @@ public abstract class CraftingServiceSyncMixin {
     }
 
     /**
-     * 成品自我認領：gtolib 的交付認領只掛在 CPU 的插入事件上；產出機器若自帶 ME 連接
-     * （me_pattern_buffer 案例），產物會繞過認領 hook 直接進 CPU 庫存——job 拿著成品卻
-     * 記不了帳，waitingFor 也是空的，餵料／陳舊解鎖／補輸入三層全部無感。
-     * 救援：成品在 CPU 庫存滯留 ≥60 秒且數量不動 → 補 waitingFor 假帳、走正規 insert 觸發認領。
-     * 注意 GTO insert 對成品「先按全額銷帳、後問 link」（remainingAmount 用 amount 非 link 實收）：
-     * 認領量須扣掉已銷帳留庫（claimedFinalHeld）與剩餘任務需求（自催化配方），殘額送網路而非留庫，
-     * 否則同批物品會被每 ~60 秒重複燒 remainingAmount → 偽完單短交。反射全軟失敗。
+     * 成品自我認領：產出機器自帶 ME 連接時產物繞過認領 hook 直進 CPU 庫存——記不了帳、waitingFor 空、
+     * 其餘救援全無感。滯留 ≥60 秒且數量不動 → 補 waitingFor 假帳、走正規 insert 觸發認領。
+     * GTO insert 對成品「先按全額銷帳、後問 link」：認領量須扣已銷帳留庫與剩餘任務需求，
+     * 殘額送網路而非留庫（防同批物品重複燒帳）。反射全軟失敗。
      */
     private boolean gtocraftfix$selfClaimFinal(appeng.crafting.execution.CraftingCpuLogic logic,
                                             appeng.me.cluster.implementations.CraftingCPUCluster cluster,
@@ -2317,13 +2192,12 @@ public abstract class CraftingServiceSyncMixin {
                 gtocraftfix$staleHeld.remove(cluster);
                 return false;
             }
-            // [重檢5] 冷卻檢查：曾被 link 全拒（standalone 玩家單恆回 0）→ 10 分鐘內不重試。
-            // 舊版不查冷卻、每 ~63 秒重試，每次都對同批成品重燒 remainingAmount。
+            // [重檢5] 曾被 link 全拒（standalone 玩家單恆回 0）→ 10 分鐘內不重試（每次重試都重燒帳）
             Integer ru = gtocraftfix$refusedGet(cluster, fk);
             if (ru != null && gtocraftfix$tickCounter - ru < 12000) {
                 return false;
             }
-            // 數量有變動＝機器還在產出，不是滯留 → 年齡歸零（[重檢14] 計時與陳舊等待分表）
+            // 數量有變動＝機器還在產出 → 年齡歸零（[重檢14] 計時與陳舊等待分表）
             Long prev = gtocraftfix$staleHeld.put(cluster, heldFin);
             if (prev == null || prev != heldFin) {
                 gtocraftfix$finalClaimTick.put(cluster, gtocraftfix$tickCounter);
@@ -2348,10 +2222,8 @@ public abstract class CraftingServiceSyncMixin {
                 return false;
             }
             if (gtocraftfix$isOrderJob(job) && gtocraftfix$totalTaskRounds(job) != 0) {
-                // [v1.2.0] 有剩餘任務的訂單 job 不認領：CPU 庫存裡的同 tag 單據可能是前單退庫殘留
-                //（cantStoreItems 案例：探針 held 從開單就躺 10 張），認領＝收據充數偽完單。
-                // [v1.2.2] 零任務（純現貨/全部完工）放行：此時持有單據＝本單交付品，認領＝
-                // 經 link 交給訂單機器記帳——唯一歸還路徑（totalTaskRounds 讀不到回 -1 → 照舊跳過）。
+                // [v1.2.0] 有剩餘任務的訂單 job 不認領（庫存單據可能是前單殘留，認領＝收據充數偽完單）；
+                // [v1.2.2] 零任務放行——此時單據＝本單交付品，認領是唯一歸還路徑。
                 return false;
             }
             if (gtocraftfix$fWaitingFor == null) {
@@ -2363,8 +2235,7 @@ public abstract class CraftingServiceSyncMixin {
             if (!(wf instanceof appeng.crafting.inv.ListCraftingInventory wli)) {
                 return false;
             }
-            // [重檢5] 認領上限＝持有 − 已銷帳留庫（餵料殘額，帳已被 GTO insert 銷過一次，再認領＝二次燒）
-            //         − 剩餘任務對成品的 capped 需求（自催化配方保留工作料；[重檢13] 同公式）
+            // [重檢5] 認領上限＝持有 − 已銷帳留庫 − 剩餘任務對成品的 capped 需求（自催化配方保留工作料）
             long claimable = Math.min(heldFin - gtocraftfix$claimedGet(job)
                     - gtocraftfix$remainingDemand(logic, fk), heldFin);
             if (claimable <= 0) {
@@ -2379,16 +2250,14 @@ public abstract class CraftingServiceSyncMixin {
             try {
                 accepted = logic.insert(fk, got, Actionable.MODULATE);
             } catch (Throwable t) {
-                // [重檢6] 例外補償：收回假帳＋料放回 CPU 庫存再拋。舊版半途拋出會讓假帳永駐 waitingFor
-                //（waiting 從此非空 → 本層永不再跑、陳舊解鎖又跳過成品 → 無人能清）＋物品蒸發。
+                // [重檢6] 例外補償：收回假帳＋料放回 CPU 庫存再拋（假帳永駐 waitingFor 會讓所有救援層失效）
                 wli.extract(fk, got, Actionable.MODULATE);
                 inv.insert(fk, got, Actionable.MODULATE);
                 throw t;
             }
             if (accepted < got) {
-                // [重檢5] 帳目回滾刪除：GTO insert 銷帳用 amount 非 link 實收，此刻假帳已被吃光、無帳可回滾
-                //（舊 wli.extract 是對空帳的 no-op）；殘額改送網路（本 CPU waitingFor 已空 → 攔截層回 0
-                // 不再入）＝standalone 單的正確交付地，且不留 CPU 庫存供下輪重燒。
+                // [重檢5] 此刻假帳已被 GTO insert 全額吃光、無帳可回滾；殘額送網路
+                //（standalone 單的正確交付地），不留 CPU 庫存供下輪重燒。
                 grid.getStorageService().getInventory()
                         .insert(fk, got - accepted, Actionable.MODULATE, cluster.getSrc());
             }
@@ -2435,9 +2304,7 @@ public abstract class CraftingServiceSyncMixin {
                 gtocraftfix$fTasks = ft;
             }
             Map<?, ?> tasks = (Map<?, ?>) gtocraftfix$fTasks.get(job);
-            // [v1.2.2] fInv 改走自帶初始化的 invOf：v1.2.0 起 jobOf() 會先初始化 fJob，
-            // 舊「fJob==null 才順便初始化 fInv」耦合被跳過 → 開機頭 20 秒（探針/餵料還沒
-            // 路過 invOf 前）補輸入整層 NPE（21:08:36 實錄）。
+            // [v1.2.2] fInv 走自帶初始化的 invOf（「fJob==null 才順便初始化 fInv」的耦合會被 jobOf 先跑而跳過 → NPE）
             var inv = gtocraftfix$invOf(logic);
             if (tasks == null || inv == null || tasks.isEmpty()) {
                 return false;
@@ -2459,9 +2326,8 @@ public abstract class CraftingServiceSyncMixin {
                     continue;
                 }
                 var pat = (IPatternDetails) en.getKey();
-                // [v1.3.6] 樣板總成（PatternBuffer 系列，無限槽）供應器：一次補滿全部剩餘輪。
-                // cap 原為防「機器塞爆＋CPU 囤料鎖倉」；總成無限空間，塞好塞滿讓執行器
-                // 一次推完反而最快（涵蓋 MEPatternBuffer／Simple／Wildcard／Catalyst／Proxy）。
+                // [v1.3.6] 樣板總成（PatternBuffer 系列，無限槽）供應器：一次補滿全部剩餘輪
+                //（cap 原為防機器塞爆；總成無限空間，塞滿讓執行器一次推完最快）
                 long roundsCap = gtocraftfix$TOPUP_ROUNDS_CAP;
                 try {
                     for (var prov : ((CraftingService) (Object) this).getProviders(pat)) {
@@ -2472,11 +2338,8 @@ public abstract class CraftingServiceSyncMixin {
                     }
                 } catch (Throwable ignored) {
                 }
-                // [v1.7.1] v1.7.0 的「完單時點復原」節流已撤：原始碼證實非訂單 job 根本沒有
-                // 「全部派完即 finishJob」路徑（唯一收單點＝insert() 實際交付最終產物打穿
-                // remainingAmount，OptimizedCraftingCpuLogic.java:470-475）——節流改不了收單
-                // 時點，卻會卡住 >64 台並行產線的餵料窗口。「機器還在做就收單」屬訂單收據制
-                //（:134-155，刻意設計）；完單快照的「帳剩 N」多為保母取樣滯後假象。
+                // [v1.7.1] 完單時點節流已撤：非訂單 job 唯一收單點＝insert 實際交付打穿 remainingAmount，
+                // 節流改不了收單時點、只會卡住大並行產線的餵料窗口。
                 for (var input : pat.getInputs()) {
                     var poss = input.getPossibleInputs();
                     if (poss.length == 0) {
@@ -2492,10 +2355,8 @@ public abstract class CraftingServiceSyncMixin {
                     if (per <= 0) {
                         continue;
                     }
-                    // [重檢1] 輪數 cap：need=per×min(times,cap)。舊版 per×times 無上限（溢位還 fallback
-                    // Long.MAX/4＝實質抽光全網）：x10M 常備單會把該料全量吸進單一 CPU 鎖到完單，
-                    // 其他 CPU／機器全部餓死；job 存續期執行器只取不還，storeItems 只在完單後跑。
-                    // cap 內的量完單時由 storeItems 退回網路，不會遺失；每秒會再續補。
+                    // [重檢1] 輪數 cap：無上限會把該料全量吸進單一 CPU 鎖到完單、其他 CPU 餓死；
+                    // cap 內的量完單時 storeItems 退回網路，每秒會再續補。
                     long need;
                     try {
                         need = Math.multiplyExact(per, Math.min(times, roundsCap));
@@ -2524,14 +2385,13 @@ public abstract class CraftingServiceSyncMixin {
                         }
                     }
                     if (have + got < per) {
-                        // 連一輪都湊不齊且網路已乾 → 執行器會無聲跳過此任務；至少留下可見證據
+                        // 連一輪都湊不齊且網路已乾 → 執行器會無聲跳過此任務；留下可見證據
                         if (gtocraftfix$logWarnOk()) {
                             LOG.warn("[craftfix] 任務缺料 {}：每輪需 {}、CPU 有 {}、網路已乾（{} 任務被無聲跳過）",
                                     ik, gtocraftfix$fmtAmt(ik, per), gtocraftfix$fmtAmt(ik, have + got),
                                     pat.getPrimaryOutput().what());
                         }
-                        // [v1.4.0→v1.8.0] 斷料持續 60 秒 → 收集、迴圈後整併成單則聊天訊息
-                        //（不再自動下單救援）
+                        // [v1.8.0] 斷料持續 60 秒 → 收集、迴圈後整併成單則聊天訊息（不自動下單）
                         var due = gtocraftfix$starveDue(cluster, job, pat.getPrimaryOutput().what(),
                                 ik, per, have + got);
                         if (due != null) {
@@ -2551,14 +2411,9 @@ public abstract class CraftingServiceSyncMixin {
         return acted;
     }
 
-    /** [v1.4.0→v1.8.0] 跑單斷料計時：同 job 同（任務主產物|缺料）連續 60 秒「連一輪都湊不齊且
-     *  網路已乾」且過 10 分鐘冷卻 → 回報條目（由 starveBroadcast 整併成單則訊息——深層連鎖
-     *  斷料一次 30+ 種料同時過門檻的洗版實錄）；未達門檻回 null。換 job／料補齊即重計
-     *  （[重檢18] 計時綁 job 身分）。
-     *  [v1.8.0] 自動救援下單（v1.5.0）已整套移除：深層斷鏈場景「每輪需求×剩餘輪數」的補單量
-     *  不可控——實錄一小時內滾動開出 19+ 張巨量救援單（NOR 晶片 x60000、陶瓷磚 x79040、
-     *  鋼錠 x35376、量子位晶片 x31878…）把 CPU/產線塞爆、伺服器過載。回歸「點名＋玩家自行
-     *  補料、保母自動餵入解凍」。 */
+    /** [v1.8.0] 跑單斷料計時：同 job 同（任務主產物|缺料）連續 60 秒湊不齊且網路已乾、過 10 分鐘
+     *  冷卻 → 回報條目（由 starveBroadcast 整併，防深層斷鏈多料同時過門檻洗版）；未達門檻回 null。
+     *  換 job／料補齊即重計。自動救援下單已移除：補單量不可控，會塞爆 CPU/產線。 */
     private Object[] gtocraftfix$starveDue(appeng.me.cluster.implementations.CraftingCPUCluster cluster,
                                            Object job, AEKey patOut, AEKey ik, long per, long have) {
         try {
@@ -2630,11 +2485,8 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
-    /** [v1.6.1] 完單短交監看泵（每 tick）：GTO 預測性收單（機器還在做就關帳）攔不到也**不該擋**
-     *  ——帳差多半稍後自行落庫。這裡只對「玩家單、扣掉現貨後仍應到未到」的量做 5 分鐘到貨
-     *  監看（cachedInventory 正差分累計，同 tick 進出會互抵→低估到貨→高估損失的方向性誤差
-     *  由現貨抵帳與玩家單限定兜住）；期滿仍未到帳的餘額才視為真損失 → [v1.8.0] 只聊天通知、
-     *  不代補（自動補單整套移除）。 */
+    /** [v1.6.1] 完單短交監看泵（每 tick）：只對「玩家單、扣現貨後仍應到未到」的量做 5 分鐘到貨
+     *  監看（cachedInventory 正差分累計）；期滿餘額才視為真損失 → 只聊天通知、不代補。 */
     private void gtocraftfix$shortWatchTick() {
         try {
             if (gtocraftfix$shortWatch.isEmpty()) {
@@ -2666,7 +2518,7 @@ public abstract class CraftingServiceSyncMixin {
                 }
                 it.remove();
                 long loss = need - accum;
-                // [v1.8.0] 只通知不代補（自動補單整套移除）：真損失罕見，交玩家決定
+                // [v1.8.0] 只通知不代補：真損失罕見，交玩家決定
                 var server = grid.getPivot() != null && grid.getPivot().getLevel() != null
                         ? grid.getPivot().getLevel().getServer()
                         : null;
