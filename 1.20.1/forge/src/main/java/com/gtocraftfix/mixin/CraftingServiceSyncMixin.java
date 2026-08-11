@@ -129,6 +129,9 @@ public abstract class CraftingServiceSyncMixin {
     /** [v1.4.0] 跑單斷料廣播：cluster（弱鍵）→ {job 弱參照, 「任務主產物|缺料」→ int[]{首見, 上次廣播}}；
      *  鍵含任務主產物，防別的任務把同 key 計時清零。 */
     private Map<CraftingCPUCluster, Object[]> gtocraftfix$starveNotice = new WeakHashMap<>();
+    // [v1.8.2] 同文去重：兩顆 CPU 跑同產物會同秒連發相同訊息
+    private String gtocraftfix$lastStarveTxt;
+    private int gtocraftfix$lastStarveTxtTick = Integer.MIN_VALUE / 2;
     /** [v1.4.0] 玩家定向訊息節流：uuid|產物|錯誤碼 → 上次發送 ms（3 秒窗防連點；伺服器執行緒單寫）。 */
     private static Map<String, Long> gtocraftfix$playerNoticeMs = new HashMap<>();
     /** [v1.6.1] 完單短交監看：{AEKey out, 應到未到, 已到帳, 上次存量, 起始 tick}；正差分累計到貨、蓋過應到即結案。 */
@@ -1148,7 +1151,8 @@ public abstract class CraftingServiceSyncMixin {
                 // 輸入補給：帳漂移可把任務輸入吃到不足一輪 → 每 tick 取料失敗、無聲凍結；
                 // 短缺輸入從網路補進 CPU 庫存。waiting 空、或本輪餵料掛零時都要跑。
                 if ((waiting.isEmpty() || handled == handledBefore) && handled < 16) {
-                    acted |= gtocraftfix$topUpInputs(logic, storage, cluster);
+                    // [v1.8.2] waiting 非空＝本單有東西在機器裡做（深鏈上游）→ 斷料點名凍結
+                    acted |= gtocraftfix$topUpInputs(logic, storage, cluster, !waiting.isEmpty());
                 }
                 // 陳舊等待解鎖：可證明無用的 waitingFor 帳目才清（無剩餘任務吃、網內無貨、滯留逾時）
                 if (!waiting.isEmpty()) {
@@ -2282,7 +2286,8 @@ public abstract class CraftingServiceSyncMixin {
     /** 輸入補給：讀 GTO job 的剩餘任務，對「需求 > CPU 庫存」的主輸入從網路補進（輪數有 cap）。反射全軟失敗。 */
     private boolean gtocraftfix$topUpInputs(appeng.crafting.execution.CraftingCpuLogic logic,
                                             appeng.api.storage.MEStorage storage,
-                                            appeng.me.cluster.implementations.CraftingCPUCluster cluster) {
+                                            appeng.me.cluster.implementations.CraftingCPUCluster cluster,
+                                            boolean jobBusy) {
         boolean acted = false;
         try {
             IActionSource src = cluster.getSrc();
@@ -2388,13 +2393,14 @@ public abstract class CraftingServiceSyncMixin {
                         // 連一輪都湊不齊且網路已乾 → 執行器會無聲跳過此任務；留下可見證據
                         long flying = gtocraftfix$inFlightAmt(job, ik); // [v1.8.1] 在途生產＝慢，非卡
                         if (gtocraftfix$logWarnOk()) {
-                            LOG.warn("[craftfix] 任務缺料 {}：每輪需 {}、CPU 有 {}、在途 {}、網路已乾（{} 任務被無聲跳過）",
+                            LOG.warn("[craftfix] 任務缺料 {}：每輪需 {}、CPU 有 {}、在途 {}、網路已乾（{} 任務被無聲跳過{}）",
                                     ik, gtocraftfix$fmtAmt(ik, per), gtocraftfix$fmtAmt(ik, have + got),
-                                    gtocraftfix$fmtAmt(ik, flying), pat.getPrimaryOutput().what());
+                                    gtocraftfix$fmtAmt(ik, flying), pat.getPrimaryOutput().what(),
+                                    jobBusy ? "；本單在製中" : "");
                         }
                         // [v1.8.0] 斷料持續 60 秒 → 收集、迴圈後整併成單則聊天訊息（不自動下單）
                         var due = gtocraftfix$starveDue(cluster, job, pat.getPrimaryOutput().what(),
-                                ik, per, have + got, flying);
+                                ik, per, have + got, flying, jobBusy);
                         if (due != null) {
                             starveDue.add(due);
                         }
@@ -2412,12 +2418,14 @@ public abstract class CraftingServiceSyncMixin {
         return acted;
     }
 
-    /** [v1.8.0] 跑單斷料計時：同 job 同（任務主產物|缺料）連續 60 秒湊不齊、網路已乾**且全網零在途
-     *  生產**、過 10 分鐘冷卻 → 回報條目（由 starveBroadcast 整併）；未達門檻回 null。
-     *  換 job／料補齊即重計；[v1.8.1] 有在途生產＝機器在做只是慢，凍結計時不點名。
+    /** [v1.8.0] 跑單斷料計時：同 job 同（任務主產物|缺料）連續 60 秒湊不齊、網路已乾且**整單完全
+     *  靜止**、過 10 分鐘冷卻 → 回報條目（由 starveBroadcast 整併）；未達門檻回 null。
+     *  換 job／料補齊即重計。凍結條件（[v1.8.1] 此料全網有在途；[v1.8.2] 本單 waitingFor 非空＝
+     *  深鏈上游在製，缺料只是還沒輪到）任一成立即重計不點名——只點名「整單無任何機器在做」的真卡。
      *  自動救援下單已移除：補單量不可控，會塞爆 CPU/產線。 */
     private Object[] gtocraftfix$starveDue(appeng.me.cluster.implementations.CraftingCPUCluster cluster,
-                                           Object job, AEKey patOut, AEKey ik, long per, long have, long flying) {
+                                           Object job, AEKey patOut, AEKey ik, long per, long have,
+                                           long flying, boolean jobBusy) {
         try {
             Object[] st = gtocraftfix$starveNotice.get(cluster);
             Object stJob = st == null ? null : ((java.lang.ref.WeakReference<?>) st[0]).get();
@@ -2432,8 +2440,8 @@ public abstract class CraftingServiceSyncMixin {
             }
             var rec = m.computeIfAbsent(patOut + "|" + ik,
                     k -> new int[] { gtocraftfix$tickCounter, Integer.MIN_VALUE / 2 });
-            if (flying > 0) {
-                rec[0] = gtocraftfix$tickCounter; // [v1.8.1] 凍結：60 秒門檻只累計「零在途」時間
+            if (flying > 0 || jobBusy) {
+                rec[0] = gtocraftfix$tickCounter; // 凍結：60 秒門檻只累計「整單靜止」時間
                 return null;
             }
             int stuck = gtocraftfix$tickCounter - rec[0];
@@ -2508,6 +2516,13 @@ public abstract class CraftingServiceSyncMixin {
                                         + "、CPU " + gtocraftfix$fmtAmt(k, (Long) d[2]) + "）"));
             }
             msg.append(net.minecraft.network.chat.Component.literal("；網路無貨，補進 ME 後會自動續作"));
+            String txt = msg.getString();
+            if (txt.equals(gtocraftfix$lastStarveTxt)
+                    && gtocraftfix$tickCounter - gtocraftfix$lastStarveTxtTick < 1200) {
+                return; // [v1.8.2] 60 秒內同文只發一次
+            }
+            gtocraftfix$lastStarveTxt = txt;
+            gtocraftfix$lastStarveTxtTick = gtocraftfix$tickCounter;
             server.getPlayerList().broadcastSystemMessage(msg, false);
         } catch (Throwable ignored) {
         }
