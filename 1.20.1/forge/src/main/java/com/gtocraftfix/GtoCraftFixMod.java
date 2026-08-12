@@ -7,13 +7,18 @@ import net.minecraftforge.fml.common.Mod;
 import org.apache.logging.log4j.LogManager;
 
 /**
- * 獨立修復 mod（不改 GTOCore、不動 gtolib），修 GTO 環境下多步自動合成：
+ * 獨立修復 mod：不改 GTOCore、不動 gtolib。修 GTO 環境下「合成樹超過一步就無法（正確）自動合成」：
  * <ol>
- *   <li>算料同步化：GTO async 算料多步時 Future 不返回 → 改伺服器執行緒同步執行。</li>
- *   <li>機器源 present-once：讓機器源走與玩家相同的 IgnoreMissing 分支（缺料記 waitingFor、回流認領）。</li>
- *   <li>保母：定期掃孤兒 waitingFor，網路有貨直餵解凍。</li>
+ *   <li><b>算料同步化</b>：GTO 單執行緒 async 算料多步時 Future 不返回 → 終端 ctrl+左鍵卡死。
+ *       改伺服器執行緒同步執行。</li>
+ *   <li><b>機器源 present-once 走 IgnoreMissing</b>：GTO 計畫的 usedItems 含「執行期間才回流的中間產物」，
+ *       嚴格取料必失敗 → 接口/請求器/合成卡被 MISSING_INGREDIENT 無限拒單。包 present-once 讓機器源
+ *       走與玩家相同的 IgnoreMissing 分支（缺料記 waitingFor、回流認領）。</li>
+ *   <li><b>保母</b>：GTO 算料器會把「網路 0 個的中間料」寫進 usedItems 而不排合成任務（批量餘數）
+ *       → job 永久凍結。每 5 秒掃孤兒 waitingFor：有貨直餵、沒貨代下巢狀合成單。</li>
  * </ol>
- * 全部實作於 {@code mixin.CraftingServiceSyncMixin}；{@code mixin.CraftingCpuHelperMixin} 為金絲雀。
+ * 全部實作於 {@code mixin.CraftingServiceSyncMixin}（皆掛在 AE2 類上）；
+ * {@code mixin.CraftingCpuHelperMixin} 為金絲雀（present-once 失效警報）。
  */
 @Mod(GtoCraftFixMod.MODID)
 public final class GtoCraftFixMod {

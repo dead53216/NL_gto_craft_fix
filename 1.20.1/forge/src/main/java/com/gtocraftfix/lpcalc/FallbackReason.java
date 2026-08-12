@@ -19,8 +19,6 @@ public enum FallbackReason {
     BAD_PATTERN,
     /** 多候選重導向槽所屬樣板 runs > 0 */
     REDIRECT_AMBIGUOUS,
-    /** [重檢10] 唯一候選重導向解出的 key 不在該槽 possibleInputs 內（GTO 執行器只精確比對取料，執行必凍） */
-    REDIRECT_UNREACHABLE,
     /** [鐵則3] 循環 SCC 產出 key 承接 PATTERN 來源需求（禁止抵帳） */
     SCC_FEEDS_PATTERN,
     /** 高斯奇異／代入 pin 後仍欠定／負解；自迴圈 b−a≤0 且 d>0 */
