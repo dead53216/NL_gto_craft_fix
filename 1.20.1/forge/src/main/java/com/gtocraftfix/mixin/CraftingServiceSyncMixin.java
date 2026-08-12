@@ -1056,7 +1056,12 @@ public abstract class CraftingServiceSyncMixin {
                         if (orderJob) {
                             continue;
                         }
-                        // 成品也要餵（成品回流但 CPU 沒攔到認領時的唯一救援）；拒收記憶 10 分鐘內不再試
+                        // [v1.8.4] standalone（玩家終端）單成品不餵：真交付經認領攔截已燒帳、link 收 0
+                        // 貨落回網路——那不是待認領盈餘，再餵＝同批貨雙重銷帳（100k 單 50k 收單實錄）。
+                        if (gtocraftfix$standaloneLink(jobNow)) {
+                            continue;
+                        }
+                        // requester 單成品照餵（link 實收、貨進 requester）；拒收記憶 10 分鐘內不再試
                         Integer ru = gtocraftfix$refusedGet(cluster, key);
                         if (ru != null && gtocraftfix$tickCounter - ru < 12000) {
                             continue;
@@ -2462,6 +2467,22 @@ public abstract class CraftingServiceSyncMixin {
         } catch (Throwable ignored) {
             return null;
         }
+    }
+
+    /** [v1.8.4] standalone（玩家終端）單判定：其 link.insert 恆收 0、真交付經認領攔截燒帳後落回
+     *  網路即為送達。判不出時保守回 true（寧漏勿重——誤餵會雙重銷帳）。 */
+    private boolean gtocraftfix$standaloneLink(Object job) {
+        try {
+            if (job == null) {
+                return true;
+            }
+            Object link = gtocraftfix$linkObjOf(job);
+            if (link instanceof appeng.api.networking.crafting.ICraftingLink l) {
+                return l.isStandalone();
+            }
+        } catch (Throwable ignored) {
+        }
+        return true;
     }
 
     /** [v1.8.1] 全網在途生產量：GTO 版 getRequestedAmount＝各 CPU waitingFor 合計（涵蓋玩家另開的
