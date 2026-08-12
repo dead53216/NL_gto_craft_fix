@@ -204,8 +204,15 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.8.0：同步算料＋機器源 IgnoreMissing＋保母（1秒/總成滿補/基線防偽/paused排除）＋配額解鎖＋link判死寬限＋斷料整併點名（不自動補單）＋完單短交通知＋探針PushResult人話化；lpcalc={}。",
-                                com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
+                        String ver;
+                        try {
+                            ver = net.minecraftforge.fml.ModList.get().getModContainerById("gto_craft_fix")
+                                    .map(c -> c.getModInfo().getVersion().toString()).orElse("?");
+                        } catch (Throwable t) {
+                            ver = "?";
+                        }
+                        LOG.info("[craftfix] 已啟用 v{}：同步算料＋機器源 IgnoreMissing＋保母（1秒/基線防偽/paused排除）＋配額解鎖＋link判死寬限＋斷料整併點名（不自動補單）＋完單短交通知＋探針PushResult人話化；lpcalc={}。",
+                                ver, com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
                     }
                 }
             }
@@ -1085,7 +1092,7 @@ public abstract class CraftingServiceSyncMixin {
                         var inv0 = gtocraftfix$invOf(logic);
                         if (inv0 != null) {
                             long heldHere = inv0.list.get(key);
-                            // [重檢13] 只認領超出「剩餘任務 capped 需求」的超額：topUp 塞的工作備料不是交付品，
+                            // [重檢13] 只認領超出「剩餘任務全量需求」的超額：topUp 塞的工作備料不是交付品，
                             // 銷了帳會讓在途真交付被拒
                             long claimable = Math.min(heldHere - gtocraftfix$remainingDemand(logic, key), want);
                             if (claimable > 0) {
@@ -1552,7 +1559,8 @@ public abstract class CraftingServiceSyncMixin {
         return a == null ? 0 : a[0];
     }
 
-    /** [重檢13] 剩餘任務（times>0）對某 key 的需求總量，輪數以 [重檢1] 的 cap 截斷（兩層判準對齊）。
+    /** [重檢13] 剩餘任務（times>0）對某 key 的需求總量，輪數**不截斷**——[v1.8.3] 總成滿補塞進的
+     *  備料可遠超 cap，截斷會把備料誤判成可認領超額、每秒重複燒 waitingFor 帳（液態氦實錄）。
      *  失敗回 0（回到舊行為＝可全額認領）。 */
     private long gtocraftfix$remainingDemand(appeng.crafting.execution.CraftingCpuLogic logic, AEKey key) {
         try {
@@ -1586,7 +1594,7 @@ public abstract class CraftingServiceSyncMixin {
                 if (times <= 0) {
                     continue;
                 }
-                long capped = Math.min(times, gtocraftfix$TOPUP_ROUNDS_CAP);
+                long capped = times; // [v1.8.3] 不截斷，見 javadoc
                 var pat = (IPatternDetails) en.getKey();
                 for (var input : pat.getInputs()) {
                     for (var poss : input.getPossibleInputs()) {
@@ -2239,7 +2247,7 @@ public abstract class CraftingServiceSyncMixin {
             if (!(wf instanceof appeng.crafting.inv.ListCraftingInventory wli)) {
                 return false;
             }
-            // [重檢5] 認領上限＝持有 − 已銷帳留庫 − 剩餘任務對成品的 capped 需求（自催化配方保留工作料）
+            // [重檢5] 認領上限＝持有 − 已銷帳留庫 − 剩餘任務對成品的全量需求（自催化配方保留工作料）
             long claimable = Math.min(heldFin - gtocraftfix$claimedGet(job)
                     - gtocraftfix$remainingDemand(logic, fk), heldFin);
             if (claimable <= 0) {
@@ -2331,13 +2339,14 @@ public abstract class CraftingServiceSyncMixin {
                     continue;
                 }
                 var pat = (IPatternDetails) en.getKey();
-                // [v1.3.6] 樣板總成（PatternBuffer 系列，無限槽）供應器：一次補滿全部剩餘輪
-                //（cap 原為防機器塞爆；總成無限空間，塞滿讓執行器一次推完最快）
+                // [v1.3.6] 樣板總成（PatternBuffer 系列，無限槽）供應器放寬 cap 讓執行器快推；
+                // [v1.8.3] 放寬有界（cap×8）：無界會把該料全網存量抽進單一 CPU（液態氦 6.5 億 mB
+                // 實錄），其他單全部餓死，且超出 remainingDemand 判準會被自庫認領誤燒帳。
                 long roundsCap = gtocraftfix$TOPUP_ROUNDS_CAP;
                 try {
                     for (var prov : ((CraftingService) (Object) this).getProviders(pat)) {
                         if (prov != null && prov.getClass().getName().contains("PatternBuffer")) {
-                            roundsCap = times;
+                            roundsCap = Math.min(times, gtocraftfix$TOPUP_ROUNDS_CAP * 8);
                             break;
                         }
                     }
