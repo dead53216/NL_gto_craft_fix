@@ -2454,8 +2454,11 @@ public abstract class CraftingServiceSyncMixin {
             }
             var rec = m.computeIfAbsent(patOut + "|" + ik,
                     k -> new int[] { gtocraftfix$tickCounter, Integer.MIN_VALUE / 2 });
-            if (flying > 0 || jobBusy) {
-                rec[0] = gtocraftfix$tickCounter; // 凍結：60 秒門檻只累計「整單靜止」時間
+            if (flying > 0 || (jobBusy && gtocraftfix$jobProduces(job, ik))) {
+                // 凍結：全網有在途、或深鏈上游還會產這個料。[v1.8.5] 本單沒有任何剩餘輪次會產 ik
+                // （計畫記了現貨、沒排生產）且零在途＝死枝，jobBusy 也要點名——基岩採礦機訂單實錄：
+                // 缺 hv_digital_miner 全網乾涸，卻因其他分支在製而整單靜默。
+                rec[0] = gtocraftfix$tickCounter;
                 return null;
             }
             int stuck = gtocraftfix$tickCounter - rec[0];
@@ -2466,6 +2469,41 @@ public abstract class CraftingServiceSyncMixin {
             return new Object[] { ik, per, have, stuck };
         } catch (Throwable ignored) {
             return null;
+        }
+    }
+
+    /** [v1.8.5] 本單是否還有剩餘輪次（times>0）會產出 ik——false＝這張單永遠不會自產此料
+     *  （計畫把需求記在網路現貨上）。判不出回 true（保守維持凍結、避免誤點名）。 */
+    private boolean gtocraftfix$jobProduces(Object job, AEKey ik) {
+        try {
+            if (gtocraftfix$fTasks == null) {
+                var ft = job.getClass().getDeclaredField("tasks");
+                ft.setAccessible(true);
+                gtocraftfix$fTasks = ft;
+            }
+            Map<?, ?> tasks = (Map<?, ?>) gtocraftfix$fTasks.get(job);
+            if (tasks == null) {
+                return true;
+            }
+            for (var en : tasks.entrySet()) {
+                Object holder = en.getValue();
+                if (gtocraftfix$fHolderVal == null) {
+                    var fv = holder.getClass().getField("value");
+                    fv.setAccessible(true);
+                    gtocraftfix$fHolderVal = fv;
+                }
+                if (gtocraftfix$fHolderVal.getLong(holder) <= 0) {
+                    continue;
+                }
+                for (var out : ((IPatternDetails) en.getKey()).getOutputs()) {
+                    if (out.what().equals(ik)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        } catch (Throwable ignored) {
+            return true;
         }
     }
 
