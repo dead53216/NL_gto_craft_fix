@@ -6,7 +6,8 @@
   "refmap": "gto_craft_fix.refmap.json",
   "mixins": [
     "CraftingServiceSyncMixin",
-    "CraftingCpuHelperMixin"
+    "CraftingCpuHelperMixin",
+    "OptimizedCpuParallelFixMixin"
   ],
   "client": [],
   "server": [],

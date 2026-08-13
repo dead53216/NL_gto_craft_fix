@@ -831,8 +831,6 @@ public abstract class CraftingServiceSyncMixin {
                 if (waiting.isEmpty() && handled < 8) {
                     gtocraftfix$topUpInputs(logic, storage, cluster.getSrc());
                 }
-                // [2.1.0] 並行死角解鎖：上游 executeCrafting 對 parallel==1 永久無聲跳過（見方法 javadoc）
-                gtocraftfix$unjamParallelOne(logic, storage, cluster.getSrc());
             } catch (Throwable t) {
                 int c = gtocraftfix$sitterLog.incrementAndGet();
                 if (c <= 5) {
@@ -910,128 +908,6 @@ public abstract class CraftingServiceSyncMixin {
             }
         } catch (Throwable ignored) {
             // 反射不可用（模組未開放等）→ 靜默略過
-        }
-    }
-
-    /** [2.1.0] gtolib 並行樣板介面反射解析（一次）；解析失敗保守視為並行（多補 1 輪料無害）。 */
-    private static volatile Class<?> gtocraftfix$parallelIface;
-    private static volatile boolean gtocraftfix$parallelIfaceTried;
-
-    private static boolean gtocraftfix$isParallelPattern(Object pat) {
-        if (!gtocraftfix$parallelIfaceTried) {
-            try {
-                gtocraftfix$parallelIface = Class.forName("com.gtolib.api.ae2.pattern.IParallelPatternDetails");
-            } catch (Throwable ignored) {
-            }
-            gtocraftfix$parallelIfaceTried = true;
-        }
-        var c = gtocraftfix$parallelIface;
-        return c == null || c.isInstance(pat);
-    }
-
-    /** [2.1.0] 並行死角解鎖：上游 OptimizedCraftingCpuLogic.executeCrafting 的並行分支漏了
-     *  parallel==1 的取料路徑——「並行樣板＋剩餘輪數>1＋庫存恰夠 1 輪」被每 tick 無聲跳過、永久卡死
-     *  （中子反射板 x2 實錄；催化劑返還配方按淨需求備料必然踩中，已回報上游）。
-     *  解法：命中指紋（min⌊庫存/每輪⌋==1 且 times>1）時把各輸入從網路補到 2 輪份，讓 GTO 自己的
-     *  parallel>1 分支正常取料推送——只補料，不代推送、不碰帳目。網路無貨則無操作（下輪再試）。 */
-    private void gtocraftfix$unjamParallelOne(appeng.crafting.execution.CraftingCpuLogic logic,
-                                              appeng.api.storage.MEStorage storage, IActionSource src) {
-        try {
-            if (gtocraftfix$fJob == null) {
-                var fj = logic.getClass().getDeclaredField("job");
-                fj.setAccessible(true);
-                gtocraftfix$fJob = fj;
-                var fi = appeng.crafting.execution.CraftingCpuLogic.class.getDeclaredField("inventory");
-                fi.setAccessible(true);
-                gtocraftfix$fInv = fi;
-            }
-            Object job = gtocraftfix$fJob.get(logic);
-            if (job == null) {
-                return;
-            }
-            if (gtocraftfix$fTasks == null) {
-                var ft = job.getClass().getDeclaredField("tasks");
-                ft.setAccessible(true);
-                gtocraftfix$fTasks = ft;
-            }
-            Map<?, ?> tasks = (Map<?, ?>) gtocraftfix$fTasks.get(job);
-            var inv = (appeng.crafting.inv.ListCraftingInventory) gtocraftfix$fInv.get(logic);
-            if (tasks == null || inv == null || tasks.isEmpty()) {
-                return;
-            }
-            for (var en : tasks.entrySet()) {
-                Object holder = en.getValue();
-                if (gtocraftfix$fHolderVal == null) {
-                    var fv = holder.getClass().getField("value");
-                    fv.setAccessible(true);
-                    gtocraftfix$fHolderVal = fv;
-                }
-                long times = gtocraftfix$fHolderVal.getLong(holder);
-                if (times <= 1) {
-                    continue; // 剩 1 輪走一般取料分支，無死角
-                }
-                var pat = (IPatternDetails) en.getKey();
-                if (!gtocraftfix$isParallelPattern(pat)) {
-                    continue; // 非並行樣板走 else 分支，無死角
-                }
-                // 死角指紋：可並行數==1（照抄 getMaxParallel 的算法：替代品加總、除以 multiplier 取整）
-                long mp = Long.MAX_VALUE;
-                for (var input : pat.getInputs()) {
-                    var poss = input.getPossibleInputs();
-                    if (poss.length == 0) {
-                        continue;
-                    }
-                    long units = 0;
-                    var seen = new HashSet<AEKey>();
-                    for (var ps : poss) {
-                        if (ps.amount() > 0 && seen.add(ps.what())) {
-                            units += inv.list.get(ps.what()) / ps.amount();
-                        }
-                    }
-                    if (input.getMultiplier() > 0) {
-                        mp = Math.min(mp, units / input.getMultiplier());
-                    }
-                    if (mp == 0) {
-                        break;
-                    }
-                }
-                if (mp != 1) {
-                    continue; // 0=真缺料（輸入補給負責）；>=2 取料正常，皆非死角
-                }
-                for (var input : pat.getInputs()) {
-                    var poss = input.getPossibleInputs();
-                    if (poss.length == 0) {
-                        continue;
-                    }
-                    var ik = poss[0].what();
-                    long per = poss[0].amount() * input.getMultiplier();
-                    if (per <= 0) {
-                        continue;
-                    }
-                    long have = inv.list.get(ik);
-                    long target = 2 * per;
-                    if (have >= target) {
-                        continue;
-                    }
-                    long got = storage.extract(ik, target - have, Actionable.MODULATE, src);
-                    if (got > 0) {
-                        try {
-                            inv.insert(ik, got, Actionable.MODULATE);
-                        } catch (Throwable t) {
-                            // 例外補償：插不進就退回網路再拋，防半套蒸發
-                            storage.insert(ik, got, Actionable.MODULATE, src);
-                            throw t;
-                        }
-                        int c = gtocraftfix$sitterLog.incrementAndGet();
-                        if (c <= 200) {
-                            LOG.info("[craftfix] 並行死角解鎖 {}：補 {} x{}（湊滿 2 輪，繞過上游 parallel==1 取料漏洞）",
-                                    pat.getPrimaryOutput().what(), ik, got);
-                        }
-                    }
-                }
-            }
-        } catch (Throwable ignored) {
-            // 反射不可用 → 靜默略過（純救援層，失效不影響原行為）
         }
     }
 
