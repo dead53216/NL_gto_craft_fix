@@ -18,7 +18,9 @@
 | 無樣板守衛 | 無樣板物品的機器源請求直接擋下（原版語意），聊天室提示 |
 | 真缺料擋單 | 無樣板可補的硬缺口 → 擋下提交防凍結，聊天室點名缺什麼 |
 | 保母（只餵料）| 網路既有庫存不被 waitingFor 認領（GTO 認領只在插入事件觸發）→ 每 5 秒餵入 |
-| 並行死角根治（2.2.0，mixin 手術）| **上游 bug**（`OptimizedCraftingCpuLogic.executeCrafting:221-238`，已回報）：並行分支漏了 `parallel==1` 的取料路徑——「並行樣板＋剩餘輪數>1＋庫存恰夠 1 輪」被每 tick 無聲跳過、永久卡死。催化劑返還配方（吃 9216 還 4608 錫鐵合金的中子反射板實錄）按淨需求備料必然踩中，小量下單 100% 重現、與算料器無關。修法（`OptimizedCpuParallelFixMixin`，等價補上缺失的 else）：@Redirect 攔 `ObjHolder` 建構子記住本輪容器＋攔 `getMaxParallel`——算出 1 時就地用**原樣板做單輪取料**塞進容器再照樣回傳 1，上游後續原生流程照走（配額按 1 折算、推送原樣板、`progress -= 1`）。取料失敗容器留 null＝回退原狀；欄位改名（上游更新）自動永久停用。~~2.1.0 保母補料版~~已由本修法取代移除。**本 mixin 掛 GTOCore 類（targets 字串綁定、不引編譯依賴）＝「mixin 只掛 AE2」鐵則的首個例外（使用者核准）**，datasynclib holder 以 `libs/` 內抽出的迷你 jar 供編譯 |
+| 並行死角解鎖（2.1.0 / 2.3.0 重啟用）| **疑似上游 bug**（`OptimizedCraftingCpuLogic.executeCrafting:221-238`）：並行分支漏了 `parallel==1` 的取料路徑——「並行樣板＋剩餘輪數>1＋庫存恰夠 1 輪」每 tick 無聲跳過。催化劑返還配方（吃 9216 還 4608 錫鐵合金的中子反射板實錄：剩 2 輪、CPU 有 13824＝1.5 輪）按淨需求備料必然踩中，小量下單 100% 重現、與算料器無關（三種算料一致、拔 mod 也卡）。修法：保母命中指紋（min⌊庫存/每輪⌋==1 且剩>1 輪）時把輸入補到 2 輪份，讓 GTO 自己的 `parallel>1` 分支正常取料——只補料，不代推送不碰帳 |
+| ~~mixin 直接根治（2.2.0）~~ **實測無效、2.3.0 撤除** | 掛 GTOCore 開源類 `OptimizedCraftingCpuLogic` 補上缺失的 else——**mixin 無聲失效**：jar 內有類、config 正常載入、同檔 AE2 mixin 照常運作、全程零錯誤，但欄位普查證實注入欄位不存在（gtocore 為簽章 jar、`com/gtocore/mixin` 標 `Sealed: true`）。**「mixin 只准掛 AE2 類」鐵則二度實證，此路封死** |
+| 供應器忙碌診斷（2.3.0）| 探針 X 光加印 `忙:N`——全部供應器 `isBusy()` 時 executeCrafting 同樣不推、不留任何結果，與並行死角**外觀完全相同**（`results={}`）。加印後兩者可一眼分辨（機器卡料/阻塞模式 vs 取料死角）|
 
 ## lpcalc（機器源結構化算料器）
 

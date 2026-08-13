@@ -53,9 +53,6 @@ tasks.named('processResources', ProcessResources).configure {
 dependencies {
     // 編譯需 AE2（CraftingService / KeyCounter / GenericStack…）；執行期由整合包提供。
     modImplementation("appeng:appliedenergistics2-forge-1.20.1:15.267.4")
-    // OptimizedCpuParallelFixMixin 編譯 stub：目標類（Mixin AP 要求可解析）＋datasynclib holder，
-    // 自整合包 gtocore jar 抽出（僅 12 個 class），執行期由整合包提供。
-    compileOnly files('libs/gto-compile-stubs.jar')
     // Mixin 註解處理器：產生 refmap 與 reobf 所需的 mappings tsrg。
     annotationProcessor 'org.spongepowered:mixin:0.8.7:processor'
 }
