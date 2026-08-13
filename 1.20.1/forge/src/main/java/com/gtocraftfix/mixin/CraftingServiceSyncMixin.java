@@ -99,6 +99,59 @@ public abstract class CraftingServiceSyncMixin {
     private static volatile java.lang.reflect.Field gtocraftfix$fInv;
     private static volatile java.lang.reflect.Field gtocraftfix$fHolderVal;
     private final Set<String> gtocraftfix$failLogged = new HashSet<>();
+    /** [2.0.1 純診斷] 欄位普查已做過的 cluster（每場遊戲每 cluster 只倒一次，避免洗版）。 */
+    private final Set<String> gtocraftfix$censusDone = new HashSet<>();
+
+    /** [2.0.1 純診斷] 反射倒出物件全類別鏈的實例欄位（名稱=精簡值）；集合印型別(大小)，其餘截 60 字。 */
+    private static String gtocraftfix$census(Object o) {
+        var sb = new StringBuilder();
+        for (Class<?> c = o.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            for (var f : c.getDeclaredFields()) {
+                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                    continue;
+                }
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(o);
+                    String vs;
+                    if (v == null) {
+                        vs = "null";
+                    } else if (v instanceof Number || v instanceof Boolean) {
+                        vs = String.valueOf(v);
+                    } else if (v instanceof appeng.api.stacks.KeyCounter kc) {
+                        vs = "KeyCounter(" + kc.size() + ")";
+                    } else if (v instanceof Map<?, ?> mp) {
+                        vs = v.getClass().getSimpleName() + "(" + mp.size() + ")";
+                    } else if (v instanceof java.util.Collection<?> cl) {
+                        vs = v.getClass().getSimpleName() + "(" + cl.size() + ")";
+                    } else {
+                        vs = String.valueOf(v);
+                        if (vs.length() > 60) {
+                            vs = vs.substring(0, 60) + "…";
+                        }
+                    }
+                    sb.append(f.getName()).append('=').append(vs).append("; ");
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    /** [2.0.1 純診斷] CPU 內部庫存（CraftingCpuLogic.inventory）反射存取；不可用回 null。 */
+    private appeng.crafting.inv.ListCraftingInventory gtocraftfix$invOf(
+            appeng.crafting.execution.CraftingCpuLogic logic) {
+        try {
+            if (gtocraftfix$fInv == null) {
+                var fi = appeng.crafting.execution.CraftingCpuLogic.class.getDeclaredField("inventory");
+                fi.setAccessible(true);
+                gtocraftfix$fInv = fi;
+            }
+            return (appeng.crafting.inv.ListCraftingInventory) gtocraftfix$fInv.get(logic);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
 
     // ---- 修正 1：算料同步化（修好終端 ctrl+左鍵多步卡死）----
     @Inject(method = "beginCraftingCalculation", at = @At("HEAD"), cancellable = true, remap = false)
@@ -609,8 +662,109 @@ public abstract class CraftingServiceSyncMixin {
                     } catch (Throwable t) {
                         held = "n/a";
                     }
-                    LOG.info("[craftfix] CPU探針 out={} waiting[{}]={} held=[{}] results={}",
-                            out, waiting.size(), waitStr, held, results);
+                    // [2.0.1 純診斷] 剩餘任務 X 光（自 1.1.4/1.1.6/1.1.7 診斷段移植，零行為變動）：
+                    // 主產物×次數＋供應器數＋最缺輸入格「CPU庫存/每輪需求」——
+                    // 分辨「計畫沒排任務」「缺料不推」「有料不推」「樣板失聯(prov:0)」
+                    String tasksStr = "n/a";
+                    try {
+                        if (gtocraftfix$fJob == null) {
+                            var fj = logic.getClass().getDeclaredField("job");
+                            fj.setAccessible(true);
+                            gtocraftfix$fJob = fj;
+                        }
+                        Object job0 = gtocraftfix$fJob.get(logic);
+                        if (job0 != null) {
+                            if (gtocraftfix$fTasks == null) {
+                                var ft = job0.getClass().getDeclaredField("tasks");
+                                ft.setAccessible(true);
+                                gtocraftfix$fTasks = ft;
+                            }
+                            Map<?, ?> ts = (Map<?, ?>) gtocraftfix$fTasks.get(job0);
+                            var inv0 = gtocraftfix$invOf(logic);
+                            if (ts != null) {
+                                StringBuilder tb = new StringBuilder();
+                                int shownT = 0;
+                                for (var en : ts.entrySet()) {
+                                    Object holder0 = en.getValue();
+                                    if (gtocraftfix$fHolderVal == null) {
+                                        var fv = holder0.getClass().getField("value");
+                                        fv.setAccessible(true);
+                                        gtocraftfix$fHolderVal = fv;
+                                    }
+                                    long times = gtocraftfix$fHolderVal.getLong(holder0);
+                                    if (times <= 0) {
+                                        continue;
+                                    }
+                                    if (shownT++ >= 8) {
+                                        tb.append('…');
+                                        break;
+                                    }
+                                    var pat0 = (IPatternDetails) en.getKey();
+                                    tb.append(pat0.getPrimaryOutput().what()).append('x').append(times);
+                                    // prov:0 = 樣板失聯（供應器清單找不到機器）→ executeCrafting 空轉不留痕
+                                    int provN = 0;
+                                    for (var p0 : ((CraftingService) (Object) this).getProviders(pat0)) {
+                                        if (++provN >= 9) {
+                                            break;
+                                        }
+                                    }
+                                    tb.append(",prov:").append(provN);
+                                    // 印「最缺的那格」輸入——executeCrafting 任一格不足即無聲跳過，
+                                    // 只看第一格會得到假健康
+                                    if (inv0 != null) {
+                                        AEKey worstK = null;
+                                        long worstHave = 0;
+                                        long worstNeed = 0;
+                                        double worstR = Double.MAX_VALUE;
+                                        for (var in1 : pat0.getInputs()) {
+                                            var ps = in1.getPossibleInputs();
+                                            if (ps.length == 0) {
+                                                continue;
+                                            }
+                                            long need1 = ps[0].amount() * in1.getMultiplier();
+                                            if (need1 <= 0) {
+                                                continue;
+                                            }
+                                            long have1 = inv0.list.get(ps[0].what());
+                                            double r = (double) have1 / need1;
+                                            if (r < worstR) {
+                                                worstR = r;
+                                                worstK = ps[0].what();
+                                                worstHave = have1;
+                                                worstNeed = need1;
+                                            }
+                                        }
+                                        if (worstK != null) {
+                                            tb.append("(缺口:").append(worstK).append(' ')
+                                                    .append(worstHave).append('/').append(worstNeed).append(')');
+                                        }
+                                    }
+                                    tb.append("; ");
+                                }
+                                tasksStr = tb.length() == 0 ? "(無)" : tb.toString();
+                            }
+                        }
+                    } catch (Throwable ignored2) {
+                    }
+                    LOG.info("[craftfix] CPU探針 out={} waiting[{}]={} held=[{}] 剩餘任務=[{}] results={}",
+                            out, waiting.size(), waitStr, held, tasksStr, results);
+                    // [2.0.1 純診斷] 欄位普查（自 1.1.5 移植）：waiting 空＋有剩餘任務＝執行器不推但料在，
+                    // 閘門多半在 gtolib 私有欄位裡；每 cluster 只倒一次
+                    if (waiting.isEmpty() && !"n/a".equals(tasksStr) && !"(無)".equals(tasksStr)) {
+                        String cid0 = Integer.toHexString(System.identityHashCode(cluster));
+                        if (gtocraftfix$censusDone.add(cid0)) {
+                            try {
+                                Object job1 = gtocraftfix$fJob != null ? gtocraftfix$fJob.get(logic) : null;
+                                LOG.info("[craftfix] 欄位普查 logic({}): {}",
+                                        logic.getClass().getName(), gtocraftfix$census(logic));
+                                if (job1 != null) {
+                                    LOG.info("[craftfix] 欄位普查 job({}): {}",
+                                            job1.getClass().getName(), gtocraftfix$census(job1));
+                                }
+                            } catch (Throwable ignored3) {
+                            }
+                        }
+                    }
                 } catch (Throwable ignored) {
                 }
             }
