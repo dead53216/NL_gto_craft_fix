@@ -138,6 +138,39 @@ public abstract class CraftingServiceSyncMixin {
         return sb.toString();
     }
 
+    /** [2.3.1 純診斷] 供應器位置「類型(x,y,z)」；BlockEntity 直取，GTO 機器類走反射
+     *  （getPos/gto$getPos/getBlockPos），都讀不到回 null。 */
+    private static String gtocraftfix$provAt(Object p) {
+        try {
+            net.minecraft.core.BlockPos bp = null;
+            if (p instanceof net.minecraft.world.level.block.entity.BlockEntity be) {
+                bp = be.getBlockPos();
+            } else {
+                for (var mn : new String[] { "getPos", "gto$getPos", "getBlockPos" }) {
+                    try {
+                        Object v = p.getClass().getMethod(mn).invoke(p);
+                        if (v instanceof net.minecraft.core.BlockPos b1) {
+                            bp = b1;
+                        } else if (v instanceof net.minecraft.core.GlobalPos g1) {
+                            bp = g1.pos();
+                        }
+                        if (bp != null) {
+                            break;
+                        }
+                    } catch (NoSuchMethodException ignored) {
+                    }
+                }
+            }
+            String cn = p.getClass().getSimpleName();
+            if (bp == null) {
+                return cn;
+            }
+            return cn + "(" + bp.getX() + "," + bp.getY() + "," + bp.getZ() + ")";
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     /** [2.0.1 純診斷] CPU 內部庫存（CraftingCpuLogic.inventory）反射存取；不可用回 null。 */
     private appeng.crafting.inv.ListCraftingInventory gtocraftfix$invOf(
             appeng.crafting.execution.CraftingCpuLogic logic) {
@@ -705,19 +738,32 @@ public abstract class CraftingServiceSyncMixin {
                                     // [2.3.0] 忙碌數：全忙時 executeCrafting 同樣不推、不留任何結果（與死角同貌）
                                     int provN = 0;
                                     int busyN = 0;
+                                    String provAt = null;
                                     for (var p0 : ((CraftingService) (Object) this).getProviders(pat0)) {
                                         provN++;
+                                        boolean b0 = false;
                                         try {
-                                            if (p0.isBusy()) {
-                                                busyN++;
-                                            }
+                                            b0 = p0.isBusy();
                                         } catch (Throwable ignored4) {
+                                        }
+                                        if (b0) {
+                                            busyN++;
+                                        }
+                                        // [2.3.1] 忙碌機器座標：卡單時直接走過去看那台（優先印忙碌者）
+                                        if (provAt == null || (b0 && !provAt.endsWith("忙"))) {
+                                            String pa = gtocraftfix$provAt(p0);
+                                            if (pa != null) {
+                                                provAt = b0 ? pa + "忙" : pa;
+                                            }
                                         }
                                         if (provN >= 9) {
                                             break;
                                         }
                                     }
                                     tb.append(",prov:").append(provN).append(",忙:").append(busyN);
+                                    if (provAt != null) {
+                                        tb.append('@').append(provAt);
+                                    }
                                     // 印「最缺的那格」輸入——executeCrafting 任一格不足即無聲跳過，
                                     // 只看第一格會得到假健康
                                     if (inv0 != null) {
