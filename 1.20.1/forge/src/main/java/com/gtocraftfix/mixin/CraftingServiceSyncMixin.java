@@ -649,8 +649,10 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
-    // ---- 修正 3：保母（每 5 秒掃孤兒 waitingFor）＋ 診斷探針（每 20 秒）----
-    @Inject(method = "onServerEndTick", at = @At("TAIL"), remap = false)
+    // ---- 修正 3：保母（[2.4.0] 每 tick 掃孤兒 waitingFor）＋ 診斷探針（每 20 秒）----
+    // [2.4.0] 掛 HEAD 不掛 TAIL：GTOCore 在偶數 tick 提前 ci.cancel() 本方法，掛 TAIL 整段實跑半速
+    // （原「5 秒」實為 10 秒、探針 20 秒實為 40 秒——log 探針間隔 40 秒實證）。
+    @Inject(method = "onServerEndTick", at = @At("HEAD"), remap = false)
     private void gtocraftfix$tick(MinecraftServer server, CallbackInfo ci) {
         com.gtocraftfix.calc.CalcTicker.tick(); // 內置原版算料器的預算泵（每 tick）
         com.gtocraftfix.lpcalc.LpFallbackQueue.drainOnServerTick(); // LP 晚期回退/影子驗證的伺服器緒建構點（鐵則5/8）
@@ -824,9 +826,7 @@ public abstract class CraftingServiceSyncMixin {
                 }
             }
         }
-        if (gtocraftfix$tickCounter % 100 != 0) {
-            return;
-        }
+        // [2.4.0] 保母改每 tick（原 %100 在半頻下實為 10 秒一輪，兩單搶料時只能一點一點給）
         var storage = grid.getStorageService().getInventory();
         int handled = 0;
         for (var cluster : craftingCPUClusters) {
@@ -841,6 +841,7 @@ public abstract class CraftingServiceSyncMixin {
                 }
                 Set<AEKey> waiting = new HashSet<>();
                 logic.getAllWaitingFor(waiting);
+                int handledBefore = handled;
                 for (var key : waiting) {
                     if (handled >= 8) {
                         break;
@@ -881,9 +882,10 @@ public abstract class CraftingServiceSyncMixin {
                         }
                     }
                 }
-                // 輸入補給：waiting 空（無在途）但仍有未完成任務＝執行中帳漂移把某任務輸入吃到不足一輪
-                // → 剩餘任務每 tick 取料失敗、無聲凍結。反射讀任務清單，短缺輸入直接從網路補進 CPU 庫存。
-                if (waiting.isEmpty() && handled < 8) {
+                // 輸入補給：剩餘任務輸入不足一輪＝每 tick 取料失敗、無聲凍結 → 從網路補進 CPU 庫存。
+                // [2.4.0] 閘門放寬：原本只在 waiting 空時跑，但「有在途＋另一任務缺料」（兩單搶料實錄：
+                // 在途 qbit 晶圓擋住整個補給）同樣要補；本輪沒餵到料時一律跑。
+                if ((waiting.isEmpty() || handled == handledBefore) && handled < 8) {
                     gtocraftfix$topUpInputs(logic, storage, cluster.getSrc());
                 }
                 // [2.1.0] 並行死角解鎖：上游 executeCrafting 對 parallel==1 永久無聲跳過（見方法 javadoc）
@@ -897,7 +899,22 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
-    /** 輸入補給：讀 GTO job 的剩餘任務，對「每輪需求 > CPU 庫存」的主輸入從網路補足一輪。反射全軟失敗。 */
+    /** [2.4.0] 補輸入輪數上限：預設無限（＝一次補滿全部剩餘輪，兩單搶料時靠「先到先贏」序列化
+     *  打破 50/50 分食）。舊版全額曾把單料全網存量吸進單一 CPU 餓死其他單——真出事就用
+     *  `-Dgtodiag.topupRounds=N` 收斂（N=1 即回 1.1.0 的每次一輪）。 */
+    private static final long gtocraftfix$TOPUP_ROUNDS = gtocraftfix$topupRoundsProp();
+
+    private static long gtocraftfix$topupRoundsProp() {
+        try {
+            long v = Long.parseLong(System.getProperty("gtodiag.topupRounds", "0"));
+            return v > 0 ? v : Long.MAX_VALUE;
+        } catch (Throwable ignored) {
+            return Long.MAX_VALUE;
+        }
+    }
+
+    /** 輸入補給：讀 GTO job 的剩餘任務，對「CPU 庫存 &lt; 需求」的主輸入從網路補足。反射全軟失敗。
+     *  [2.4.0] 補到「剩餘輪數×每輪需求」（受 gtodiag.topupRounds 上限），原為固定一輪。 */
     private void gtocraftfix$topUpInputs(appeng.crafting.execution.CraftingCpuLogic logic,
                                          appeng.api.storage.MEStorage storage, IActionSource src) {
         try {
@@ -934,9 +951,11 @@ public abstract class CraftingServiceSyncMixin {
                     fv.setAccessible(true);
                     gtocraftfix$fHolderVal = fv;
                 }
-                if (gtocraftfix$fHolderVal.getLong(holder) <= 0) {
+                long times = gtocraftfix$fHolderVal.getLong(holder);
+                if (times <= 0) {
                     continue;
                 }
+                long rounds = Math.min(times, gtocraftfix$TOPUP_ROUNDS); // [2.4.0] 全額（可用系統屬性收斂）
                 var pat = (IPatternDetails) en.getKey();
                 for (var input : pat.getInputs()) {
                     var poss = input.getPossibleInputs();
@@ -948,17 +967,29 @@ public abstract class CraftingServiceSyncMixin {
                     if (per <= 0) {
                         continue;
                     }
+                    long need;
+                    try {
+                        need = Math.multiplyExact(per, rounds);
+                    } catch (ArithmeticException e) {
+                        need = per; // 溢位保底一輪
+                    }
                     long have = inv.list.get(ik);
-                    if (have >= per) {
+                    if (have >= need) {
                         continue;
                     }
-                    long got = storage.extract(ik, per - have, Actionable.MODULATE, src);
+                    long got = storage.extract(ik, need - have, Actionable.MODULATE, src);
                     if (got > 0) {
-                        inv.insert(ik, got, Actionable.MODULATE);
+                        try {
+                            inv.insert(ik, got, Actionable.MODULATE);
+                        } catch (Throwable t) {
+                            storage.insert(ik, got, Actionable.MODULATE, src); // 插不進退回網路，防蒸發
+                            throw t;
+                        }
                         fed++;
                         int c = gtocraftfix$sitterLog.incrementAndGet();
                         if (c <= 200) {
-                            LOG.info("[craftfix] 保母補輸入 {} x{}（凍結任務救援）", ik, got);
+                            LOG.info("[craftfix] 保母補輸入 {} x{}（剩餘 {} 輪、目標 {} 輪份）",
+                                    ik, got, times, rounds == Long.MAX_VALUE ? times : rounds);
                         }
                     }
                 }
