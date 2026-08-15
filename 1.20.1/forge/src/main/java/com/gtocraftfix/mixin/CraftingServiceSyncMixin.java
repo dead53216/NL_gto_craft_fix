@@ -72,6 +72,15 @@ public abstract class CraftingServiceSyncMixin {
 
     private static final Logger LOG = LogManager.getLogger("gtocraftfix");
 
+    /**
+     * [slim 分支] 精簡版：**只保留三項會改行為的修正**——①算料同步化（終端 ctrl+左鍵）
+     * ②機器源 present-once IgnoreMissing（請求器/接口/合成卡）③並行死角解鎖。
+     * 其餘（無樣板守衛、lpcalc 接管、降量重算、計畫修補＋真缺料擋單＋拒收退化計畫、保母餵料/補輸入）
+     * 全部停用但**程式碼保留、log 照印**，方便對照觀察 GTO 原生行為。
+     * 改 false 即恢復完整版行為（各處以 {@code gtocraftfix$SLIM} 判斷）。
+     */
+    private static final boolean gtocraftfix$SLIM = true;
+
     @Shadow(remap = false)
     @Final
     private IGrid grid;
@@ -198,8 +207,13 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$executeV2 == null) {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
-                        LOG.info("[craftfix] 已啟用 v1.1.0：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
-                                com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
+                        if (gtocraftfix$SLIM) {
+                            LOG.info("[craftfix] 已啟用 slim：只保留 同步算料(ctrl+左鍵)＋機器源 IgnoreMissing(請求器)"
+                                    + "＋並行死角解鎖；守衛/lpcalc/降量/計畫修補/保母 皆停用（僅印 log）。");
+                        } else {
+                            LOG.info("[craftfix] 已啟用完整版：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
+                                    com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
+                        }
                     }
                 }
             }
@@ -222,7 +236,7 @@ public abstract class CraftingServiceSyncMixin {
                         gtocraftfix$noPatternLogged.clear();
                     }
                     // 同步在聊天室提示玩家（同 key 只提示一次）
-                    if (level instanceof ServerLevel sl) {
+                    if (!gtocraftfix$SLIM && level instanceof ServerLevel sl) {
                         sl.getServer().getPlayerList().broadcastSystemMessage(
                                 net.minecraft.network.chat.Component.literal("[合成修復] 無樣板，已擋下自動合成請求：")
                                         .append(what.getDisplayName())
@@ -232,6 +246,9 @@ public abstract class CraftingServiceSyncMixin {
                 }
                 final AEKey fWhat = what;
                 final long fAmount = amount;
+                if (gtocraftfix$SLIM) {
+                    return; // [slim] 不擋單，交回 GTO 原生流程（上方 WARN 仍留紀錄）
+                }
                 cir.setReturnValue(CompletableFuture.completedFuture(new ICraftingPlan() {
 
                     @Override
@@ -283,7 +300,7 @@ public abstract class CraftingServiceSyncMixin {
             // +1 tick），-Dgtodiag.lpcalc.enabled=false 一鍵停用（機器路徑完全回樹狀版）。
             // LpEntry 全包 try-catch 不外拋；外層 catch（不 setReturnValue → 退 GTO async）當最後防線。
             // 玩家維持 GTO executeV2（快，且玩家路徑在現有防線下運作正常）。
-            if (machineSrc0) {
+            if (machineSrc0 && !gtocraftfix$SLIM) { // [slim] 停用 lpcalc 接管：機器源與玩家一樣走下方同步 executeV2
                 cir.setReturnValue(com.gtocraftfix.lpcalc.LpEntry.beginMachineCalc(
                         level, grid, (ICraftingService) (Object) this, simRequester,
                         what, amount, strategy, gtocraftfix$CALC_POOL));
@@ -297,7 +314,7 @@ public abstract class CraftingServiceSyncMixin {
             // 外部重現：砍半重算直到可執行；做多少先交多少，追蹤器下輪自然補餘量。玩家不降（要看缺料畫面）。
             var actionSrc = simRequester.getActionSource();
             boolean machineSrc = actionSrc == null || actionSrc.player().isEmpty();
-            if (machineSrc && plan != null && amount > 1
+            if (machineSrc && !gtocraftfix$SLIM && plan != null && amount > 1 // [slim] 降量重算停用
                     && (plan.simulation() || plan.finalOutput() == null || plan.finalOutput().amount() <= 0)) {
                 long tryAmount = amount;
                 for (int i = 0; i < 12 && tryAmount > 1; i++) {
@@ -334,6 +351,17 @@ public abstract class CraftingServiceSyncMixin {
                                         boolean prioritizePower, IActionSource src,
                                         CallbackInfoReturnable<ICraftingSubmitResult> cir) {
         if (!(job instanceof CraftingPlan plan)) {
+            return;
+        }
+        if (gtocraftfix$SLIM) {
+            // [slim] 計畫修補＋真缺料擋單＋拒收退化計畫全部停用，計畫原封不動交給 GTO；
+            // 只留一行紀錄（sim 計畫與缺料在此可見，方便對照原生行為）
+            int c0 = gtocraftfix$sitterLog.incrementAndGet();
+            if (c0 <= 200 && (plan.simulation() || !plan.missingItems().isEmpty())) {
+                LOG.info("[craftfix] 放行未修補計畫 out={} sim={} missing={} 任務數={}",
+                        plan.finalOutput(), plan.simulation(), plan.missingItems().size(),
+                        plan.patternTimes().size());
+            }
             return;
         }
         boolean blockSubmit = false;
@@ -843,6 +871,9 @@ public abstract class CraftingServiceSyncMixin {
                 logic.getAllWaitingFor(waiting);
                 int handledBefore = handled;
                 for (var key : waiting) {
+                    if (gtocraftfix$SLIM) {
+                        break; // [slim] 保母餵料停用（孤兒 waitingFor 交回 GTO 自己處理）
+                    }
                     if (handled >= 8) {
                         break;
                     }
@@ -885,7 +916,8 @@ public abstract class CraftingServiceSyncMixin {
                 // 輸入補給：剩餘任務輸入不足一輪＝每 tick 取料失敗、無聲凍結 → 從網路補進 CPU 庫存。
                 // [2.4.0] 閘門放寬：原本只在 waiting 空時跑，但「有在途＋另一任務缺料」（兩單搶料實錄：
                 // 在途 qbit 晶圓擋住整個補給）同樣要補；本輪沒餵到料時一律跑。
-                if ((waiting.isEmpty() || handled == handledBefore) && handled < 8) {
+                if (!gtocraftfix$SLIM // [slim] 補輸入停用
+                        && (waiting.isEmpty() || handled == handledBefore) && handled < 8) {
                     gtocraftfix$topUpInputs(logic, storage, cluster.getSrc());
                 }
                 // [2.1.0] 並行死角解鎖：上游 executeCrafting 對 parallel==1 永久無聲跳過（見方法 javadoc）
