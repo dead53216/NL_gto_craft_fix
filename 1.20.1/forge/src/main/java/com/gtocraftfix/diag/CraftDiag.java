@@ -86,6 +86,14 @@ public final class CraftDiag {
         long remaining = -1;
         long pushedRounds;
         long pushedAtOverview;
+        /** 下單總量（finalJobOutput 的 amount）與累計實際交付量：收單時一比就知道有沒有提前收單。 */
+        long ordered;
+        long deliveredTotal;
+        long deliveredWindow;
+        /** 樣板 → 「料齊到現在」的起始 tick；久齊不推＝執行器沉默（parallel==1 死角指紋）。 */
+        final Map<IPatternDetails, Integer> readySince = new HashMap<>();
+        final Set<IPatternDetails> silentLogged = new HashSet<>();
+        final Set<AEKey> longWaitLogged = new HashSet<>();
         final Map<IPatternDetails, Long> rounds = new HashMap<>();
         final Map<AEKey, Long> inv = new HashMap<>();
         final Map<AEKey, Long> wait = new HashMap<>();
@@ -318,11 +326,17 @@ public final class CraftDiag {
                 long w = sum(prev.wait);
                 long iv = sum(prev.inv);
                 if (spend()) {
-                    LOG.info("[craftfix][帳本] 單離場 out={} CPU={} 存活{}s 推送{}輪 剩餘輪{} 在途{} 庫存{} 待交付{}{}",
+                    LOG.info("[craftfix][帳本] 單離場 out={} CPU={} 存活{}s 推送{}輪 訂{}/交付{} "
+                                    + "剩餘輪{} 在途{} 庫存{} 待交付{}{}",
                             prev.out, id(logic), (tick - prev.firstTick) / 20, prev.pushedRounds,
-                            r, w, iv, prev.remaining,
+                            prev.ordered, prev.deliveredTotal, r, w, iv, prev.remaining,
                             (r > 0 || w > 0 || prev.remaining > 0)
                                     ? "  ← **沒做完就離場**（取消或提前收單）" : "");
+                }
+                if (prev.ordered > 0 && prev.deliveredTotal < prev.ordered && spend()) {
+                    LOG.warn("[craftfix][帳本] **提前收單**：out={} 訂{} 實際只交付{}（差{}）",
+                            prev.out, prev.ordered, prev.deliveredTotal,
+                            prev.ordered - prev.deliveredTotal);
                 }
                 if ((r > 0 || prev.remaining > 0) && !prev.drift.isEmpty() && spend()) {
                     LOG.warn("[craftfix][帳本] 離場時累計帳外差額 out={} → {}", prev.out, driftStr(prev));
@@ -343,6 +357,7 @@ public final class CraftDiag {
             var fo = logic.getFinalJobOutput();
             s.out = String.valueOf(fo);
             s.outKey = fo == null ? null : fo.what();
+            s.ordered = fo == null ? 0 : fo.amount();
             s.firstTick = tick;
             s.lastChangeTick = tick;
             s.stallNextTick = tick + STALL_TICKS;
@@ -456,6 +471,9 @@ public final class CraftDiag {
             var bad = new StringBuilder();
             int nbad = 0;
             for (var k : keys) {
+                if (k.equals(prev.outKey) && (prev.remaining < 0 || curRemaining < 0)) {
+                    continue; // 讀不到 remainingAmount 就無法把「交付出去」算進帳，成品這 key 跳過
+                }
                 long dInv = curInv.getOrDefault(k, 0L) - prev.inv.getOrDefault(k, 0L);
                 long dWait = curWait.getOrDefault(k, 0L) - prev.wait.getOrDefault(k, 0L);
                 long ext = prev.ext.getOrDefault(k, 0L);
@@ -495,9 +513,33 @@ public final class CraftDiag {
             }
         }
 
+        // ---- 交付進度（訂 N 只交付 M ＝提前收單的直接證據）
+        prev.deliveredTotal += delivered;
+        prev.deliveredWindow += delivered;
+        if (prev.deliveredWindow > 0 && tick % 100 == 0) {
+            if (spend()) {
+                LOG.info("[craftfix][帳本] 交付 out={} 近5s+{} 累計{}/訂{} 待交付{}",
+                        prev.out, prev.deliveredWindow, prev.deliveredTotal, prev.ordered, curRemaining);
+            }
+            prev.deliveredWindow = 0;
+        }
+
         // ---- 靜止偵測 & 快照更新
         boolean changed = dRoundsTotal > 0 || delivered > 0
                 || !curInv.equals(prev.inv) || !curWait.equals(prev.wait);
+
+        // ---- 早期警報（不必等 60 秒凍結）：①料齊卻 10 秒不推 ②在途 2 分鐘沒回
+        if (!changed && tick % 20 == 0) {
+            try {
+                earlyAlarms(tick, svc, grid, logic, prev, curRounds, curInv, curWait);
+            } catch (Throwable ignored) {
+            }
+        } else if (changed) {
+            prev.readySince.clear();
+            prev.silentLogged.clear();
+            prev.longWaitLogged.clear();
+        }
+
         if (changed) {
             prev.lastChangeTick = tick;
             prev.stallNextTick = tick + STALL_TICKS;
@@ -520,6 +562,89 @@ public final class CraftDiag {
         prev.wait.putAll(curWait);
         prev.ext.clear();
         prev.remaining = curRemaining;
+    }
+
+    /**
+     * 早期警報（每秒檢查一次，只在整顆 CPU 這 tick 沒動時跑）：
+     * <ul>
+     *   <li><b>料齊卻不推</b>：某樣板輸入夠 ≥1 輪、供應器有且不忙，卻連續 10 秒沒推——
+     *       這就是上游 {@code parallel==1} 死角／供應器沉默的指紋，不必等 60 秒凍結；</li>
+     *   <li><b>在途沒回</b>：某 key 掛在途 ≥2 分鐘、網路現貨 0——貨推出去就消失（含被別顆 CPU 領走）。</li>
+     * </ul>
+     */
+    private static void earlyAlarms(int tick, CraftingService svc, IGrid grid, CraftingCpuLogic logic, Snap s,
+                                    Map<IPatternDetails, Long> rounds, Map<AEKey, Long> inv,
+                                    Map<AEKey, Long> wait) {
+        for (var e : rounds.entrySet()) {
+            if (e.getValue() <= 0) {
+                continue;
+            }
+            var pat = e.getKey();
+            if (runnableRounds(pat, inv) < 1) {
+                s.readySince.remove(pat);
+                continue;
+            }
+            Integer since = s.readySince.putIfAbsent(pat, tick);
+            if (since == null || tick - since < 200 || !s.silentLogged.add(pat)) {
+                continue;
+            }
+            int prov = 0;
+            int busy = 0;
+            String at = null;
+            try {
+                for (var p : svc.getProviders(pat)) {
+                    prov++;
+                    boolean b = false;
+                    try {
+                        b = p.isBusy();
+                    } catch (Throwable ignored) {
+                    }
+                    if (b) {
+                        busy++;
+                    }
+                    if (at == null || (b && !at.endsWith("忙"))) {
+                        String pa = posOf(p);
+                        if (pa != null) {
+                            at = b ? pa + "忙" : pa;
+                        }
+                    }
+                    if (prov >= 12) {
+                        break;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            if (spend()) {
+                LOG.warn("[craftfix][警報] 料齊卻不推 out={} 樣板產物={} 剩{}輪 可跑{}輪 已齊{}s "
+                                + "prov:{} 忙:{}{} → {}",
+                        s.out, shortKey(pat.getPrimaryOutput().what()), e.getValue(),
+                        runnableRounds(pat, inv), (tick - since) / 20, prov, busy,
+                        at == null ? "" : "@" + at,
+                        prov == 0 ? "**樣板失聯**" : (busy >= prov ? "供應器全忙（正常等機器）"
+                                : "**執行器沉默：疑 parallel==1 死角**"));
+            }
+        }
+        var net = grid.getStorageService().getCachedInventory();
+        for (var e : wait.entrySet()) {
+            var k = e.getKey();
+            Integer since = s.waitSince.get(k);
+            if (since == null || tick - since < 2400 || net.get(k) > 0 || !s.longWaitLogged.add(k)) {
+                continue;
+            }
+            int others = 0;
+            for (var c2 : STATE.keySet()) {
+                if (c2 != logic && c2.getWaitingFor(k) > 0) {
+                    others++;
+                }
+            }
+            String pend = pendingAt(logic, k);
+            if (spend()) {
+                LOG.warn("[craftfix][警報] 在途沒回 out={} {} 等{} 已{}s 網存0{}{}",
+                        s.out, shortKey(k), e.getValue(), (tick - since) / 20,
+                        others > 0 ? "／另" + others + "顆也等" : "",
+                        pend == null ? "" : "／推給" + pend);
+            }
+        }
     }
 
     // ---------------------------------------------------------------- 一覽（每 30 秒）
