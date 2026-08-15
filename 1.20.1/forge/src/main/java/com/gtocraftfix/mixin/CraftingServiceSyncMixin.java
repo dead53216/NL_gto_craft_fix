@@ -153,6 +153,33 @@ public abstract class CraftingServiceSyncMixin {
     private static final AtomicInteger gtocraftfix$balLog = new AtomicInteger();
     private static final int gtocraftfix$BAL_MAX = 5000;
 
+    /**
+     * [3.8.0] 修補迴圈可處理的缺口數上限。原本是 96——那是「幻影缺口時代」的值（一張計畫只補一兩項），
+     * 現在修補擴成四維，大電路光第一輪缺口就破百，實測 17 次修補有 7 次貼著 96 停：
+     * <b>已加進計畫的輪次留著、它們的輸入沒補完 → 計畫內部不平衡 → 必凍</b>
+     * （ZPM 通用電路實錄：epoxy/quantum_processor/lubricant 全標「本單無人產」但網路有貨）。
+     * 上限本身要留（遞迴補料遇循環配方可以無限長，而且跑在伺服器主緒），但**耗盡時必須整組還原**。
+     */
+    private static final int gtocraftfix$REPAIR_GUARD = Integer.getInteger("gtodiag.repairGuard", 4000);
+
+    /** [3.8.0] 修補可新增的「總輪數」上限：真正該防的膨脹用輪數擋，而不是用次數硬砍。 */
+    private static final long gtocraftfix$REPAIR_RUN_CAP = Long.getLong("gtodiag.repairRunCap", 2_000_000L);
+
+    /** [3.8.0] 把 KeyCounter 倒回快照值（以差額回沖，KeyCounter.add 吃負數）。 */
+    private static void gtocraftfix$restoreCounter(appeng.api.stacks.KeyCounter kc, Map<AEKey, Long> snap) {
+        var keys = new HashSet<AEKey>(snap.keySet());
+        for (var e : kc) {
+            keys.add(e.getKey());
+        }
+        for (var k : keys) {
+            long delta = snap.getOrDefault(k, 0L) - kc.get(k);
+            if (delta != 0) {
+                kc.add(k, delta);
+            }
+        }
+        kc.removeZeros();
+    }
+
     /** [3.6.0] 逐輪記帳快照：cluster → {job, 樣板→剩餘輪數, key→CPU庫存, key→在途}。 */
     private final Map<CraftingCPUCluster, Object[]> gtocraftfix$pushSnap = new java.util.WeakHashMap<>();
 
@@ -795,8 +822,7 @@ public abstract class CraftingServiceSyncMixin {
                 long needOut = plan.finalOutput().amount() - supply;
                 if (needOut > 0) {
                     deficits.add(new Object[] { outKey, needOut, Boolean.TRUE });
-                    int c = gtocraftfix$sitterLog.incrementAndGet();
-                    if (c <= 200) {
+                    if (gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
                         LOG.info("[craftfix] 最終產出短缺 {} x{}（out={}）", outKey, needOut, plan.finalOutput());
                     }
                 }
@@ -807,10 +833,22 @@ public abstract class CraftingServiceSyncMixin {
 
             int guard = 0;
             int repaired = 0;
+            long addedRuns = 0;
+            String abortReason = null;
             StringBuilder note = new StringBuilder();
+            // [3.8.0] 修補前留底：修不完整就整組還原——半套計畫（輪次加了、輸入沒補）＝必凍，比不修更糟
+            var snapPt = new HashMap<>(pt);
+            var snapUsed = new HashMap<AEKey, Long>();
+            for (var e : used) {
+                snapUsed.put(e.getKey(), e.getLongValue());
+            }
+            var snapMissing = new HashMap<AEKey, Long>();
+            for (var e : missing) {
+                snapMissing.put(e.getKey(), e.getLongValue());
+            }
             // 外圈：解缺口 → 可執行性模擬（抓循環自舉缺口）→ 再解，最多 4 輪
             for (int round = 0; round < 4; round++) {
-            while (!deficits.isEmpty() && guard++ < 96) {
+            while (!deficits.isEmpty() && guard++ < gtocraftfix$REPAIR_GUARD) {
                 var d = deficits.poll();
                 var key = (AEKey) d[0];
                 long shortAmt = (Long) d[1];
@@ -852,8 +890,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (hard) {
                         blockSubmit = true; // 真缺料 → 擋下提交（否則 job 必凍）
                     }
-                    int c = gtocraftfix$sitterLog.incrementAndGet();
-                    if (c <= 200) {
+                    if (gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
                         LOG.warn("[craftfix] 計畫修補 無樣板可補：{} x{}（out={}）", key, shortAmt, plan.finalOutput());
                     }
                     if (gtocraftfix$noPatternLogged.add(key)) {
@@ -878,6 +915,11 @@ public abstract class CraftingServiceSyncMixin {
                 }
                 long batch = Math.max(1, batchOut);
                 long runs = (shortAmt + batch - 1) / batch; // ceil
+                addedRuns += runs;
+                if (addedRuns > gtocraftfix$REPAIR_RUN_CAP) {
+                    abortReason = "新增輪數 " + addedRuns + " 超過上限 " + gtocraftfix$REPAIR_RUN_CAP;
+                    break;
+                }
                 pt.merge(pat, runs, Long::sum);
                 // 缺口來源：先沖銷 missingItems（sim 計畫的缺），剩下沖銷 usedItems（幻影引用）
                 long fromMissing = Math.min(shortAmt, Math.max(0, missing.get(key)));
@@ -914,6 +956,14 @@ public abstract class CraftingServiceSyncMixin {
                     }
                 }
             }
+            // [3.8.0] while 只有兩種出口：缺口解完，或處理額度耗盡。後者代表計畫被改到一半 → 放棄。
+            if (abortReason == null && !deficits.isEmpty()) {
+                abortReason = "缺口未解完（已處理 " + guard + " 項、上限 " + gtocraftfix$REPAIR_GUARD
+                        + "，仍剩 " + deficits.size() + " 項）";
+            }
+            if (abortReason != null) {
+                break;
+            }
             // 可執行性模擬：紙上執行整張計畫（usedItems 當起始庫存、逐輪跑可跑的樣板）。
             // 跑不完＝有樣板被「0 庫存的輸入」卡死＝循環自舉缺口（如 H₂O₂ 蒽醌工作液：
             // 帳面淨消耗 0 → 不在 usedItems/missing → 但執行要有第一桶才轉得起來）→ 補進缺口再解。
@@ -923,19 +973,37 @@ public abstract class CraftingServiceSyncMixin {
             }
             for (var b : bootstrap) {
                 deficits.add(b);
-                int c = gtocraftfix$sitterLog.incrementAndGet();
-                if (c <= 200) {
+                if (gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
                     LOG.info("[craftfix] 循環自舉缺口 {} x{}（out={}）", b[0], b[1], plan.finalOutput());
                 }
             }
             }
+            // [3.8.0] 修補不完整 → 整組還原成修補前的計畫，原樣送出（寧可被拒單重試，也不交半套計畫）
+            if (abortReason != null) {
+                pt.keySet().removeIf(k -> !snapPt.containsKey(k));
+                for (var e : snapPt.entrySet()) {
+                    pt.put(e.getKey(), e.getValue());
+                }
+                gtocraftfix$restoreCounter(used, snapUsed);
+                gtocraftfix$restoreCounter(missing, snapMissing);
+                var left = new StringBuilder();
+                int ln = 0;
+                for (var d : deficits) {
+                    if (ln++ >= 5) {
+                        left.append('…');
+                        break;
+                    }
+                    left.append(d[0]).append(" x").append(d[1]).append("; ");
+                }
+                LOG.warn("[craftfix] **計畫修補放棄**（{}）→ 已還原成原計畫送出。未解缺口：{} out={}",
+                        abortReason, left, plan.finalOutput());
+                return;
+            }
             used.removeZeros();
             missing.removeZeros();
-            if (repaired > 0) {
-                int c = gtocraftfix$sitterLog.incrementAndGet();
-                if (c <= 200) {
-                    LOG.info("[craftfix] 計畫修補 out={} 補{}項：{}", plan.finalOutput(), repaired, note);
-                }
+            if (repaired > 0 && gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
+                LOG.info("[craftfix] 計畫修補 out={} 補{}項/新增{}輪：{}",
+                        plan.finalOutput(), repaired, addedRuns, note);
             }
             // sim 計畫的缺全補齊 → 翻回可執行，machine+sim 守衛不再靜默拒單（手動能、自動不能的分歧點）
             if (plan.simulation() && missing.size() == 0) {
