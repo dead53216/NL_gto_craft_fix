@@ -149,6 +149,88 @@ public abstract class CraftingServiceSyncMixin {
         return sb.toString();
     }
 
+    /** [3.5.0] 收支診斷專用額度（與 sitterLog 分開，避免被其他訊息燒光而靜音）。 */
+    private static final AtomicInteger gtocraftfix$balLog = new AtomicInteger();
+
+    /** [3.5.0 純診斷] **出生收支**：提交當下用計畫自己的數字驗證
+     *  「Σ(每輪輸入×runs) ≤ usedItems ＋ emittedItems ＋ Σ(每輪產出×runs)」。
+     *  算料器是拿虛擬庫存模擬跑過一遍才產出計畫，理論上必然成立；若這裡就負，代表**算料階段**
+     *  已經不平（餘數向下取整之類），與執行期無關。替代輸入取「供給最多的變體」以免誤報。 */
+    private void gtocraftfix$planBirthBalance(CraftingPlan plan) {
+        try {
+            var pt = plan.patternTimes();
+            if (pt.isEmpty()) {
+                return;
+            }
+            var supply = new HashMap<AEKey, Long>();
+            for (var e : plan.usedItems()) {
+                supply.merge(e.getKey(), e.getLongValue(), Long::sum);
+            }
+            for (var e : plan.emittedItems()) {
+                supply.merge(e.getKey(), e.getLongValue(), Long::sum);
+            }
+            for (var pe : pt.entrySet()) {
+                long runs = pe.getValue();
+                if (runs <= 0) {
+                    continue;
+                }
+                for (var o : pe.getKey().getOutputs()) {
+                    if (o.amount() > 0) {
+                        supply.merge(o.what(), o.amount() * runs, Long::sum);
+                    }
+                }
+            }
+            var demand = new HashMap<AEKey, Long>();
+            for (var pe : pt.entrySet()) {
+                long runs = pe.getValue();
+                if (runs <= 0) {
+                    continue;
+                }
+                for (var in : pe.getKey().getInputs()) {
+                    var ps = in.getPossibleInputs();
+                    if (ps.length == 0) {
+                        continue;
+                    }
+                    // 替代輸入：算在「計畫實際供給最多」的那個變體上（避免只看 ps[0] 的誤報）
+                    var best = ps[0];
+                    long bestSup = -1;
+                    for (var v : ps) {
+                        long s = supply.getOrDefault(v.what(), 0L);
+                        if (s > bestSup) {
+                            bestSup = s;
+                            best = v;
+                        }
+                    }
+                    long per = best.amount() * in.getMultiplier();
+                    if (per > 0) {
+                        demand.merge(best.what(), per * runs, Long::sum);
+                    }
+                }
+            }
+            var sb = new StringBuilder();
+            int n = 0;
+            for (var e : demand.entrySet()) {
+                long have = supply.getOrDefault(e.getKey(), 0L);
+                long shortAmt = e.getValue() - have;
+                if (shortAmt > 0 && n++ < 6) {
+                    sb.append(e.getKey()).append(" 需").append(e.getValue())
+                            .append("/計畫供").append(have).append("(缺").append(shortAmt).append("); ");
+                }
+            }
+            if (gtocraftfix$balLog.incrementAndGet() > 500) {
+                return;
+            }
+            if (sb.length() > 0) {
+                LOG.warn("[craftfix] 出生收支：**算料階段就不平** out={} 任務{}種 → {}",
+                        plan.finalOutput(), pt.size(), sb);
+            } else {
+                LOG.info("[craftfix] 出生收支：平衡 out={} 任務{}種（之後若不平＝執行期漂移）",
+                        plan.finalOutput(), pt.size());
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     /** [3.4.0 純診斷] 計畫內部收支平衡檢查（可嚴格證明「這張單做不完」的不變量）：
      *  <p>對每個 key：總消耗 = Σ(剩餘任務每輪輸入 × 剩餘輪數)；總可得 = Σ(剩餘任務每輪產出 × 剩餘輪數)
      *  ＋ CPU 庫存 ＋ 在途(waitingFor)。若 總可得 &lt; 總消耗，**無論執行順序如何都不可能完成**——
@@ -168,25 +250,42 @@ public abstract class CraftingServiceSyncMixin {
             }
             var demand = new HashMap<AEKey, Long>();
             var supply = new HashMap<AEKey, Long>();
+            // 先算供給（排定產出），替代輸入才有依據擇優
             for (var en : tasks.entrySet()) {
                 long times = gtocraftfix$fHolderVal.getLong(en.getValue());
                 if (times <= 0) {
                     continue;
                 }
-                var pat = (IPatternDetails) en.getKey();
-                for (var in : pat.getInputs()) {
+                for (var o : ((IPatternDetails) en.getKey()).getOutputs()) {
+                    if (o.amount() > 0) {
+                        supply.merge(o.what(), o.amount() * times, Long::sum);
+                    }
+                }
+            }
+            for (var en : tasks.entrySet()) {
+                long times = gtocraftfix$fHolderVal.getLong(en.getValue());
+                if (times <= 0) {
+                    continue;
+                }
+                for (var in : ((IPatternDetails) en.getKey()).getInputs()) {
                     var ps = in.getPossibleInputs();
                     if (ps.length == 0) {
                         continue;
                     }
-                    long per = ps[0].amount() * in.getMultiplier();
-                    if (per > 0) {
-                        demand.merge(ps[0].what(), per * times, Long::sum);
+                    // [3.5.0] 替代輸入：算在「庫存＋在途＋排定產出最多」的變體上，消除誤報
+                    var best = ps[0];
+                    long bestAvail = -1;
+                    for (var v : ps) {
+                        long a = inv.list.get(v.what()) + Math.max(0, logic.getWaitingFor(v.what()))
+                                + supply.getOrDefault(v.what(), 0L);
+                        if (a > bestAvail) {
+                            bestAvail = a;
+                            best = v;
+                        }
                     }
-                }
-                for (var o : pat.getOutputs()) {
-                    if (o.amount() > 0) {
-                        supply.merge(o.what(), o.amount() * times, Long::sum);
+                    long per = best.amount() * in.getMultiplier();
+                    if (per > 0) {
+                        demand.merge(best.what(), per * times, Long::sum);
                     }
                 }
             }
@@ -203,7 +302,7 @@ public abstract class CraftingServiceSyncMixin {
                             .append("); ");
                 }
             }
-            if (sb.length() > 0 && gtocraftfix$sitterLog.incrementAndGet() <= 2000) {
+            if (sb.length() > 0 && gtocraftfix$balLog.incrementAndGet() <= 500) {
                 LOG.warn("[craftfix] 計畫收支缺口（排定產出＋庫存＋在途 < 總消耗，此單不可能完成）out={} → {}",
                         out, sb);
             }
@@ -523,6 +622,9 @@ public abstract class CraftingServiceSyncMixin {
                                 plan.finalOutput(), sb);
                     }
                 }
+                // [3.5.0] 出生收支：用計畫自己的數字驗證「消耗 ≤ usedItems＋排定產出」。
+                // 出生就負＝算料器的鍋；出生平、跑到一半才負＝執行期漂移（並行取料／認領歸屬）。
+                gtocraftfix$planBirthBalance(plan);
             } catch (Throwable ignored) {
             }
         }
