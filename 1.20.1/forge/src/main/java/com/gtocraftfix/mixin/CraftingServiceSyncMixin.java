@@ -846,14 +846,42 @@ public abstract class CraftingServiceSyncMixin {
             for (var e : missing) {
                 snapMissing.put(e.getKey(), e.getLongValue());
             }
-            // 外圈：解缺口 → 可執行性模擬（抓循環自舉缺口）→ 再解，最多 4 輪
-            for (int round = 0; round < 4; round++) {
+            var finalKey = plan.finalOutput() == null ? null : plan.finalOutput().what();
+            // 外圈：解缺口 → 內部配平 ＋ 可執行性模擬 → 再解，最多 6 輪
+            for (int round = 0; round < 6; round++) {
             while (!deficits.isEmpty() && guard++ < gtocraftfix$REPAIR_GUARD) {
                 var d = deficits.poll();
                 var key = (AEKey) d[0];
                 long shortAmt = (Long) d[1];
                 // hard=真實記帳缺口（missing/usedItems/最終產出/新增輸入）；自舉猜測（近似模擬）為 soft
                 boolean hard = d.length > 2 && Boolean.TRUE.equals(d[2]);
+
+                // [3.9.0] 先拿網路現貨：缺的量網路有就直接記進 usedItems（開局一次取進 CPU），
+                // 比排樣板便宜也即時。實錄：LUV 電路做到剩 34 個時餓死在 lubricant 132／copper_block 4／
+                // platinum_single_wire 6，而網路各有 115209／6／13——就差這一步。
+                // 成品本身例外：GTO 沒有「把開局吸入的成品交給 link」的步驟，吸進去只會抱著現貨永凍。
+                if (shortAmt > 0 && !key.equals(finalKey)) {
+                    long a0 = avail.computeIfAbsent(key,
+                            k -> storage.extract(k, Long.MAX_VALUE / 2, Actionable.SIMULATE, src));
+                    long free0 = Math.max(0, a0 - reserved.getOrDefault(key, 0L));
+                    long fromNet0 = Math.min(shortAmt, free0);
+                    if (fromNet0 > 0) {
+                        used.add(key, fromNet0);
+                        reserved.merge(key, fromNet0, Long::sum);
+                        long fm0 = Math.min(fromNet0, Math.max(0, missing.get(key)));
+                        if (fm0 > 0) {
+                            missing.add(key, -fm0);
+                        }
+                        shortAmt -= fromNet0;
+                        repaired++;
+                        if (repaired <= 8) {
+                            note.append(key).append(" +").append(fromNet0).append("(網路現貨); ");
+                        }
+                        if (shortAmt <= 0) {
+                            continue;
+                        }
+                    }
+                }
 
                 // 找樣板：①計畫裡主產出＝key ②計畫裡任一產出含 key（副產物，如鎂循環的鎂）③問網路
                 IPatternDetails pat = null;
@@ -964,19 +992,45 @@ public abstract class CraftingServiceSyncMixin {
             if (abortReason != null) {
                 break;
             }
+            // [3.9.0] 第五維：內部配平——檢查**修補後**的計畫自己配不配得平
+            // （前四維只看「對網路的引用」與「可執行性」，沒人檢查修補完的成品）。
+            var balance = gtocraftfix$internalBalanceDeficits(plan);
+            for (var b : balance) {
+                deficits.add(b);
+                if (gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
+                    LOG.info("[craftfix] 內部配平缺口 {} x{}（out={}）", b[0], b[1], plan.finalOutput());
+                }
+            }
             // 可執行性模擬：紙上執行整張計畫（usedItems 當起始庫存、逐輪跑可跑的樣板）。
             // 跑不完＝有樣板被「0 庫存的輸入」卡死＝循環自舉缺口（如 H₂O₂ 蒽醌工作液：
             // 帳面淨消耗 0 → 不在 usedItems/missing → 但執行要有第一桶才轉得起來）→ 補進缺口再解。
             var bootstrap = gtocraftfix$findBootstrapDeficits(plan);
-            if (bootstrap.isEmpty()) {
-                break;
-            }
             for (var b : bootstrap) {
                 deficits.add(b);
                 if (gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
                     LOG.info("[craftfix] 循環自舉缺口 {} x{}（out={}）", b[0], b[1], plan.finalOutput());
                 }
             }
+            if (deficits.isEmpty()) {
+                break;
+            }
+            }
+            // [3.9.0] 收斂檢查：6 輪後仍不平只記 WARN 不還原——配平模型對「替代輸入／副產物」是啟發式，
+            // 誤判就把能跑的計畫也丟掉太貴；真正的截斷（額度耗盡）才走全有全無。
+            if (abortReason == null) {
+                var left = gtocraftfix$internalBalanceDeficits(plan);
+                if (!left.isEmpty() && gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
+                    var sb2 = new StringBuilder();
+                    int n2 = 0;
+                    for (var b : left) {
+                        if (n2++ >= 5) {
+                            sb2.append('…');
+                            break;
+                        }
+                        sb2.append(b[0]).append(" x").append(b[1]).append("; ");
+                    }
+                    LOG.warn("[craftfix] 內部配平未收斂（6 輪）out={} 仍缺：{}", plan.finalOutput(), sb2);
+                }
             }
             // [3.8.0] 修補不完整 → 整組還原成修補前的計畫，原樣送出（寧可被拒單重試，也不交半套計畫）
             if (abortReason != null) {
@@ -1721,6 +1775,76 @@ public abstract class CraftingServiceSyncMixin {
         } catch (Throwable ignored) {
             // 反射不可用 → 靜默略過（純救援層，失效不影響原行為）
         }
+    }
+
+    /**
+     * [3.9.0] 內部配平缺口（修補第五維）：對整張計畫每個 key 算
+     * {@code demand = Σ(每輪輸入 × runs)}、{@code supply = usedItems ＋ emittedItems ＋ Σ(每輪產出 × runs)}，
+     * 負差即缺口。前四維只檢查「計畫對網路的引用」與「可執行性」，**沒有人檢查修補後的計畫自己配不配得平**
+     * ——實錄：LUV 通用電路修補完仍差 lubricant 132／copper_block 4／platinum_single_wire 6／naquadah_boule 2，
+     * 做到剩最後 34 個成品時全鏈餓死，而網路各有 115209／6／13／3。
+     * 替代輸入取「計畫供給最多」的變體（與 {@code planBirthBalance} 同一模型），避免誤報。
+     */
+    private static java.util.List<Object[]> gtocraftfix$internalBalanceDeficits(CraftingPlan plan) {
+        var out = new java.util.ArrayList<Object[]>();
+        try {
+            var pt = plan.patternTimes();
+            if (pt.isEmpty()) {
+                return out;
+            }
+            var supply = new HashMap<AEKey, Long>();
+            for (var e : plan.usedItems()) {
+                supply.merge(e.getKey(), e.getLongValue(), Long::sum);
+            }
+            for (var e : plan.emittedItems()) {
+                supply.merge(e.getKey(), e.getLongValue(), Long::sum);
+            }
+            for (var pe : pt.entrySet()) {
+                long runs = pe.getValue() == null ? 0 : pe.getValue();
+                if (runs <= 0) {
+                    continue;
+                }
+                for (var o : pe.getKey().getOutputs()) {
+                    if (o.amount() > 0) {
+                        supply.merge(o.what(), o.amount() * runs, Long::sum);
+                    }
+                }
+            }
+            var demand = new HashMap<AEKey, Long>();
+            for (var pe : pt.entrySet()) {
+                long runs = pe.getValue() == null ? 0 : pe.getValue();
+                if (runs <= 0) {
+                    continue;
+                }
+                for (var in : pe.getKey().getInputs()) {
+                    var ps = in.getPossibleInputs();
+                    if (ps.length == 0) {
+                        continue;
+                    }
+                    var best = ps[0];
+                    long bestSup = -1;
+                    for (var v : ps) {
+                        long s = supply.getOrDefault(v.what(), 0L);
+                        if (s > bestSup) {
+                            bestSup = s;
+                            best = v;
+                        }
+                    }
+                    long per = best.amount() * in.getMultiplier();
+                    if (per > 0) {
+                        demand.merge(best.what(), per * runs, Long::sum);
+                    }
+                }
+            }
+            for (var e : demand.entrySet()) {
+                long shortAmt = e.getValue() - supply.getOrDefault(e.getKey(), 0L);
+                if (shortAmt > 0) {
+                    out.add(new Object[] { e.getKey(), shortAmt, Boolean.TRUE });
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return out;
     }
 
     /**
