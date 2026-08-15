@@ -152,6 +152,116 @@ public abstract class CraftingServiceSyncMixin {
     /** [3.5.0] 收支診斷專用額度（與 sitterLog 分開，避免被其他訊息燒光而靜音）。 */
     private static final AtomicInteger gtocraftfix$balLog = new AtomicInteger();
 
+    /** [3.6.0] 逐輪記帳快照：cluster → {job, 樣板→剩餘輪數, key→CPU庫存, key→在途}。 */
+    private final Map<CraftingCPUCluster, Object[]> gtocraftfix$pushSnap = new java.util.WeakHashMap<>();
+
+    /**
+     * [3.6.0 純診斷] 推送記帳：抓「某樣板剩餘輪數下降」的瞬間（＝執行器推了 Δ 輪），比對
+     * <ul>
+     *   <li><b>實際抽走的輸入</b> vs <b>計畫每輪值 × Δ</b> —— 多吃＝並行取料換算與計畫不一致；</li>
+     *   <li><b>在途(waitingFor)增加量</b> vs <b>樣板每輪產出 × Δ</b> —— 記少了＝產出帳沒掛上。</li>
+     * </ul>
+     * 只在「本次取樣恰有一個樣板變動」時報告（多樣板同時推無法歸屬）。純讀取，不改任何狀態。
+     */
+    private void gtocraftfix$pushAudit(appeng.crafting.execution.CraftingCpuLogic logic,
+                                       CraftingCPUCluster cluster) {
+        try {
+            Object job = gtocraftfix$fJob == null ? null : gtocraftfix$fJob.get(logic);
+            if (job == null || gtocraftfix$fTasks == null) {
+                gtocraftfix$pushSnap.remove(cluster);
+                return;
+            }
+            Map<?, ?> tasks = (Map<?, ?>) gtocraftfix$fTasks.get(job);
+            var inv = gtocraftfix$invOf(logic);
+            if (tasks == null || inv == null) {
+                return;
+            }
+            var curTimes = new HashMap<IPatternDetails, Long>();
+            var keys = new HashSet<AEKey>();
+            for (var en : tasks.entrySet()) {
+                long t = gtocraftfix$fHolderVal.getLong(en.getValue());
+                var pat = (IPatternDetails) en.getKey();
+                curTimes.put(pat, t);
+                for (var in : pat.getInputs()) {
+                    for (var v : in.getPossibleInputs()) {
+                        keys.add(v.what());
+                    }
+                }
+                for (var o : pat.getOutputs()) {
+                    keys.add(o.what());
+                }
+            }
+            var curInv = new HashMap<AEKey, Long>();
+            var curWait = new HashMap<AEKey, Long>();
+            for (var k : keys) {
+                curInv.put(k, inv.list.get(k));
+                curWait.put(k, logic.getWaitingFor(k));
+            }
+            Object[] prev = gtocraftfix$pushSnap.get(cluster);
+            gtocraftfix$pushSnap.put(cluster, new Object[] { job, curTimes, curInv, curWait });
+            if (prev == null || prev[0] != job) {
+                return; // 換單重新起算
+            }
+            @SuppressWarnings("unchecked")
+            var pTimes = (HashMap<IPatternDetails, Long>) prev[1];
+            @SuppressWarnings("unchecked")
+            var pInv = (HashMap<AEKey, Long>) prev[2];
+            @SuppressWarnings("unchecked")
+            var pWait = (HashMap<AEKey, Long>) prev[3];
+            IPatternDetails moved = null;
+            long delta = 0;
+            for (var e : pTimes.entrySet()) {
+                long now = curTimes.getOrDefault(e.getKey(), 0L);
+                long d = e.getValue() - now;
+                if (d > 0) {
+                    if (moved != null) {
+                        return; // 同一取樣有多個樣板推送 → 無法歸屬，跳過
+                    }
+                    moved = e.getKey();
+                    delta = d;
+                }
+            }
+            if (moved == null) {
+                return;
+            }
+            var sb = new StringBuilder();
+            for (var in : moved.getInputs()) {
+                var ps = in.getPossibleInputs();
+                if (ps.length == 0) {
+                    continue;
+                }
+                // 實際抽走：取「庫存下降最多」的變體（並行版可能挑了別的替代品）
+                var used = ps[0];
+                long usedDrop = Long.MIN_VALUE;
+                for (var v : ps) {
+                    long drop = pInv.getOrDefault(v.what(), 0L) - curInv.getOrDefault(v.what(), 0L);
+                    if (drop > usedDrop) {
+                        usedDrop = drop;
+                        used = v;
+                    }
+                }
+                long expect = used.amount() * in.getMultiplier() * delta;
+                if (usedDrop != expect) {
+                    sb.append(used.what()).append(" 預期吃").append(expect)
+                            .append("/實吃").append(usedDrop).append("; ");
+                }
+            }
+            for (var o : moved.getOutputs()) {
+                long expect = o.amount() * delta;
+                long got = curWait.getOrDefault(o.what(), 0L) - pWait.getOrDefault(o.what(), 0L);
+                if (got != expect) {
+                    sb.append(o.what()).append(" 預期在途+").append(expect)
+                            .append("/實際+").append(got).append("; ");
+                }
+            }
+            if (sb.length() > 0 && gtocraftfix$balLog.incrementAndGet() <= 500) {
+                LOG.warn("[craftfix] 推送記帳不符 {} Δ輪={} → {}",
+                        moved.getPrimaryOutput().what(), delta, sb);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     /** [3.5.0 純診斷] **出生收支**：提交當下用計畫自己的數字驗證
      *  「Σ(每輪輸入×runs) ≤ usedItems ＋ emittedItems ＋ Σ(每輪產出×runs)」。
      *  算料器是拿虛擬庫存模擬跑過一遍才產出計畫，理論上必然成立；若這裡就負，代表**算料階段**
@@ -1015,6 +1125,26 @@ public abstract class CraftingServiceSyncMixin {
         com.gtocraftfix.calc.CalcTicker.tick(); // 內置原版算料器的預算泵（每 tick）
         com.gtocraftfix.lpcalc.LpFallbackQueue.drainOnServerTick(); // LP 晚期回退/影子驗證的伺服器緒建構點（鐵則5/8）
         gtocraftfix$tickCounter++;
+        // [3.6.0] 逐輪記帳取樣（每 2 tick）：抓推送瞬間比對實吃/實掛帳，純讀取
+        if (gtocraftfix$tickCounter % 2 == 0) {
+            for (var cluster : craftingCPUClusters) {
+                try {
+                    if (gtocraftfix$fJob == null) {
+                        var fj = cluster.craftingLogic.getClass().getDeclaredField("job");
+                        fj.setAccessible(true);
+                        gtocraftfix$fJob = fj;
+                        Object j0 = fj.get(cluster.craftingLogic);
+                        if (j0 != null && gtocraftfix$fTasks == null) {
+                            var ft = j0.getClass().getDeclaredField("tasks");
+                            ft.setAccessible(true);
+                            gtocraftfix$fTasks = ft;
+                        }
+                    }
+                    gtocraftfix$pushAudit(cluster.craftingLogic, cluster);
+                } catch (Throwable ignored) {
+                }
+            }
+        }
         if (gtocraftfix$tickCounter % 400 == 0) {
             for (var cluster : craftingCPUClusters) {
                 try {
