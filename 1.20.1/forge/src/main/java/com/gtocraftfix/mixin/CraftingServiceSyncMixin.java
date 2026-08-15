@@ -149,8 +149,9 @@ public abstract class CraftingServiceSyncMixin {
         return sb.toString();
     }
 
-    /** [3.5.0] 收支診斷專用額度（與 sitterLog 分開，避免被其他訊息燒光而靜音）。 */
+    /** [3.5.0] 收支診斷專用額度（與 sitterLog 分開，避免被其他訊息燒光而靜音）；[3.7.0] 上限拉到 5000。 */
     private static final AtomicInteger gtocraftfix$balLog = new AtomicInteger();
+    private static final int gtocraftfix$BAL_MAX = 5000;
 
     /** [3.6.0] 逐輪記帳快照：cluster → {job, 樣板→剩餘輪數, key→CPU庫存, key→在途}。 */
     private final Map<CraftingCPUCluster, Object[]> gtocraftfix$pushSnap = new java.util.WeakHashMap<>();
@@ -254,7 +255,7 @@ public abstract class CraftingServiceSyncMixin {
                             .append("/實際+").append(got).append("; ");
                 }
             }
-            if (sb.length() > 0 && gtocraftfix$balLog.incrementAndGet() <= 500) {
+            if (sb.length() > 0 && gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
                 LOG.warn("[craftfix] 推送記帳不符 {} Δ輪={} → {}",
                         moved.getPrimaryOutput().what(), delta, sb);
             }
@@ -327,7 +328,7 @@ public abstract class CraftingServiceSyncMixin {
                             .append("/計畫供").append(have).append("(缺").append(shortAmt).append("); ");
                 }
             }
-            if (gtocraftfix$balLog.incrementAndGet() > 500) {
+            if (gtocraftfix$balLog.incrementAndGet() > gtocraftfix$BAL_MAX) {
                 return;
             }
             if (sb.length() > 0) {
@@ -412,7 +413,7 @@ public abstract class CraftingServiceSyncMixin {
                             .append("); ");
                 }
             }
-            if (sb.length() > 0 && gtocraftfix$balLog.incrementAndGet() <= 500) {
+            if (sb.length() > 0 && gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
                 LOG.warn("[craftfix] 計畫收支缺口（排定產出＋庫存＋在途 < 總消耗，此單不可能完成）out={} → {}",
                         out, sb);
             }
@@ -695,16 +696,20 @@ public abstract class CraftingServiceSyncMixin {
     private void gtocraftfix$repairPlan(ICraftingPlan job, ICraftingRequester requestingMachine, ICraftingCPU target,
                                         boolean prioritizePower, IActionSource src,
                                         CallbackInfoReturnable<ICraftingSubmitResult> cir) {
+        // [3.7.0] 提交入口記錄（來源／計畫概要／重下單次數），並記下「誰已經在跑單」供 RETURN 對帳
+        com.gtocraftfix.diag.CraftDiag.onSubmit(gtocraftfix$tickCounter, job, src, requestingMachine,
+                craftingCPUClusters);
         if (!(job instanceof CraftingPlan plan)) {
             return;
         }
+        com.gtocraftfix.diag.CraftDiag.dumpPlan(plan); // [3.7.0] 計畫出生留底（任務／used／missing）
         if (gtocraftfix$SLIM) {
             // [slim 3.3.0] 計畫修補**已啟用**（下方照跑）；只有兩個拒單守衛仍停用（見方法末尾）。
             // [3.2.3] 修補前先把「幻影缺口」點出來：usedItems 要的量網路實際取不到、且計畫沒排任何
             // 樣板產它 → 不修就必然變成永遠等不到的 waitingFor（凍結源自計畫本身，與機器/認領無關）。
             try {
-                int c0 = gtocraftfix$sitterLog.incrementAndGet();
-                if (c0 <= 200) {
+                // [3.7.0] 改用 balLog 額度（原本共用 sitterLog，幾分鐘就被燒光而靜音）
+                if (gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
                     var st = grid.getStorageService().getInventory();
                     var made = new HashSet<AEKey>();
                     for (var pe : plan.patternTimes().entrySet()) {
@@ -979,6 +984,17 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
+    // ---- [3.7.0 純診斷] 開單對帳：提交返回後找出新上機的 CPU，把「計畫 usedItems」與
+    // 「CPU 實際吸到的庫存＋掛上的在途」逐項比對——差額若不落在任一邊，就是取料階段直接吞掉；
+    // 落在在途則是正常 IgnoreMissing（之後要靠認領回來）。這是分辨兩種凍結成因的唯一切點。----
+    @Inject(method = "submitJob", at = @At("RETURN"), remap = false)
+    private void gtocraftfix$diagSubmitted(ICraftingPlan job, ICraftingRequester requestingMachine,
+                                           ICraftingCPU target, boolean prioritizePower, IActionSource src,
+                                           CallbackInfoReturnable<ICraftingSubmitResult> cir) {
+        com.gtocraftfix.diag.CraftDiag.onSubmitted(gtocraftfix$tickCounter, job, cir.getReturnValue(),
+                grid, craftingCPUClusters);
+    }
+
     // ---- 診斷：機器源提交失敗（原本完全無聲——追蹤器只會下一 tick 重試）----
     @Inject(method = "submitJob", at = @At("RETURN"), remap = false)
     private void gtocraftfix$diagMachineFail(ICraftingPlan job, ICraftingRequester requestingMachine,
@@ -1125,26 +1141,11 @@ public abstract class CraftingServiceSyncMixin {
         com.gtocraftfix.calc.CalcTicker.tick(); // 內置原版算料器的預算泵（每 tick）
         com.gtocraftfix.lpcalc.LpFallbackQueue.drainOnServerTick(); // LP 晚期回退/影子驗證的伺服器緒建構點（鐵則5/8）
         gtocraftfix$tickCounter++;
-        // [3.6.0] 逐輪記帳取樣（每 2 tick）：抓推送瞬間比對實吃/實掛帳，純讀取
-        if (gtocraftfix$tickCounter % 2 == 0) {
-            for (var cluster : craftingCPUClusters) {
-                try {
-                    if (gtocraftfix$fJob == null) {
-                        var fj = cluster.craftingLogic.getClass().getDeclaredField("job");
-                        fj.setAccessible(true);
-                        gtocraftfix$fJob = fj;
-                        Object j0 = fj.get(cluster.craftingLogic);
-                        if (j0 != null && gtocraftfix$fTasks == null) {
-                            var ft = j0.getClass().getDeclaredField("tasks");
-                            ft.setAccessible(true);
-                            gtocraftfix$fTasks = ft;
-                        }
-                    }
-                    gtocraftfix$pushAudit(cluster.craftingLogic, cluster);
-                } catch (Throwable ignored) {
-                }
-            }
-        }
+        // [3.7.0] 帳本：每 tick 逐 CPU 對「Δ庫存＋Δ在途＋Δ交付 == 產出−消耗＋自補」這條不變量，
+        // 違反即帳外流動（多吃／被領走／產出沒掛帳）；另含新單/離場快照、任務增減、一覽、凍結全景。
+        // 取代 3.6.0 的每 2 tick 取樣式 pushAudit（取樣會把任務移除誤算成巨量 Δ）。
+        com.gtocraftfix.diag.CraftDiag.tick(gtocraftfix$tickCounter, (CraftingService) (Object) this,
+                grid, craftingCPUClusters);
         if (gtocraftfix$tickCounter % 400 == 0) {
             for (var cluster : craftingCPUClusters) {
                 try {
@@ -1515,6 +1516,7 @@ public abstract class CraftingServiceSyncMixin {
                             storage.insert(ik, got, Actionable.MODULATE, src); // 插不進退回網路，防蒸發
                             throw t;
                         }
+                        com.gtocraftfix.diag.CraftDiag.noteExternalInsert(logic, ik, got); // [3.7.0] 帳本登記
                         fed++;
                         int c = gtocraftfix$sitterLog.incrementAndGet();
                         if (c <= 200) {
@@ -1638,6 +1640,8 @@ public abstract class CraftingServiceSyncMixin {
                             storage.insert(ik, got, Actionable.MODULATE, src);
                             throw t;
                         }
+                        // [3.7.0] 登記「本 mod 自己塞的料」，帳本才不會把它算成帳外流入
+                        com.gtocraftfix.diag.CraftDiag.noteExternalInsert(logic, ik, got);
                         int c = gtocraftfix$sitterLog.incrementAndGet();
                         if (c <= 200) {
                             LOG.info("[craftfix] 並行死角解鎖 {}：補 {} x{}（湊滿 2 輪，繞過上游 parallel==1 取料漏洞）",
