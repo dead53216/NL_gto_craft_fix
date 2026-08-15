@@ -400,7 +400,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (p2 != null && !p2.simulation() && p2.finalOutput() != null && p2.finalOutput().amount() > 0
                             && !p2.patternTimes().isEmpty()) {
                         int c = gtocraftfix$sitterLog.incrementAndGet();
-                        if (c <= 200) {
+                        if (c <= 2000) { // [3.3.1] 額度 200→2000：共用計數器太小，一場就靜音
                             LOG.info("[craftfix] 機器源降量重算 {}：{} → {}", what, amount, tryAmount);
                         }
                         plan = p2;
@@ -432,34 +432,33 @@ public abstract class CraftingServiceSyncMixin {
             // [3.2.3] 修補前先把「幻影缺口」點出來：usedItems 要的量網路實際取不到、且計畫沒排任何
             // 樣板產它 → 不修就必然變成永遠等不到的 waitingFor（凍結源自計畫本身，與機器/認領無關）。
             try {
-                int c0 = gtocraftfix$sitterLog.incrementAndGet();
-                if (c0 <= 200) {
-                    var st = grid.getStorageService().getInventory();
-                    var made = new HashSet<AEKey>();
-                    for (var pe : plan.patternTimes().entrySet()) {
-                        if (pe.getValue() > 0) {
-                            for (var o : pe.getKey().getOutputs()) {
-                                made.add(o.what());
-                            }
+                // [3.3.1] 計數器只在「真的有東西要印」時才 +1：舊寫法每次 submitJob 都 +1，
+                // 機器源每 2 秒重試很快就把共用額度燒光，之後所有診斷全靜音（實測一場後全瞎）。
+                var st = grid.getStorageService().getInventory();
+                var made = new HashSet<AEKey>();
+                for (var pe : plan.patternTimes().entrySet()) {
+                    if (pe.getValue() > 0) {
+                        for (var o : pe.getKey().getOutputs()) {
+                            made.add(o.what());
                         }
                     }
-                    var sb = new StringBuilder();
-                    int n = 0;
-                    for (var e : plan.usedItems()) {
-                        long want = e.getLongValue();
-                        if (want <= 0 || made.contains(e.getKey())) {
-                            continue; // 計畫有排生產＝不是幻影
-                        }
-                        long can = st.extract(e.getKey(), want, Actionable.SIMULATE, src);
-                        if (can < want && n++ < 6) {
-                            sb.append(e.getKey()).append(" 要").append(want)
-                                    .append("/網").append(can).append("; ");
-                        }
+                }
+                var sb = new StringBuilder();
+                int n = 0;
+                for (var e : plan.usedItems()) {
+                    long want = e.getLongValue();
+                    if (want <= 0 || made.contains(e.getKey())) {
+                        continue; // 計畫有排生產＝不是幻影
                     }
-                    if (sb.length() > 0) {
-                        LOG.warn("[craftfix] 開單即缺（計畫未排生產，將由計畫修補補上）out={} → {}",
-                                plan.finalOutput(), sb);
+                    long can = st.extract(e.getKey(), want, Actionable.SIMULATE, src);
+                    if (can < want && n++ < 6) {
+                        sb.append(e.getKey()).append(" 要").append(want)
+                                .append("/網").append(can).append("; ");
                     }
+                }
+                if (sb.length() > 0 && gtocraftfix$sitterLog.incrementAndGet() <= 2000) {
+                    LOG.warn("[craftfix] 開單即缺（計畫未排生產，將由計畫修補補上）out={} → {}",
+                            plan.finalOutput(), sb);
                 }
             } catch (Throwable ignored) {
             }
@@ -517,7 +516,7 @@ public abstract class CraftingServiceSyncMixin {
                 if (needOut > 0) {
                     deficits.add(new Object[] { outKey, needOut, Boolean.TRUE });
                     int c = gtocraftfix$sitterLog.incrementAndGet();
-                    if (c <= 200) {
+                    if (c <= 2000) { // [3.3.1] 額度 200→2000：共用計數器太小，一場就靜音
                         LOG.info("[craftfix] 最終產出短缺 {} x{}（out={}）", outKey, needOut, plan.finalOutput());
                     }
                 }
@@ -574,7 +573,7 @@ public abstract class CraftingServiceSyncMixin {
                         blockSubmit = true; // 真缺料 → 擋下提交（否則 job 必凍）
                     }
                     int c = gtocraftfix$sitterLog.incrementAndGet();
-                    if (c <= 200) {
+                    if (c <= 2000) { // [3.3.1] 額度 200→2000：共用計數器太小，一場就靜音
                         LOG.warn("[craftfix] 計畫修補 無樣板可補：{} x{}（out={}）", key, shortAmt, plan.finalOutput());
                     }
                     if (gtocraftfix$noPatternLogged.add(key)) {
@@ -645,7 +644,7 @@ public abstract class CraftingServiceSyncMixin {
             for (var b : bootstrap) {
                 deficits.add(b);
                 int c = gtocraftfix$sitterLog.incrementAndGet();
-                if (c <= 200) {
+                if (c <= 2000) { // [3.3.1] 額度 200→2000：共用計數器太小，一場就靜音
                     LOG.info("[craftfix] 循環自舉缺口 {} x{}（out={}）", b[0], b[1], plan.finalOutput());
                 }
             }
@@ -654,7 +653,7 @@ public abstract class CraftingServiceSyncMixin {
             missing.removeZeros();
             if (repaired > 0) {
                 int c = gtocraftfix$sitterLog.incrementAndGet();
-                if (c <= 200) {
+                if (c <= 2000) { // [3.3.1] 額度 200→2000：共用計數器太小，一場就靜音
                     LOG.info("[craftfix] 計畫修補 out={} 補{}項：{}", plan.finalOutput(), repaired, note);
                 }
             }
@@ -665,7 +664,7 @@ public abstract class CraftingServiceSyncMixin {
                     f.setAccessible(true);
                     f.setBoolean(plan, false);
                     int c = gtocraftfix$sitterLog.incrementAndGet();
-                    if (c <= 200) {
+                    if (c <= 2000) { // [3.3.1] 額度 200→2000：共用計數器太小，一場就靜音
                         LOG.info("[craftfix] 計畫修補 sim→可執行 out={}", plan.finalOutput());
                     }
                 } catch (Throwable t) {
@@ -695,7 +694,7 @@ public abstract class CraftingServiceSyncMixin {
         // 會自己拉現貨，自然收斂。
         if (src.player().isEmpty() && plan.patternTimes().isEmpty()) {
             int c = gtocraftfix$sitterLog.incrementAndGet();
-            if (c <= 200) {
+            if (c <= 2000) { // [3.3.1] 額度 200→2000
                 LOG.warn("[craftfix] 退化計畫（無合成任務）out={}{}", plan.finalOutput(),
                         gtocraftfix$SLIM ? "（slim：不拒單，僅紀錄）" : "→ 拒收");
             }
@@ -1111,7 +1110,7 @@ public abstract class CraftingServiceSyncMixin {
                         }
                         handled++;
                         int c = gtocraftfix$sitterLog.incrementAndGet();
-                        if (c <= 200) {
+                        if (c <= 2000) { // [3.3.1] 額度 200→2000：共用計數器太小，一場就靜音
                             LOG.info("[craftfix] 保母餵料 {} x{}", key, accepted);
                         }
                     }
@@ -1222,7 +1221,7 @@ public abstract class CraftingServiceSyncMixin {
                         }
                         fed++;
                         int c = gtocraftfix$sitterLog.incrementAndGet();
-                        if (c <= 200) {
+                        if (c <= 2000) { // [3.3.1] 額度 200→2000：共用計數器太小，一場就靜音
                             LOG.info("[craftfix] 保母補輸入 {} x{}（剩餘 {} 輪、目標 {} 輪份）",
                                     ik, got, times, rounds == Long.MAX_VALUE ? times : rounds);
                         }
@@ -1344,7 +1343,7 @@ public abstract class CraftingServiceSyncMixin {
                             throw t;
                         }
                         int c = gtocraftfix$sitterLog.incrementAndGet();
-                        if (c <= 200) {
+                        if (c <= 2000) { // [3.3.1] 額度 200→2000：共用計數器太小，一場就靜音
                             LOG.info("[craftfix] 並行死角解鎖 {}：補 {} x{}（湊滿 2 輪，繞過上游 parallel==1 取料漏洞）",
                                     pat.getPrimaryOutput().what(), ik, got);
                         }
