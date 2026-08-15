@@ -73,11 +73,12 @@ public abstract class CraftingServiceSyncMixin {
     private static final Logger LOG = LogManager.getLogger("gtocraftfix");
 
     /**
-     * [slim 分支] 精簡版：**只保留四項會改行為的修正**——①算料同步化（終端 ctrl+左鍵）
-     * ②機器源 present-once IgnoreMissing（請求器/接口/合成卡）③並行死角解鎖
-     * ④機器源降量重算（3.1.0 加回；lpcalc 停用後它是 CRAFT_LESS 的唯一處理者）。
-     * 其餘（無樣板守衛、lpcalc 接管、計畫修補＋真缺料擋單＋拒收退化計畫、保母餵料/補輸入）
-     * 全部停用但**程式碼保留、log 照印**，方便對照觀察 GTO 原生行為。
+     * [slim 分支] 精簡版：保留 ①算料同步化（終端 ctrl+左鍵）②機器源 present-once IgnoreMissing
+     * （請求器/接口/合成卡）③並行死角解鎖 ④機器源降量重算（3.1.0）⑤**計畫修補（3.3.0）**——
+     * 根因二實證後加回：算料器把網路沒有、也沒排生產的量寫進 usedItems，IgnoreMissing 讓它變成
+     * 永遠等不到的 waitingFor；修補把缺口補成真正的樣板輪次，是這條鏈唯一的根治點。
+     * 仍停用：無樣板守衛、lpcalc 接管、**兩個拒單守衛**（真缺料擋單／退化計畫拒收，改為只記 log
+     * ——slim 原則是「只修計畫、不擋單」）、保母餵料/補輸入。停用處程式碼保留、log 照印。
      * 改 false 即恢復完整版行為（各處以 {@code gtocraftfix$SLIM} 判斷）。
      */
     private static final boolean gtocraftfix$SLIM = true;
@@ -279,8 +280,9 @@ public abstract class CraftingServiceSyncMixin {
                         LOG.warn("[craftfix] OptimizedCalculation.executeV2 找不到 → 不接管算料，退回原本 async。");
                     } else {
                         if (gtocraftfix$SLIM) {
-                            LOG.info("[craftfix] 已啟用 slim：只保留 同步算料(ctrl+左鍵)＋機器源 IgnoreMissing(請求器)"
-                                    + "＋並行死角解鎖＋降量重算；守衛/lpcalc/計畫修補/保母 皆停用（僅印 log）。");
+                            LOG.info("[craftfix] 已啟用 slim：同步算料(ctrl+左鍵)＋機器源 IgnoreMissing(請求器)"
+                                    + "＋並行死角解鎖＋降量重算＋計畫修補(只修不擋單)；"
+                                    + "無樣板守衛/lpcalc/保母 停用（僅印 log）。");
                         } else {
                             LOG.info("[craftfix] 已啟用完整版：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
                                     com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
@@ -426,9 +428,9 @@ public abstract class CraftingServiceSyncMixin {
             return;
         }
         if (gtocraftfix$SLIM) {
-            // [slim] 計畫修補＋真缺料擋單＋拒收退化計畫全部停用，計畫原封不動交給 GTO；
-            // [3.2.3] 提交當下就把「幻影缺口」點出來：usedItems 要的量網路實際取不到、且計畫沒排任何
-            // 樣板產它 → 這筆必然變成永遠等不到的 waitingFor（證明凍結源自計畫本身，與機器/認領無關）。
+            // [slim 3.3.0] 計畫修補**已啟用**（下方照跑）；只有兩個拒單守衛仍停用（見方法末尾）。
+            // [3.2.3] 修補前先把「幻影缺口」點出來：usedItems 要的量網路實際取不到、且計畫沒排任何
+            // 樣板產它 → 不修就必然變成永遠等不到的 waitingFor（凍結源自計畫本身，與機器/認領無關）。
             try {
                 int c0 = gtocraftfix$sitterLog.incrementAndGet();
                 if (c0 <= 200) {
@@ -455,17 +457,12 @@ public abstract class CraftingServiceSyncMixin {
                         }
                     }
                     if (sb.length() > 0) {
-                        LOG.warn("[craftfix] 開單即缺（計畫未排生產，必成永久在途）out={} → {}",
+                        LOG.warn("[craftfix] 開單即缺（計畫未排生產，將由計畫修補補上）out={} → {}",
                                 plan.finalOutput(), sb);
-                    } else if (plan.simulation() || !plan.missingItems().isEmpty()) {
-                        LOG.info("[craftfix] 放行未修補計畫 out={} sim={} missing={} 任務數={}",
-                                plan.finalOutput(), plan.simulation(), plan.missingItems().size(),
-                                plan.patternTimes().size());
                     }
                 }
             } catch (Throwable ignored) {
             }
-            return;
         }
         boolean blockSubmit = false;
         try {
@@ -687,6 +684,9 @@ public abstract class CraftingServiceSyncMixin {
         // 真缺料（無樣板可補的硬缺口）→ 擋下提交：提交了必凍。機器每 2 秒重試（聊天室/log 已去重）；
         // 玩家按確認會沒反應，但聊天室已說明缺什麼。
         if (blockSubmit) {
+            if (gtocraftfix$SLIM) {
+                return; // [slim 3.3.0] 只修計畫不擋單：真缺料照樣提交（log/聊天已點名）
+            }
             cir.setReturnValue(appeng.crafting.execution.CraftingSubmitResult.INCOMPLETE_PLAN);
             return;
         }
@@ -696,9 +696,12 @@ public abstract class CraftingServiceSyncMixin {
         if (src.player().isEmpty() && plan.patternTimes().isEmpty()) {
             int c = gtocraftfix$sitterLog.incrementAndGet();
             if (c <= 200) {
-                LOG.warn("[craftfix] 拒收退化計畫（無合成任務）out={}", plan.finalOutput());
+                LOG.warn("[craftfix] 退化計畫（無合成任務）out={}{}", plan.finalOutput(),
+                        gtocraftfix$SLIM ? "（slim：不拒單，僅紀錄）" : "→ 拒收");
             }
-            cir.setReturnValue(appeng.crafting.execution.CraftingSubmitResult.INCOMPLETE_PLAN);
+            if (!gtocraftfix$SLIM) { // [slim 3.3.0] 只修計畫不擋單
+                cir.setReturnValue(appeng.crafting.execution.CraftingSubmitResult.INCOMPLETE_PLAN);
+            }
         }
     }
 

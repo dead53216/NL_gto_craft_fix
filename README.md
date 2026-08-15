@@ -6,7 +6,37 @@
 - 環境：Minecraft 1.20.1 / Forge 47.x / GTOCore 26.7.5-alpha / AE2-gto 15.267.4
 - 根因分析與上游修法建議：見 [gtocraftdiag repo 的 ISSUE.md](https://github.com/dead53216/gtocraftdiag/blob/main/ISSUE.md)（本 mod 前身，同源）
 
-> **本檔說明完整版（`v2` 分支）。目前所在的 `slim` 分支只保留四項會改行為的修正**：算料同步化（終端 ctrl+左鍵）、機器源 present-once IgnoreMissing（請求器／接口／合成卡）、並行死角解鎖、機器源降量重算（3.1.0 加回——lpcalc 停用後它是 CRAFT_LESS 的唯一處理者）。其餘（無樣板守衛、lpcalc 接管、計畫修補＋真缺料擋單＋拒收退化計畫、保母餵料／補輸入）**程式碼保留但停用，log 照印**——`CraftingServiceSyncMixin.gtocraftfix$SLIM` 改 false 即恢復完整行為。診斷（探針 X 光／忙碌座標／欄位普查／提交失敗）全部保留。
+> **本檔說明完整版（`v2` 分支）。目前所在的 `slim` 分支保留五項會改行為的修正**：算料同步化（終端 ctrl+左鍵）、機器源 present-once IgnoreMissing（請求器／接口／合成卡）、並行死角解鎖、機器源降量重算（3.1.0）、**計畫修補（3.3.0，見下方「根因二實證」）**。仍停用：無樣板守衛、lpcalc 接管、**兩個拒單守衛**（真缺料擋單／退化計畫拒收改為只記 log——slim 原則是「只修計畫、不擋單」）、保母餵料／補輸入。停用處**程式碼保留、log 照印**；`CraftingServiceSyncMixin.gtocraftfix$SLIM` 改 false 即恢復完整行為。診斷（探針 X 光／忙碌座標／欄位普查／提交失敗）全部保留。
+
+## 根因二實證（2026-08-15，slim 對照實驗）
+
+把保母與計畫修補全部關掉、只留診斷跑一整晚，凍結案例全部收斂到 **ISSUE.md 根因二**（`executeV2` 把
+「網路中數量為 0 的批量餘數」寫進 `usedItems` 且不為其安排樣板運行），且首次抓到**提交當下**的證據：
+
+```
+22:33:36 提交  [craftfix] 開單即缺（計畫未排生產）out=universal_circuit_zpm x100
+                → gtceu:ferrite_mixture_dust 要37/網0
+22:35:58 探針  gtceu:ferrite_mixture_dust(等37/網0/無任務產它)
+               gtceu:polyvinyl_chloride_foil(等2/網0/無任務產它)
+               gtocore:tungsten_tetraboride_ceramics_brick(等96/網0/無任務產它)
+               剩餘任務全部被自己的輸入餓死、供應器全 忙:0、results 全 BREAK
+```
+
+同一個數字（37）從「計畫以為網路有」直接變成「永遠等不到的 `waitingFor`」。同場另兩張單同構
+（qbit 晶片：雙酚A 74000／表氯醇 10000／電子級矽 16000 全標「無任務產它」）。
+
+**排除的其他假說**（都有量測佐證，不是推測）：
+
+| 假說 | 反證 |
+|---|---|
+| 跨 CPU 誤認領（`insertIntoCpus` 對 HashSet 任意序發貨）| 認領日誌（候選 ≥2 才印）**0 筆**；在途料幾乎都只有本 CPU 在等 |
+| 產物回流網路未觸發認領 | 在途料一律 `網0`——貨根本不存在，不是沒被認領 |
+| 機器忙碌／吞樣板 | 供應器全 `忙:0`，且缺的料本單**零任務會產出**（`無任務產它`）|
+| 並行死角（`parallel==1`）| 缺口多為 `0/N`，連一輪都不到，不符指紋 |
+
+**結論**：凍結源自**計畫本身**，與執行器、認領、機器現場無關。上游正解＝gtolib 批量餘數向上取整
+（多排一次樣板）；mod 這層的等效根治＝**計畫修補**把缺口補成真正的樣板輪次排進同一張計畫——
+因此 3.3.0 在 slim 重新啟用它（保母／lpcalc 維持關閉，證明「不靠補料也能解」）。
 
 ## 修正內容
 
