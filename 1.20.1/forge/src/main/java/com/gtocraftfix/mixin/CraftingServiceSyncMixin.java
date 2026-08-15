@@ -148,6 +148,48 @@ public abstract class CraftingServiceSyncMixin {
         return sb.toString();
     }
 
+    /** [3.2.2 純診斷] 本 job 所有剩餘任務（times&gt;0）的產出 key 集合；讀不到回 null（不標記）。 */
+    private java.util.Set<AEKey> gtocraftfix$taskOutputs(appeng.crafting.execution.CraftingCpuLogic logic) {
+        try {
+            if (gtocraftfix$fJob == null) {
+                var fj = logic.getClass().getDeclaredField("job");
+                fj.setAccessible(true);
+                gtocraftfix$fJob = fj;
+            }
+            Object job = gtocraftfix$fJob.get(logic);
+            if (job == null) {
+                return null;
+            }
+            if (gtocraftfix$fTasks == null) {
+                var ft = job.getClass().getDeclaredField("tasks");
+                ft.setAccessible(true);
+                gtocraftfix$fTasks = ft;
+            }
+            Map<?, ?> tasks = (Map<?, ?>) gtocraftfix$fTasks.get(job);
+            if (tasks == null) {
+                return null;
+            }
+            var out = new HashSet<AEKey>();
+            for (var en : tasks.entrySet()) {
+                Object holder = en.getValue();
+                if (gtocraftfix$fHolderVal == null) {
+                    var fv = holder.getClass().getField("value");
+                    fv.setAccessible(true);
+                    gtocraftfix$fHolderVal = fv;
+                }
+                if (gtocraftfix$fHolderVal.getLong(holder) <= 0) {
+                    continue;
+                }
+                for (var o : ((IPatternDetails) en.getKey()).getOutputs()) {
+                    out.add(o.what());
+                }
+            }
+            return out;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     /** [3.2.1 純診斷] 該 key 最近被推送到哪些供應器（GTO 的 {@code getPendingRequests(AEKey)} 公開 API，
      *  反射呼叫）：印前 2 個座標。語意＝「樣板送去過這裡」，貨沒回來時的第一現場。讀不到回 null。 */
     private static String gtocraftfix$pendingAt(Object logic, AEKey key) {
@@ -791,6 +833,8 @@ public abstract class CraftingServiceSyncMixin {
                         waitStr = "(空)";
                     } else {
                         var cached = grid.getStorageService().getCachedInventory();
+                        // [3.2.2] 本單剩餘任務會產出的 key 集合：在途料若不在其中＝沒有任何機器會做它
+                        var producible = gtocraftfix$taskOutputs(logic);
                         var wb = new StringBuilder();
                         int wn = 0;
                         for (var wk : waiting) {
@@ -813,6 +857,10 @@ public abstract class CraftingServiceSyncMixin {
                             String pend = gtocraftfix$pendingAt(logic, wk);
                             if (pend != null) {
                                 wb.append("/推給").append(pend);
+                            }
+                            // [3.2.2] 幻影缺口指紋：沒有剩餘任務產它＝開單當下就缺、沒人會做（等到天荒地老）
+                            if (producible != null && !producible.contains(wk)) {
+                                wb.append("/無任務產它");
                             }
                             wb.append(") ");
                         }
