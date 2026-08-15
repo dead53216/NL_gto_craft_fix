@@ -148,6 +148,34 @@ public abstract class CraftingServiceSyncMixin {
         return sb.toString();
     }
 
+    /** [3.2.1 純診斷] 該 key 最近被推送到哪些供應器（GTO 的 {@code getPendingRequests(AEKey)} 公開 API，
+     *  反射呼叫）：印前 2 個座標。語意＝「樣板送去過這裡」，貨沒回來時的第一現場。讀不到回 null。 */
+    private static String gtocraftfix$pendingAt(Object logic, AEKey key) {
+        try {
+            Object r = logic.getClass().getMethod("getPendingRequests", AEKey.class).invoke(logic, key);
+            if (!(r instanceof java.util.Collection<?> col) || col.isEmpty()) {
+                return null;
+            }
+            var sb = new StringBuilder();
+            int n = 0;
+            for (var o : col) {
+                if (n++ >= 2) {
+                    sb.append('…');
+                    break;
+                }
+                if (o instanceof net.minecraft.core.GlobalPos gp) {
+                    var p = gp.pos();
+                    sb.append(p.getX()).append(',').append(p.getY()).append(',').append(p.getZ()).append(' ');
+                } else {
+                    sb.append(o).append(' ');
+                }
+            }
+            return sb.toString().trim();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     /** [2.3.1 純診斷] 供應器位置「類型(x,y,z)」；BlockEntity 直取，GTO 機器類走反射
      *  （getPos/gto$getPos/getBlockPos），都讀不到回 null。 */
     private static String gtocraftfix$provAt(Object p) {
@@ -780,6 +808,11 @@ public abstract class CraftingServiceSyncMixin {
                                     .append("/網").append(cached.get(wk));
                             if (others > 0) {
                                 wb.append("/另").append(others).append("顆也等");
+                            }
+                            // [3.2.1] 樣板推去哪台機器：貨沒回來時直接指出現場（GTO 公開 API，反射呼叫）
+                            String pend = gtocraftfix$pendingAt(logic, wk);
+                            if (pend != null) {
+                                wb.append("/推給").append(pend);
                             }
                             wb.append(") ");
                         }
