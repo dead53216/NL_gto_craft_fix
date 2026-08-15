@@ -25,6 +25,16 @@
 | ~~mixin 直接根治（2.2.0）~~ **實測無效、2.3.0 撤除** | 掛 GTOCore 開源類 `OptimizedCraftingCpuLogic` 補上缺失的 else——**mixin 無聲失效**：jar 內有類、config 正常載入、同檔 AE2 mixin 照常運作、全程零錯誤，但欄位普查證實注入欄位不存在（gtocore 為簽章 jar、`com/gtocore/mixin` 標 `Sealed: true`）。**「mixin 只准掛 AE2 類」鐵則二度實證，此路封死** |
 | 供應器忙碌診斷（2.3.0，2.3.1 加座標）| 探針 X 光加印 `忙:N@類型(x,y,z)忙`——全部供應器 `isBusy()` 時 executeCrafting 直接 `continue`：**不推送、不留任何結果**，與並行死角外觀完全相同（`results={}`、零錯誤），這是「料齊卻完全不動」最常見的真因。實錄：ZPM 場發生器單的 5 個任務中 4 個 `忙:1`，泵/發射器料備足 2 輪仍不推，整鏈凍結。2.3.1 起一併印出忙碌機器座標（BlockEntity 直取，GTO 機器走 `getPos`/`gto$getPos` 反射），可直接到現場查機器 |
 
+## 認領歸屬追蹤（slim 3.2.0，純診斷）
+
+AE2 的交付認領走 `CraftingServiceStorage`（以 `Integer.MAX_VALUE` 最高優先權掛進網路儲存）→
+`CraftingService.insertIntoCpus`，而該方法對 `craftingCPUClusters`（**HashSet，順序任意**）逐顆呼叫
+`craftingLogic.insert`，**完全不認這批貨是哪張單訂的**——誰的 `waitingFor` 有這個 key 就先給誰。
+多單共用中間料時「A 訂的貨被 B 領走、A 永遠等不到」即由此而生（潤滑油／焊錫粉／環氧／鎵錠實錄）。
+
+- `[craftfix][認領] <key> x<量> 交付：N顆 CPU 同時在等 → <產物>(等X→吃下Y) …`：候選 ≥2 才印（上限 300 行）。
+- 探針 `waiting` 欄改印 `key(等N/網M/另K顆也等)`：分辨「貨沒回網路」（網M=0）與「貨被別人領走」（另K顆>0）。
+
 ## lpcalc（機器源結構化算料器）
 
 機器來源的算料請求優先走 `com.gtocraftfix.lpcalc`；任何不支援/超限/驗不過的情形都回退

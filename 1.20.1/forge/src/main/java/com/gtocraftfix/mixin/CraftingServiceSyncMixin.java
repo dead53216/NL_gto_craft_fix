@@ -679,6 +679,66 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
+    // ---- [3.2.0 純診斷] 認領歸屬追蹤：AE2 的 insertIntoCpus 對 craftingCPUClusters（HashSet，順序任意）
+    // 逐顆呼叫 logic.insert，**不認這批貨是誰訂的**——只要哪顆 CPU 的 waitingFor 有這個 key 就先給誰。
+    // 多單共用中間料時「A 訂的貨被 B 領走」在此發生：HEAD 記候選、RETURN 比對誰實際吃到。
+    // 只在候選 ≥2（可能誤認領）時印，避免每筆入庫都洗版。 ----
+    private java.util.List<Object[]> gtocraftfix$claimSnap;
+    private static final AtomicInteger gtocraftfix$claimLog = new AtomicInteger();
+
+    @Inject(method = "insertIntoCpus", at = @At("HEAD"), remap = false)
+    private void gtocraftfix$claimHead(AEKey what, long amount, Actionable type,
+                                       CallbackInfoReturnable<Long> cir) {
+        gtocraftfix$claimSnap = null;
+        if (type != Actionable.MODULATE || gtocraftfix$claimLog.get() > 300) {
+            return;
+        }
+        try {
+            java.util.List<Object[]> snap = null;
+            for (var c : craftingCPUClusters) {
+                long w = c.craftingLogic.getWaitingFor(what);
+                if (w > 0) {
+                    if (snap == null) {
+                        snap = new java.util.ArrayList<>(4);
+                    }
+                    snap.add(new Object[] { c, w, c.craftingLogic.getFinalJobOutput() });
+                }
+            }
+            if (snap != null && snap.size() >= 2) { // 單一候選＝正常交付，不記
+                gtocraftfix$claimSnap = snap;
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @Inject(method = "insertIntoCpus", at = @At("RETURN"), remap = false)
+    private void gtocraftfix$claimTail(AEKey what, long amount, Actionable type,
+                                       CallbackInfoReturnable<Long> cir) {
+        var snap = gtocraftfix$claimSnap;
+        gtocraftfix$claimSnap = null;
+        if (snap == null) {
+            return;
+        }
+        try {
+            var sb = new StringBuilder();
+            for (var s : snap) {
+                var c = (CraftingCPUCluster) s[0];
+                long before = (Long) s[1];
+                long after = c.craftingLogic.getWaitingFor(what);
+                var fo = (appeng.api.stacks.GenericStack) s[2];
+                sb.append(fo == null ? "?" : fo.what()).append("(等").append(before);
+                if (after < before) {
+                    sb.append("→吃下").append(before - after);
+                }
+                sb.append(") ");
+            }
+            gtocraftfix$claimLog.incrementAndGet();
+            LOG.info("[craftfix][認領] {} x{} 交付：{}顆 CPU 同時在等 → {}",
+                    what, amount, snap.size(), sb);
+        } catch (Throwable ignored) {
+        }
+    }
+
     // ---- 修正 3：保母（[2.4.0] 每 tick 掃孤兒 waitingFor）＋ 診斷探針（每 20 秒）----
     // [2.4.0] 掛 HEAD 不掛 TAIL：GTOCore 在偶數 tick 提前 ci.cancel() 本方法，掛 TAIL 整段實跑半速
     // （原「5 秒」實為 10 秒、探針 20 秒實為 40 秒——log 探針間隔 40 秒實證）。
@@ -697,8 +757,34 @@ public abstract class CraftingServiceSyncMixin {
                     }
                     Set<AEKey> waiting = new HashSet<>();
                     logic.getAllWaitingFor(waiting);
-                    String waitStr = waiting.stream().limit(8).map(String::valueOf)
-                            .reduce((a, b) -> a + "," + b).orElse("(空)");
+                    // [3.2.0] 每個在途 key 印「等N/網M/別的CPU也等K」：分辨「貨沒回網路」「貨被別人領走」
+                    String waitStr;
+                    if (waiting.isEmpty()) {
+                        waitStr = "(空)";
+                    } else {
+                        var cached = grid.getStorageService().getCachedInventory();
+                        var wb = new StringBuilder();
+                        int wn = 0;
+                        for (var wk : waiting) {
+                            if (wn++ >= 8) {
+                                wb.append('…');
+                                break;
+                            }
+                            long others = 0;
+                            for (var c2 : craftingCPUClusters) {
+                                if (c2 != cluster && c2.craftingLogic.getWaitingFor(wk) > 0) {
+                                    others++;
+                                }
+                            }
+                            wb.append(wk).append("(等").append(logic.getWaitingFor(wk))
+                                    .append("/網").append(cached.get(wk));
+                            if (others > 0) {
+                                wb.append("/另").append(others).append("顆也等");
+                            }
+                            wb.append(") ");
+                        }
+                        waitStr = wb.toString();
+                    }
                     String results;
                     try {
                         Object r = logic.getClass().getMethod("getCraftingResults").invoke(logic);
