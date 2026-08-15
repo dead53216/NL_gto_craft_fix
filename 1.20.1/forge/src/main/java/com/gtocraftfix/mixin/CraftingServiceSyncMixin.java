@@ -149,6 +149,68 @@ public abstract class CraftingServiceSyncMixin {
         return sb.toString();
     }
 
+    /** [3.4.0 純診斷] 計畫內部收支平衡檢查（可嚴格證明「這張單做不完」的不變量）：
+     *  <p>對每個 key：總消耗 = Σ(剩餘任務每輪輸入 × 剩餘輪數)；總可得 = Σ(剩餘任務每輪產出 × 剩餘輪數)
+     *  ＋ CPU 庫存 ＋ 在途(waitingFor)。若 總可得 &lt; 總消耗，**無論執行順序如何都不可能完成**——
+     *  代表計畫本身少排了輪次（批量餘數向下取整的內部版本，usedItems 對網路的比對抓不到）。
+     *  只在有負差時印，額度與其他診斷共用。 */
+    private void gtocraftfix$balanceReport(appeng.crafting.execution.CraftingCpuLogic logic,
+                                           appeng.api.stacks.GenericStack out) {
+        try {
+            Object job = gtocraftfix$fJob == null ? null : gtocraftfix$fJob.get(logic);
+            if (job == null || gtocraftfix$fTasks == null) {
+                return;
+            }
+            Map<?, ?> tasks = (Map<?, ?>) gtocraftfix$fTasks.get(job);
+            var inv = gtocraftfix$invOf(logic);
+            if (tasks == null || tasks.isEmpty() || inv == null) {
+                return;
+            }
+            var demand = new HashMap<AEKey, Long>();
+            var supply = new HashMap<AEKey, Long>();
+            for (var en : tasks.entrySet()) {
+                long times = gtocraftfix$fHolderVal.getLong(en.getValue());
+                if (times <= 0) {
+                    continue;
+                }
+                var pat = (IPatternDetails) en.getKey();
+                for (var in : pat.getInputs()) {
+                    var ps = in.getPossibleInputs();
+                    if (ps.length == 0) {
+                        continue;
+                    }
+                    long per = ps[0].amount() * in.getMultiplier();
+                    if (per > 0) {
+                        demand.merge(ps[0].what(), per * times, Long::sum);
+                    }
+                }
+                for (var o : pat.getOutputs()) {
+                    if (o.amount() > 0) {
+                        supply.merge(o.what(), o.amount() * times, Long::sum);
+                    }
+                }
+            }
+            var sb = new StringBuilder();
+            int n = 0;
+            for (var e : demand.entrySet()) {
+                var k = e.getKey();
+                long have = inv.list.get(k) + Math.max(0, logic.getWaitingFor(k))
+                        + supply.getOrDefault(k, 0L);
+                long shortAmt = e.getValue() - have;
+                if (shortAmt > 0 && n++ < 6) {
+                    sb.append(k).append(" 需").append(e.getValue()).append("/可得").append(have)
+                            .append("(缺").append(shortAmt).append(supply.containsKey(k) ? "" : "、無人產")
+                            .append("); ");
+                }
+            }
+            if (sb.length() > 0 && gtocraftfix$sitterLog.incrementAndGet() <= 2000) {
+                LOG.warn("[craftfix] 計畫收支缺口（排定產出＋庫存＋在途 < 總消耗，此單不可能完成）out={} → {}",
+                        out, sb);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     /** [3.2.2 純診斷] 本 job 所有剩餘任務（times&gt;0）的產出 key 集合；讀不到回 null（不標記）。 */
     private java.util.Set<AEKey> gtocraftfix$taskOutputs(appeng.crafting.execution.CraftingCpuLogic logic) {
         try {
@@ -1036,6 +1098,7 @@ public abstract class CraftingServiceSyncMixin {
                     }
                     LOG.info("[craftfix] CPU探針 out={} waiting[{}]={} held=[{}] 剩餘任務=[{}] results={}",
                             out, waiting.size(), waitStr, held, tasksStr, results);
+                    gtocraftfix$balanceReport(logic, out); // [3.4.0] 計畫內部收支平衡檢查
                     // [2.0.1 純診斷] 欄位普查（自 1.1.5 移植）：waiting 空＋有剩餘任務＝執行器不推但料在，
                     // 閘門多半在 gtolib 私有欄位裡；每 cluster 只倒一次
                     if (waiting.isEmpty() && !"n/a".equals(tasksStr) && !"(無)".equals(tasksStr)) {
