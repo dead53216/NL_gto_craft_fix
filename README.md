@@ -6,7 +6,7 @@
 - 環境：Minecraft 1.20.1 / Forge 47.x / GTOCore 26.7.5-alpha / AE2-gto 15.267.4
 - 根因分析與上游修法建議：見 [gtocraftdiag repo 的 ISSUE.md](https://github.com/dead53216/gtocraftdiag/blob/main/ISSUE.md)（本 mod 前身，同源）
 
-> **本檔說明完整版（`v2` 分支）。目前所在的 `slim` 分支只保留三項會改行為的修正**：算料同步化（終端 ctrl+左鍵）、機器源 present-once IgnoreMissing（請求器／接口／合成卡）、並行死角解鎖。其餘（無樣板守衛、lpcalc 接管、降量重算、計畫修補＋真缺料擋單＋拒收退化計畫、保母餵料／補輸入）**程式碼保留但停用，log 照印**——`CraftingServiceSyncMixin.gtocraftfix$SLIM` 改 false 即恢復完整行為。診斷（探針 X 光／忙碌座標／欄位普查／提交失敗）全部保留。
+> **本檔說明完整版（`v2` 分支）。目前所在的 `slim` 分支只保留四項會改行為的修正**：算料同步化（終端 ctrl+左鍵）、機器源 present-once IgnoreMissing（請求器／接口／合成卡）、並行死角解鎖、機器源降量重算（3.1.0 加回——lpcalc 停用後它是 CRAFT_LESS 的唯一處理者）。其餘（無樣板守衛、lpcalc 接管、計畫修補＋真缺料擋單＋拒收退化計畫、保母餵料／補輸入）**程式碼保留但停用，log 照印**——`CraftingServiceSyncMixin.gtocraftfix$SLIM` 改 false 即恢復完整行為。診斷（探針 X 光／忙碌座標／欄位普查／提交失敗）全部保留。
 
 ## 修正內容
 

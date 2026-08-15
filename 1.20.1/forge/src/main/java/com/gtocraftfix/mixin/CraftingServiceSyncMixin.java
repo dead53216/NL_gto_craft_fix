@@ -73,9 +73,10 @@ public abstract class CraftingServiceSyncMixin {
     private static final Logger LOG = LogManager.getLogger("gtocraftfix");
 
     /**
-     * [slim 分支] 精簡版：**只保留三項會改行為的修正**——①算料同步化（終端 ctrl+左鍵）
-     * ②機器源 present-once IgnoreMissing（請求器/接口/合成卡）③並行死角解鎖。
-     * 其餘（無樣板守衛、lpcalc 接管、降量重算、計畫修補＋真缺料擋單＋拒收退化計畫、保母餵料/補輸入）
+     * [slim 分支] 精簡版：**只保留四項會改行為的修正**——①算料同步化（終端 ctrl+左鍵）
+     * ②機器源 present-once IgnoreMissing（請求器/接口/合成卡）③並行死角解鎖
+     * ④機器源降量重算（3.1.0 加回；lpcalc 停用後它是 CRAFT_LESS 的唯一處理者）。
+     * 其餘（無樣板守衛、lpcalc 接管、計畫修補＋真缺料擋單＋拒收退化計畫、保母餵料/補輸入）
      * 全部停用但**程式碼保留、log 照印**，方便對照觀察 GTO 原生行為。
      * 改 false 即恢復完整版行為（各處以 {@code gtocraftfix$SLIM} 判斷）。
      */
@@ -209,7 +210,7 @@ public abstract class CraftingServiceSyncMixin {
                     } else {
                         if (gtocraftfix$SLIM) {
                             LOG.info("[craftfix] 已啟用 slim：只保留 同步算料(ctrl+左鍵)＋機器源 IgnoreMissing(請求器)"
-                                    + "＋並行死角解鎖；守衛/lpcalc/降量/計畫修補/保母 皆停用（僅印 log）。");
+                                    + "＋並行死角解鎖＋降量重算；守衛/lpcalc/計畫修補/保母 皆停用（僅印 log）。");
                         } else {
                             LOG.info("[craftfix] 已啟用完整版：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
                                     com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
@@ -314,7 +315,8 @@ public abstract class CraftingServiceSyncMixin {
             // 外部重現：砍半重算直到可執行；做多少先交多少，追蹤器下輪自然補餘量。玩家不降（要看缺料畫面）。
             var actionSrc = simRequester.getActionSource();
             boolean machineSrc = actionSrc == null || actionSrc.player().isEmpty();
-            if (machineSrc && !gtocraftfix$SLIM && plan != null && amount > 1 // [slim] 降量重算停用
+            // [slim 3.1.0] 降量重算啟用：lpcalc 停用後，本段是機器源 CRAFT_LESS 的唯一處理者
+            if (machineSrc && plan != null && amount > 1
                     && (plan.simulation() || plan.finalOutput() == null || plan.finalOutput().amount() <= 0)) {
                 long tryAmount = amount;
                 for (int i = 0; i < 12 && tryAmount > 1; i++) {
