@@ -427,12 +427,43 @@ public abstract class CraftingServiceSyncMixin {
         }
         if (gtocraftfix$SLIM) {
             // [slim] 計畫修補＋真缺料擋單＋拒收退化計畫全部停用，計畫原封不動交給 GTO；
-            // 只留一行紀錄（sim 計畫與缺料在此可見，方便對照原生行為）
-            int c0 = gtocraftfix$sitterLog.incrementAndGet();
-            if (c0 <= 200 && (plan.simulation() || !plan.missingItems().isEmpty())) {
-                LOG.info("[craftfix] 放行未修補計畫 out={} sim={} missing={} 任務數={}",
-                        plan.finalOutput(), plan.simulation(), plan.missingItems().size(),
-                        plan.patternTimes().size());
+            // [3.2.3] 提交當下就把「幻影缺口」點出來：usedItems 要的量網路實際取不到、且計畫沒排任何
+            // 樣板產它 → 這筆必然變成永遠等不到的 waitingFor（證明凍結源自計畫本身，與機器/認領無關）。
+            try {
+                int c0 = gtocraftfix$sitterLog.incrementAndGet();
+                if (c0 <= 200) {
+                    var st = grid.getStorageService().getInventory();
+                    var made = new HashSet<AEKey>();
+                    for (var pe : plan.patternTimes().entrySet()) {
+                        if (pe.getValue() > 0) {
+                            for (var o : pe.getKey().getOutputs()) {
+                                made.add(o.what());
+                            }
+                        }
+                    }
+                    var sb = new StringBuilder();
+                    int n = 0;
+                    for (var e : plan.usedItems()) {
+                        long want = e.getLongValue();
+                        if (want <= 0 || made.contains(e.getKey())) {
+                            continue; // 計畫有排生產＝不是幻影
+                        }
+                        long can = st.extract(e.getKey(), want, Actionable.SIMULATE, src);
+                        if (can < want && n++ < 6) {
+                            sb.append(e.getKey()).append(" 要").append(want)
+                                    .append("/網").append(can).append("; ");
+                        }
+                    }
+                    if (sb.length() > 0) {
+                        LOG.warn("[craftfix] 開單即缺（計畫未排生產，必成永久在途）out={} → {}",
+                                plan.finalOutput(), sb);
+                    } else if (plan.simulation() || !plan.missingItems().isEmpty()) {
+                        LOG.info("[craftfix] 放行未修補計畫 out={} sim={} missing={} 任務數={}",
+                                plan.finalOutput(), plan.simulation(), plan.missingItems().size(),
+                                plan.patternTimes().size());
+                    }
+                }
+            } catch (Throwable ignored) {
             }
             return;
         }
