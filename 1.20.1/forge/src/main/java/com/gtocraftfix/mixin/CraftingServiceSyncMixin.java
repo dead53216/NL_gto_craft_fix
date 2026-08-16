@@ -166,14 +166,21 @@ public abstract class CraftingServiceSyncMixin {
      * 更早的 96 是「幻影缺口時代」的值，已證實會讓大電路交出半套計畫而必凍。
      * 上限本身必須留（遞迴補料遇循環配方可以無限長，而且跑在伺服器主緒），**耗盡時整組還原**。
      */
-    private static final int gtocraftfix$REPAIR_GUARD = Integer.getInteger("gtodiag.repairGuard", 4000);
+    // [3.11.1] 4000 → 20000（實測依據）：有機陽液／陰液的計畫在 3.11.0 上跑出
+    // 「已處理 4001 項、上限 4000，仍剩 9 項（陰液 7 項）」——只差 9 項就修得完，卻整組還原成
+    // 未修補的原計畫 → 幻影缺口變成永遠等不到的 waitingFor（探針：diethyl_ether 等20000/網0）→
+    // 30 秒只推 2 輪、最後被丟掉重下單。上限本身留著，但護欄改由下面的時間預算擔任（見 REPAIR_BUDGET_MS）。
+    private static final int gtocraftfix$REPAIR_GUARD = Integer.getInteger("gtodiag.repairGuard", 20000);
 
     /**
      * [3.10.1/3.11.0] 修補的**時間**預算（毫秒），**預設 0＝停用**（3.8.0 沒有時間維度）。
      * 用 0 停用而不是「設一個很大的值」——{@code ms * 1_000_000} 在極大值會溢位成負數，
      * 反而變成每次都超時。要啟用建議 200（＝4 個 tick，命中即為可感知卡頓）。
      */
-    private static final long gtocraftfix$REPAIR_BUDGET_MS = Long.getLong("gtodiag.repairBudgetMs", 0L);
+    // [3.11.1] 0（停用）→ 200：把「數到 N 就放棄」換成真正該擋的東西——時間。
+    // 用固定次數擋一個遞迴補料迴圈本來就是錯的設計（96 太小 → 4000 太小 → 10 萬又沒有時間護欄，三次都設錯）。
+    // 200ms＝4 個 tick，命中即為可感知卡頓，但只在病態計畫上才會命中。設 0 可停用。
+    private static final long gtocraftfix$REPAIR_BUDGET_MS = Long.getLong("gtodiag.repairBudgetMs", 200L);
     private static final long gtocraftfix$REPAIR_BUDGET_NS = gtocraftfix$REPAIR_BUDGET_MS <= 0
             ? Long.MAX_VALUE
             : gtocraftfix$REPAIR_BUDGET_MS * 1_000_000L;
