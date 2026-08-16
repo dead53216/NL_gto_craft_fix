@@ -153,33 +153,88 @@ public abstract class CraftingServiceSyncMixin {
     private static final AtomicInteger gtocraftfix$balLog = new AtomicInteger();
     private static final int gtocraftfix$BAL_MAX = 5000;
 
-    /**
-     * [3.8.0] 修補迴圈可處理的缺口數上限。原本是 96——那是「幻影缺口時代」的值（一張計畫只補一兩項），
-     * 現在修補擴成四維，大電路光第一輪缺口就破百，實測 17 次修補有 7 次貼著 96 停：
-     * <b>已加進計畫的輪次留著、它們的輸入沒補完 → 計畫內部不平衡 → 必凍</b>
-     * （ZPM 通用電路實錄：epoxy/quantum_processor/lubricant 全標「本單無人產」但網路有貨）。
-     * 上限本身要留（遞迴補料遇循環配方可以無限長，而且跑在伺服器主緒），但**耗盡時必須整組還原**。
-     */
-    private static final int gtocraftfix$REPAIR_GUARD = Integer.getInteger("gtodiag.repairGuard", 100_000);
+    // ==================== [3.11.0] 修補旗標 ====================
+    // 背景：3.9.0～3.10.2 四個版本裡有兩次實測退步（3.9.0 讓 LUV 電路交付從 466/500 掉到 8/500；
+    // 3.10.0 把 157 任務／217 萬輪的正常 UHV 計畫每 10 秒擋一次）。原因是多個行為綁在一起上線，
+    // 出事時無法定位。**3.11.0 把 3.9–3.10 新增的行為全部改成「程式碼保留、預設關閉」**，
+    // 三個上限退回 3.8.0 值（實測最好的一版），每項都能單獨開關以便在遊戲內 A/B。
+    // 刻意不做「一鍵全開」的總開關——那正是釀成退步的做法。
 
     /**
-     * [3.10.1] 修補的**時間**預算（毫秒）——跑在伺服器主緒，真正該擋的是時間不是次數。
-     * 實錄：UHV 通用電路的正常計畫有 157 個任務／217 萬輪，缺口數輕鬆破 4000（原上限），
-     * 導致每 10 秒被中止一次、機器永遠下不了單（玩家手動卻做得起來）。
+     * [3.8.0/3.11.0] 修補迴圈可處理的缺口數上限，**預設退回 3.8.0 的 4000**。
+     * （3.8.0 實測：LUV 電路修補補 3650 項即完成、交付 466/500，是目前最好的基線。）
+     * 更早的 96 是「幻影缺口時代」的值，已證實會讓大電路交出半套計畫而必凍。
+     * 上限本身必須留（遞迴補料遇循環配方可以無限長，而且跑在伺服器主緒），**耗盡時整組還原**。
      */
-    private static final long gtocraftfix$REPAIR_BUDGET_NS =
-            Long.getLong("gtodiag.repairBudgetMs", 200L) * 1_000_000L;
+    private static final int gtocraftfix$REPAIR_GUARD = Integer.getInteger("gtodiag.repairGuard", 4000);
 
     /**
-     * [3.8.0] 修補可新增的「總輪數」上限：真正該防的膨脹用輪數擋，而不是用次數硬砍。
-     * [3.10.0] 2,000,000 → 20,000,000：深階合成的合法修補就會破 200 萬（UHV 電路補 36 個
-     * wetware_processor_mainframe ＝ 2,001,165 輪，只差一點點就被判膨脹而中止）。輪數多不吃 CPU 時間
-     * （時間由 {@code REPAIR_GUARD} 的缺口數擋），計畫過大 GTO 自己會回 NO_SUITABLE_CPU_FOUND。
+     * [3.10.1/3.11.0] 修補的**時間**預算（毫秒），**預設 0＝停用**（3.8.0 沒有時間維度）。
+     * 用 0 停用而不是「設一個很大的值」——{@code ms * 1_000_000} 在極大值會溢位成負數，
+     * 反而變成每次都超時。要啟用建議 200（＝4 個 tick，命中即為可感知卡頓）。
      */
-    private static final long gtocraftfix$REPAIR_RUN_CAP = Long.getLong("gtodiag.repairRunCap", 20_000_000L);
+    private static final long gtocraftfix$REPAIR_BUDGET_MS = Long.getLong("gtodiag.repairBudgetMs", 0L);
+    private static final long gtocraftfix$REPAIR_BUDGET_NS = gtocraftfix$REPAIR_BUDGET_MS <= 0
+            ? Long.MAX_VALUE
+            : gtocraftfix$REPAIR_BUDGET_MS * 1_000_000L;
+
+    /**
+     * [3.8.0/3.11.0] 修補可新增的「總輪數」上限，**預設退回 3.8.0 的 200 萬**。
+     * ⚠ 3.10.0 把它放到 2000 萬時的理由「計畫過大 GTO 自己會回 NO_SUITABLE_CPU_FOUND」是**錯的**：
+     * CPU 挑選與 trySubmitJob 都是拿 {@code plan.bytes()} 比 {@code cluster.getAvailableStorage()}，
+     * 而 bytes 是 CraftingPlan 的 final 欄位、修補全程沒動過 → 那道保護從未觸發，
+     * 補了 200 萬輪的計畫照樣會落在一顆小 CPU 上。這個上限是目前唯一的規模護欄。
+     */
+    private static final long gtocraftfix$REPAIR_RUN_CAP = Long.getLong("gtodiag.repairRunCap", 2_000_000L);
+
+    /** [3.9.0/3.11.0] 缺口優先吃網路現貨（否則一律排樣板）。預設 **off**＝3.8.0 行為。 */
+    private static final boolean gtocraftfix$REPAIR_NET_SPOT = Boolean.getBoolean("gtodiag.repairNetSpot");
+
+    /** [3.9.1/3.11.0] 內部配平缺口用網路現貨補齊（第五維）。預設 **off**＝3.8.0 行為。 */
+    private static final boolean gtocraftfix$REPAIR_BALANCE = Boolean.getBoolean("gtodiag.repairBalance");
+
+    /** [3.10.2/3.11.0] 配平補齊在「修補中止」時也照做。預設 **off**＝維持全有全無。 */
+    private static final boolean gtocraftfix$REPAIR_BALANCE_ON_ABORT =
+            Boolean.getBoolean("gtodiag.repairBalanceOnAbort");
+
+    /** [3.11.0] 即使不補齊，也照算一次內部配平缺口並印 log（純唯讀觀測，預設 on）。 */
+    private static final boolean gtocraftfix$REPAIR_BALANCE_LOG =
+            !"false".equalsIgnoreCase(System.getProperty("gtodiag.repairBalanceLog", "true"));
+
+    /**
+     * [3.10.0/3.11.0] 修補中止後擋下機器源提交：{@code off}（預設）／{@code on}／{@code force}。
+     * {@code on} 在 slim 分支自動不生效（slim 原則＝只修計畫、不擋單，見 mod CLAUDE.md）；
+     * 要在 slim 上擋單必須明寫 {@code force}。
+     */
+    private static final String gtocraftfix$REPAIR_BLOCK =
+            System.getProperty("gtodiag.repairBlockOnAbort", "off").trim().toLowerCase(java.util.Locale.ROOT);
+
+    /** [3.10.0/3.11.0] 中止擋單時在聊天室廣播缺料（會對全伺服器玩家送出）。預設 off。 */
+    private static final boolean gtocraftfix$REPAIR_ABORT_BROADCAST =
+            Boolean.getBoolean("gtodiag.repairAbortBroadcast");
+
+    /**
+     * [3.10.1/3.11.0] 必凍探針：對「計畫無人產」的 usedItems 逐項做 SIMULATE 取料，判斷還原後的計畫
+     * 是否必然凍結。擋單開啟時一定會跑；此旗標讓你在不擋單的情況下也留下判定 log。預設 off。
+     */
+    private static final boolean gtocraftfix$REPAIR_FREEZE_PROBE =
+            Boolean.getBoolean("gtodiag.repairFreezeProbe");
 
     /** [3.10.0] 修補中止已通知過的成品（聊天室去重）。 */
     private final Set<String> gtocraftfix$abortNotified = new HashSet<>();
+
+    /** [3.11.0] 現行旗標一覽（啟動時印一次，方便對照 log 與設定）。 */
+    private static String gtocraftfix$flagLine() {
+        return "guard=" + gtocraftfix$REPAIR_GUARD
+                + " runCap=" + gtocraftfix$REPAIR_RUN_CAP
+                + " budgetMs=" + gtocraftfix$REPAIR_BUDGET_MS
+                + " netSpot=" + gtocraftfix$REPAIR_NET_SPOT
+                + " balance=" + gtocraftfix$REPAIR_BALANCE
+                + "(onAbort=" + gtocraftfix$REPAIR_BALANCE_ON_ABORT
+                + ",log=" + gtocraftfix$REPAIR_BALANCE_LOG + ")"
+                + " block=" + gtocraftfix$REPAIR_BLOCK
+                + " freezeProbe=" + gtocraftfix$REPAIR_FREEZE_PROBE;
+    }
 
     /** [3.8.0] 把 KeyCounter 倒回快照值（以差額回沖，KeyCounter.add 吃負數）。 */
     private static void gtocraftfix$restoreCounter(appeng.api.stacks.KeyCounter kc, Map<AEKey, Long> snap) {
@@ -598,6 +653,7 @@ public abstract class CraftingServiceSyncMixin {
                             LOG.info("[craftfix] 已啟用 slim：同步算料(ctrl+左鍵)＋機器源 IgnoreMissing(請求器)"
                                     + "＋並行死角解鎖＋降量重算＋計畫修補(只修不擋單)；"
                                     + "無樣板守衛/lpcalc/保母 停用（僅印 log）。");
+                            LOG.info("[craftfix] 修補旗標 {}", gtocraftfix$flagLine()); // [3.11.0]
                         } else {
                             LOG.info("[craftfix] 已啟用完整版：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
                                     com.gtocraftfix.lpcalc.LpConfig.enabled() ? "on" : "off");
@@ -867,7 +923,8 @@ public abstract class CraftingServiceSyncMixin {
             long t0 = System.nanoTime();
             for (int round = 0; round < 4; round++) {
             while (!deficits.isEmpty() && guard++ < gtocraftfix$REPAIR_GUARD) {
-                if ((guard & 255) == 0 && System.nanoTime() - t0 > gtocraftfix$REPAIR_BUDGET_NS) {
+                if (gtocraftfix$REPAIR_BUDGET_NS != Long.MAX_VALUE && (guard & 255) == 0
+                        && System.nanoTime() - t0 > gtocraftfix$REPAIR_BUDGET_NS) {
                     abortReason = "超過時間預算 " + (gtocraftfix$REPAIR_BUDGET_NS / 1_000_000)
                             + "ms（已處理 " + guard + " 項、仍剩 " + deficits.size() + " 項）";
                     break;
@@ -878,11 +935,12 @@ public abstract class CraftingServiceSyncMixin {
                 // hard=真實記帳缺口（missing/usedItems/最終產出/新增輸入）；自舉猜測（近似模擬）為 soft
                 boolean hard = d.length > 2 && Boolean.TRUE.equals(d[2]);
 
-                // [3.9.0] 先拿網路現貨：缺的量網路有就直接記進 usedItems（開局一次取進 CPU），
-                // 比排樣板便宜也即時。實錄：LUV 電路做到剩 34 個時餓死在 lubricant 132／copper_block 4／
-                // platinum_single_wire 6，而網路各有 115209／6／13——就差這一步。
+                // [3.9.0，3.11.0 起預設關閉 `-Dgtodiag.repairNetSpot=true` 開啟]
+                // 先拿網路現貨：缺的量網路有就直接記進 usedItems（開局一次取進 CPU），比排樣板便宜也即時。
+                // 實錄：LUV 電路做到剩 34 個時餓死在 lubricant 132／copper_block 4／platinum_single_wire 6，
+                // 而網路各有 115209／6／13——就差這一步。
                 // 成品本身例外：GTO 沒有「把開局吸入的成品交給 link」的步驟，吸進去只會抱著現貨永凍。
-                if (shortAmt > 0 && !key.equals(finalKey)) {
+                if (gtocraftfix$REPAIR_NET_SPOT && shortAmt > 0 && !key.equals(finalKey)) {
                     long a0 = avail.computeIfAbsent(key,
                             k -> storage.extract(k, Long.MAX_VALUE / 2, Actionable.SIMULATE, src));
                     long free0 = Math.max(0, a0 - reserved.getOrDefault(key, 0L));
@@ -1044,16 +1102,22 @@ public abstract class CraftingServiceSyncMixin {
                 gtocraftfix$restoreCounter(used, snapUsed);
                 gtocraftfix$restoreCounter(missing, snapMissing);
             }
-            // [3.10.2] **中止也要做**：以前這段掛在 `abortReason == null` 底下，結果 UV 通用電路
-            // （修補要加 2001 萬輪、破輪數上限而中止）跳過了配平補齊 → 計畫原樣送出 → 開跑後餓死在
-            // epichlorohydrin／hot_platinum_ingot／niobium_titanium_ingot…（全部「本單無人產」，
-            // 而網路各有 499 萬／1920／20034）。這段又便宜又有界（只吸網路現貨、不排樣板），
-            // 不該被中止連坐。中止時 reserved 要用「還原後的 usedItems」重建，否則會誤以為現貨被佔走。
-            {
-                reserved.clear();
-                for (var e : used) {
-                    if (e.getLongValue() > 0) {
-                        reserved.merge(e.getKey(), e.getLongValue(), Long::sum);
+            // ---- 第五維：內部配平（[3.9.1] 補齊、[3.10.2] 中止也做、[3.11.0] 全部改成旗標）----
+            // apply=真的把缺口用網路現貨補進 usedItems（`-Dgtodiag.repairBalance=true`）；
+            //       中止時是否照做由 `-Dgtodiag.repairBalanceOnAbort` 決定（預設否＝維持全有全無）。
+            // 只有 log 時純唯讀，不碰 used/reserved——計畫位元與 3.8.0 完全相同，只多一次掃描。
+            // ⚠ 這個配平模型是啟發式的（替代輸入以供給扣除法歸戶、缺口記在主變體上），高估就會把
+            //   沒人會消耗的料吸進 CPU 抱到收單，所以預設關閉、先看 log 再決定要不要開。
+            boolean balApply = gtocraftfix$REPAIR_BALANCE
+                    && (abortReason == null || gtocraftfix$REPAIR_BALANCE_ON_ABORT);
+            if (balApply || gtocraftfix$REPAIR_BALANCE_LOG) {
+                if (balApply) {
+                    // 還原後 reserved 必須用「現在的 usedItems」重建，否則會誤以為現貨已被佔走
+                    reserved.clear();
+                    for (var e : used) {
+                        if (e.getLongValue() > 0) {
+                            reserved.merge(e.getKey(), e.getLongValue(), Long::sum);
+                        }
                     }
                 }
                 var bal = gtocraftfix$internalBalanceDeficits(plan);
@@ -1066,23 +1130,27 @@ public abstract class CraftingServiceSyncMixin {
                     if (bk.equals(finalKey)) {
                         continue; // 成品不吸現貨（GTO 沒有把開局現貨交給 link 的步驟）
                     }
-                    long a1 = avail.computeIfAbsent(bk,
-                            k -> storage.extract(k, Long.MAX_VALUE / 2, Actionable.SIMULATE, src));
-                    long free1 = Math.max(0, a1 - reserved.getOrDefault(bk, 0L));
-                    long take1 = Math.min(need, free1);
-                    if (take1 > 0) {
-                        used.add(bk, take1);
-                        reserved.merge(bk, take1, Long::sum);
-                        filled += take1;
-                        repaired++;
+                    long take1 = 0;
+                    if (balApply) {
+                        long a1 = avail.computeIfAbsent(bk,
+                                k -> storage.extract(k, Long.MAX_VALUE / 2, Actionable.SIMULATE, src));
+                        long free1 = Math.max(0, a1 - reserved.getOrDefault(bk, 0L));
+                        take1 = Math.min(need, free1);
+                        if (take1 > 0) {
+                            used.add(bk, take1);
+                            reserved.merge(bk, take1, Long::sum);
+                            filled += take1;
+                            repaired++;
+                        }
                     }
                     if (need - take1 > 0 && mn++ < 5) {
                         miss.append(bk).append(" x").append(need - take1).append("; ");
                     }
                 }
                 if ((filled > 0 || mn > 0) && gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
-                    LOG.info("[craftfix] 內部配平 out={} 網路補齊{}單位{}", plan.finalOutput(), filled,
-                            mn == 0 ? "（全數補平）" : "；網路也沒有：" + miss);
+                    LOG.info("[craftfix] 內部配平 out={} {}{}", plan.finalOutput(),
+                            balApply ? "網路補齊" + filled + "單位" : "（只觀測，未補齊）",
+                            mn == 0 ? "（帳已平）" : "；仍缺：" + miss);
                 }
             }
             if (abortReason != null) {
@@ -1101,37 +1169,51 @@ public abstract class CraftingServiceSyncMixin {
                 // UHV 電路的退化計畫（1 個任務、used=wetware_processor_mainframe x100、網路只有 64）
                 // 正是這個形狀；而「157 個任務、217 萬輪的正常大計畫只是修補沒跑完」不是——那種照送。
                 // 3.10.0 一律擋，把後者也擋掉了（玩家手動能做、機器一直被擋）。
+                // [3.11.0] 擋單改成旗標：off（預設，＝3.8.0 的「還原後照原樣送出」）／on／force。
+                // on 在 slim 分支自動不生效——另外兩個擋單點（下方 blockSubmit、退化計畫）都有 SLIM 例外，
+                // 只有這裡沒有，等於 3.10.0 起 slim 版違反了自己「只修計畫、不擋單」的約束。
                 boolean machineSrc2 = src == null || src.player().isEmpty();
-                var made2 = new HashSet<AEKey>();
-                for (var pe : pt.entrySet()) {
-                    if (pe.getValue() != null && pe.getValue() > 0) {
-                        for (var o : pe.getKey().getOutputs()) {
-                            made2.add(o.what());
+                boolean doBlock = "force".equals(gtocraftfix$REPAIR_BLOCK)
+                        || ("on".equals(gtocraftfix$REPAIR_BLOCK) && !gtocraftfix$SLIM);
+                boolean willFreeze = false;
+                var fatal = new StringBuilder();
+                if (doBlock || gtocraftfix$REPAIR_FREEZE_PROBE) {
+                    var made2 = new HashSet<AEKey>();
+                    for (var pe : pt.entrySet()) {
+                        if (pe.getValue() != null && pe.getValue() > 0) {
+                            for (var o : pe.getKey().getOutputs()) {
+                                made2.add(o.what());
+                            }
+                        }
+                    }
+                    int fn = 0;
+                    for (var e : used) {
+                        long want = e.getLongValue();
+                        if (want <= 0 || made2.contains(e.getKey())) {
+                            continue; // 計畫有排生產＝不會變成孤兒 waitingFor
+                        }
+                        long can = storage.extract(e.getKey(), want, Actionable.SIMULATE, src);
+                        if (can < want) {
+                            willFreeze = true;
+                            if (fn++ < 5) {
+                                fatal.append(e.getKey()).append(" 要").append(want)
+                                        .append("/網").append(can).append("; ");
+                            }
                         }
                     }
                 }
-                var fatal = new StringBuilder();
-                int fn = 0;
-                for (var e : used) {
-                    long want = e.getLongValue();
-                    if (want <= 0 || made2.contains(e.getKey())) {
-                        continue; // 計畫有排生產＝不會變成孤兒 waitingFor
-                    }
-                    long can = storage.extract(e.getKey(), want, Actionable.SIMULATE, src);
-                    if (can < want && fn++ < 5) {
-                        fatal.append(e.getKey()).append(" 要").append(want).append("/網").append(can).append("; ");
-                    }
-                }
-                boolean willFreeze = fn > 0;
                 LOG.warn("[craftfix] **計畫修補放棄**（{}）→ 已還原成原計畫，{}。未解缺口：{} out={}",
                         abortReason,
                         !machineSrc2 ? "玩家路徑照原樣送出"
-                                : willFreeze ? "且還原後的計畫必凍（" + fatal + "）→ 擋下這次提交（機器會重試）"
-                                        : "計畫本身可執行 → 照原樣送出",
+                                : (doBlock && willFreeze)
+                                        ? "且還原後的計畫必凍（" + fatal + "）→ 擋下這次提交（機器會重試）"
+                                        : willFreeze ? "⚠ 還原後的計畫必凍（" + fatal + "）但擋單已關閉 → 照原樣送出"
+                                                : "照原樣送出",
                         left, plan.finalOutput());
-                if (machineSrc2 && willFreeze) {
+                if (doBlock && machineSrc2 && willFreeze) {
                     String sig2 = "abort|" + plan.finalOutput().what();
-                    if (gtocraftfix$abortNotified.add(sig2)) {
+                    // [3.11.0] 廣播另開旗標：這是對**全伺服器所有玩家**送訊息，多人環境會洗頻
+                    if (gtocraftfix$REPAIR_ABORT_BROADCAST && gtocraftfix$abortNotified.add(sig2)) {
                         if (gtocraftfix$abortNotified.size() > 128) {
                             gtocraftfix$abortNotified.clear();
                         }

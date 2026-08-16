@@ -72,6 +72,29 @@
 系統屬性：`-Dgtodiag.ledger=false` 整組關閉、`-Dgtodiag.diagLines=N` 行數上限（預設 40000）、
 `-Dgtodiag.stallTicks` / `-Dgtodiag.stallRepeat` / `-Dgtodiag.overviewTicks` 調間隔。
 
+## 修補旗標（3.11.0，預設＝3.8.0 行為）
+
+3.9.0～3.10.2 四個版本裡有兩次實測退步（3.9.0 讓 LUV 電路交付從 466/500 掉到 **8/500**；3.10.0 把
+157 任務／217 萬輪的**正常** UHV 計畫每 10 秒擋一次）。原因是多個行為綁在一起上線，出事無法定位。
+3.11.0 把三個上限退回 3.8.0 值、3.9–3.10 新增的行為**程式碼保留但預設關閉**，每項可單獨開關以便遊戲內 A/B。
+**刻意不做「一鍵全開」的總開關**——那正是釀成退步的做法。啟動時 log 會印 `[craftfix] 修補旗標 …` 一覽。
+
+| 系統屬性 | 預設 | 作用 |
+|---|---|---|
+| `gtodiag.repairGuard` | `4000` | 修補迴圈可處理的缺口數上限（3.8.0 值；耗盡＝整組還原）|
+| `gtodiag.repairRunCap` | `2000000` | 修補可新增的總輪數上限（3.8.0 值）|
+| `gtodiag.repairBudgetMs` | `0`（停用）| 修補時間預算；**用 0 停用，不要設超大值**（`ms×1e6` 會溢位成負數→變成每次都超時）|
+| `gtodiag.repairNetSpot` | `false` | 缺口優先吃網路現貨（否則一律排樣板）|
+| `gtodiag.repairBalance` | `false` | 內部配平缺口用網路現貨補齊（第五維）|
+| `gtodiag.repairBalanceOnAbort` | `false` | 配平補齊在「修補中止」時也照做（僅 `repairBalance=true` 時有意義）|
+| `gtodiag.repairBalanceLog` | `true` | 即使不補齊也照算一次配平缺口並印 log（純唯讀觀測）|
+| `gtodiag.repairBlockOnAbort` | `off` | 中止後擋下機器源提交：`off`／`on`（slim 分支自動不生效）／`force` |
+| `gtodiag.repairAbortBroadcast` | `false` | 擋單時聊天室廣播缺料（**對全伺服器玩家**送出，多人會洗頻）|
+| `gtodiag.repairFreezeProbe` | `false` | 不擋單也跑「必凍」判定並留 log |
+
+> ⚠ 預期副作用：`repairGuard` 退回 4000 後，UHV 那種 157 任務的大計畫會再度「缺口未解完」而中止；
+> 但因 `repairBlockOnAbort=off`，中止只會**還原後照原樣送出**（＝3.8.0 行為），不會再每 10 秒擋一次。
+
 ## 修正內容
 
 | 修正 | 解決 |
