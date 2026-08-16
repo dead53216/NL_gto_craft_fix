@@ -162,8 +162,16 @@ public abstract class CraftingServiceSyncMixin {
      */
     private static final int gtocraftfix$REPAIR_GUARD = Integer.getInteger("gtodiag.repairGuard", 4000);
 
-    /** [3.8.0] 修補可新增的「總輪數」上限：真正該防的膨脹用輪數擋，而不是用次數硬砍。 */
-    private static final long gtocraftfix$REPAIR_RUN_CAP = Long.getLong("gtodiag.repairRunCap", 2_000_000L);
+    /**
+     * [3.8.0] 修補可新增的「總輪數」上限：真正該防的膨脹用輪數擋，而不是用次數硬砍。
+     * [3.10.0] 2,000,000 → 20,000,000：深階合成的合法修補就會破 200 萬（UHV 電路補 36 個
+     * wetware_processor_mainframe ＝ 2,001,165 輪，只差一點點就被判膨脹而中止）。輪數多不吃 CPU 時間
+     * （時間由 {@code REPAIR_GUARD} 的缺口數擋），計畫過大 GTO 自己會回 NO_SUITABLE_CPU_FOUND。
+     */
+    private static final long gtocraftfix$REPAIR_RUN_CAP = Long.getLong("gtodiag.repairRunCap", 20_000_000L);
+
+    /** [3.10.0] 修補中止已通知過的成品（聊天室去重）。 */
+    private final Set<String> gtocraftfix$abortNotified = new HashSet<>();
 
     /** [3.8.0] 把 KeyCounter 倒回快照值（以差額回沖，KeyCounter.add 吃負數）。 */
     private static void gtocraftfix$restoreCounter(appeng.api.stacks.KeyCounter kc, Map<AEKey, Long> snap) {
@@ -1059,8 +1067,36 @@ public abstract class CraftingServiceSyncMixin {
                     }
                     left.append(d[0]).append(" x").append(d[1]).append("; ");
                 }
-                LOG.warn("[craftfix] **計畫修補放棄**（{}）→ 已還原成原計畫送出。未解缺口：{} out={}",
-                        abortReason, left, plan.finalOutput());
+                // [3.10.0] 中止後**擋下機器源提交**：實錄證明「還原後照樣送出」＝保證凍結——
+                // UHV 通用電路的計畫是「從網路拿 100 個 wetware_processor_mainframe」但網路只有 64，
+                // 修補要補那 36 個得排 200 萬輪（超過輪數上限）→ 還原 → 送出 → IgnoreMissing 把 36 個
+                // 變成永遠等不到的 waitingFor，CPU 就此鎖死（實錄：靜止 60s、剩 1 個任務、無任務產它）。
+                // 擋下來則 CPU 保持空閒、請求器 10 秒後自己重試，網路補到貨就會成功。
+                // 玩家路徑不擋（按鈕沒反應反而更難解釋），只記 log。
+                boolean machineSrc2 = src == null || src.player().isEmpty();
+                LOG.warn("[craftfix] **計畫修補放棄**（{}）→ 已還原成原計畫，{}。未解缺口：{} out={}",
+                        abortReason, machineSrc2 ? "並擋下這次提交（機器會重試）" : "玩家路徑照原樣送出",
+                        left, plan.finalOutput());
+                if (machineSrc2) {
+                    String sig2 = "abort|" + plan.finalOutput().what();
+                    if (gtocraftfix$abortNotified.add(sig2)) {
+                        if (gtocraftfix$abortNotified.size() > 128) {
+                            gtocraftfix$abortNotified.clear();
+                        }
+                        var server2 = grid.getPivot() != null && grid.getPivot().getLevel() != null
+                                ? grid.getPivot().getLevel().getServer()
+                                : null;
+                        if (server2 != null) {
+                            server2.getPlayerList().broadcastSystemMessage(
+                                    net.minecraft.network.chat.Component.literal("[合成修復] 缺料補不齊，已擋下自動合成：")
+                                            .append(plan.finalOutput().what().getDisplayName())
+                                            .append(net.minecraft.network.chat.Component.literal(
+                                                    " x" + plan.finalOutput().amount() + "（缺 " + left + "）")),
+                                    false);
+                        }
+                    }
+                    cir.setReturnValue(appeng.crafting.execution.CraftingSubmitResult.INCOMPLETE_PLAN);
+                }
                 return;
             }
             used.removeZeros();
