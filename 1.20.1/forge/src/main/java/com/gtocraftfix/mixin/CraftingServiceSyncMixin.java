@@ -1034,7 +1034,28 @@ public abstract class CraftingServiceSyncMixin {
             // 補樣板會製造新輸入需求 → 新缺口 → 再補，這條路只能由算料器做；修補這層只該把
             // 「網路現貨拿得到的小缺口」補上（實錄：lubricant 132／copper_block 4／
             // electronic_grade_silicon 6912，網路各有 115209／6／564480）。
-            if (abortReason == null) {
+            // [3.8.0] 修補不完整 → 整組還原成修補前的計畫（寧可被拒單重試，也不交半套計畫）。
+            // [3.10.2] 還原必須在配平補齊**之前**做，否則補進 usedItems 的現貨會被還原一起洗掉。
+            if (abortReason != null) {
+                pt.keySet().removeIf(k -> !snapPt.containsKey(k));
+                for (var e : snapPt.entrySet()) {
+                    pt.put(e.getKey(), e.getValue());
+                }
+                gtocraftfix$restoreCounter(used, snapUsed);
+                gtocraftfix$restoreCounter(missing, snapMissing);
+            }
+            // [3.10.2] **中止也要做**：以前這段掛在 `abortReason == null` 底下，結果 UV 通用電路
+            // （修補要加 2001 萬輪、破輪數上限而中止）跳過了配平補齊 → 計畫原樣送出 → 開跑後餓死在
+            // epichlorohydrin／hot_platinum_ingot／niobium_titanium_ingot…（全部「本單無人產」，
+            // 而網路各有 499 萬／1920／20034）。這段又便宜又有界（只吸網路現貨、不排樣板），
+            // 不該被中止連坐。中止時 reserved 要用「還原後的 usedItems」重建，否則會誤以為現貨被佔走。
+            {
+                reserved.clear();
+                for (var e : used) {
+                    if (e.getLongValue() > 0) {
+                        reserved.merge(e.getKey(), e.getLongValue(), Long::sum);
+                    }
+                }
                 var bal = gtocraftfix$internalBalanceDeficits(plan);
                 long filled = 0;
                 var miss = new StringBuilder();
@@ -1064,14 +1085,7 @@ public abstract class CraftingServiceSyncMixin {
                             mn == 0 ? "（全數補平）" : "；網路也沒有：" + miss);
                 }
             }
-            // [3.8.0] 修補不完整 → 整組還原成修補前的計畫，原樣送出（寧可被拒單重試，也不交半套計畫）
             if (abortReason != null) {
-                pt.keySet().removeIf(k -> !snapPt.containsKey(k));
-                for (var e : snapPt.entrySet()) {
-                    pt.put(e.getKey(), e.getValue());
-                }
-                gtocraftfix$restoreCounter(used, snapUsed);
-                gtocraftfix$restoreCounter(missing, snapMissing);
                 var left = new StringBuilder();
                 int ln = 0;
                 for (var d : deficits) {
