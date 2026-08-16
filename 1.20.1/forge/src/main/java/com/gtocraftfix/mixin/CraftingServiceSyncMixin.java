@@ -160,7 +160,15 @@ public abstract class CraftingServiceSyncMixin {
      * （ZPM 通用電路實錄：epoxy/quantum_processor/lubricant 全標「本單無人產」但網路有貨）。
      * 上限本身要留（遞迴補料遇循環配方可以無限長，而且跑在伺服器主緒），但**耗盡時必須整組還原**。
      */
-    private static final int gtocraftfix$REPAIR_GUARD = Integer.getInteger("gtodiag.repairGuard", 4000);
+    private static final int gtocraftfix$REPAIR_GUARD = Integer.getInteger("gtodiag.repairGuard", 100_000);
+
+    /**
+     * [3.10.1] 修補的**時間**預算（毫秒）——跑在伺服器主緒，真正該擋的是時間不是次數。
+     * 實錄：UHV 通用電路的正常計畫有 157 個任務／217 萬輪，缺口數輕鬆破 4000（原上限），
+     * 導致每 10 秒被中止一次、機器永遠下不了單（玩家手動卻做得起來）。
+     */
+    private static final long gtocraftfix$REPAIR_BUDGET_NS =
+            Long.getLong("gtodiag.repairBudgetMs", 200L) * 1_000_000L;
 
     /**
      * [3.8.0] 修補可新增的「總輪數」上限：真正該防的膨脹用輪數擋，而不是用次數硬砍。
@@ -856,8 +864,14 @@ public abstract class CraftingServiceSyncMixin {
             }
             var finalKey = plan.finalOutput() == null ? null : plan.finalOutput().what();
             // 外圈：解缺口 → 可執行性模擬（抓循環自舉缺口）→ 再解，最多 4 輪
+            long t0 = System.nanoTime();
             for (int round = 0; round < 4; round++) {
             while (!deficits.isEmpty() && guard++ < gtocraftfix$REPAIR_GUARD) {
+                if ((guard & 255) == 0 && System.nanoTime() - t0 > gtocraftfix$REPAIR_BUDGET_NS) {
+                    abortReason = "超過時間預算 " + (gtocraftfix$REPAIR_BUDGET_NS / 1_000_000)
+                            + "ms（已處理 " + guard + " 項、仍剩 " + deficits.size() + " 項）";
+                    break;
+                }
                 var d = deficits.poll();
                 var key = (AEKey) d[0];
                 long shortAmt = (Long) d[1];
@@ -1067,17 +1081,41 @@ public abstract class CraftingServiceSyncMixin {
                     }
                     left.append(d[0]).append(" x").append(d[1]).append("; ");
                 }
-                // [3.10.0] 中止後**擋下機器源提交**：實錄證明「還原後照樣送出」＝保證凍結——
-                // UHV 通用電路的計畫是「從網路拿 100 個 wetware_processor_mainframe」但網路只有 64，
-                // 修補要補那 36 個得排 200 萬輪（超過輪數上限）→ 還原 → 送出 → IgnoreMissing 把 36 個
-                // 變成永遠等不到的 waitingFor，CPU 就此鎖死（實錄：靜止 60s、剩 1 個任務、無任務產它）。
-                // 擋下來則 CPU 保持空閒、請求器 10 秒後自己重試，網路補到貨就會成功。
-                // 玩家路徑不擋（按鈕沒反應反而更難解釋），只記 log。
+                // [3.10.1] 擋不擋單，看的是**還原後的計畫會不會必凍**，不是「修補有沒有做完」。
+                // 必凍的充要條件（實測唯一會鎖死 CPU 的形狀）：usedItems 要的量網路給不出來，
+                // 而且計畫裡沒有任何任務會產它 → IgnoreMissing 把差額變成永遠等不到的 waitingFor。
+                // UHV 電路的退化計畫（1 個任務、used=wetware_processor_mainframe x100、網路只有 64）
+                // 正是這個形狀；而「157 個任務、217 萬輪的正常大計畫只是修補沒跑完」不是——那種照送。
+                // 3.10.0 一律擋，把後者也擋掉了（玩家手動能做、機器一直被擋）。
                 boolean machineSrc2 = src == null || src.player().isEmpty();
+                var made2 = new HashSet<AEKey>();
+                for (var pe : pt.entrySet()) {
+                    if (pe.getValue() != null && pe.getValue() > 0) {
+                        for (var o : pe.getKey().getOutputs()) {
+                            made2.add(o.what());
+                        }
+                    }
+                }
+                var fatal = new StringBuilder();
+                int fn = 0;
+                for (var e : used) {
+                    long want = e.getLongValue();
+                    if (want <= 0 || made2.contains(e.getKey())) {
+                        continue; // 計畫有排生產＝不會變成孤兒 waitingFor
+                    }
+                    long can = storage.extract(e.getKey(), want, Actionable.SIMULATE, src);
+                    if (can < want && fn++ < 5) {
+                        fatal.append(e.getKey()).append(" 要").append(want).append("/網").append(can).append("; ");
+                    }
+                }
+                boolean willFreeze = fn > 0;
                 LOG.warn("[craftfix] **計畫修補放棄**（{}）→ 已還原成原計畫，{}。未解缺口：{} out={}",
-                        abortReason, machineSrc2 ? "並擋下這次提交（機器會重試）" : "玩家路徑照原樣送出",
+                        abortReason,
+                        !machineSrc2 ? "玩家路徑照原樣送出"
+                                : willFreeze ? "且還原後的計畫必凍（" + fatal + "）→ 擋下這次提交（機器會重試）"
+                                        : "計畫本身可執行 → 照原樣送出",
                         left, plan.finalOutput());
-                if (machineSrc2) {
+                if (machineSrc2 && willFreeze) {
                     String sig2 = "abort|" + plan.finalOutput().what();
                     if (gtocraftfix$abortNotified.add(sig2)) {
                         if (gtocraftfix$abortNotified.size() > 128) {
@@ -1091,7 +1129,7 @@ public abstract class CraftingServiceSyncMixin {
                                     net.minecraft.network.chat.Component.literal("[合成修復] 缺料補不齊，已擋下自動合成：")
                                             .append(plan.finalOutput().what().getDisplayName())
                                             .append(net.minecraft.network.chat.Component.literal(
-                                                    " x" + plan.finalOutput().amount() + "（缺 " + left + "）")),
+                                                    " x" + plan.finalOutput().amount() + "（缺 " + fatal + "）")),
                                     false);
                         }
                     }
