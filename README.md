@@ -81,9 +81,13 @@
 
 | 系統屬性 | 預設 | 作用 |
 |---|---|---|
-| `gtodiag.repairGuard` | `4000` | 修補迴圈可處理的缺口數上限（3.8.0 值；耗盡＝整組還原）|
+| `gtodiag.repairGuard` | `20000`（3.11.1）| 修補迴圈可處理的缺口數上限（耗盡＝整組還原）。3.8.0 是 4000，實測有機陽液／陰液「已處理 4001 項、仍剩 9 項」就整組還原→幻影缺口變成永遠等不到的 `waitingFor` |
 | `gtodiag.repairRunCap` | `2000000` | 修補可新增的總輪數上限（3.8.0 值）|
-| `gtodiag.repairBudgetMs` | `0`（停用）| 修補時間預算；**用 0 停用，不要設超大值**（`ms×1e6` 會溢位成負數→變成每次都超時）|
+| `gtodiag.repairBudgetMs` | `200`（3.11.1）| 修補時間預算——護欄從「數到 N 就放棄」改成時間制（用固定次數擋遞迴補料迴圈本身是錯的設計：96→4000→10 萬三次都設錯）。**用 0 停用，不要設超大值**（`ms×1e6` 會溢位成負數→變成每次都超時）|
+| `gtodiag.repairDeficitSrc` | `on`（3.12.0）| 缺口沖銷只准動「真的來自 usedItems」的那本帳：`on`＝完整來源判定／`clamp`＝不分來源但不寫負值／`off`＝3.8.0 原樣 |
+| `gtodiag.repairStrictRounds` | `false` | 外圈 4 輪後仍有殘留缺口就整組還原。**預設 false**：唯一能帶著殘留缺口離開外圈的路徑只剩 soft 自舉猜測，還原＝退回幻影計畫＝必凍 |
+| `gtodiag.repairUpdateBytes` | `false` | 依新增輪次等比例調高 `plan.bytes()`（開啟後原本擠得上小 CPU 的計畫會改吃 `CPU_TOO_SMALL`）|
+| `gtodiag.bootstrapMaxPass` | `200000` | 循環自舉模擬的 pass 上限，超過即跳過該次自舉補齊（3.8.0 無上限、可卡主緒數秒）|
 | `gtodiag.repairNetSpot` | `false` | 缺口優先吃網路現貨（否則一律排樣板）|
 | `gtodiag.repairBalance` | `false` | 內部配平缺口用網路現貨補齊（第五維）|
 | `gtodiag.repairBalanceOnAbort` | `false` | 配平補齊在「修補中止」時也照做（僅 `repairBalance=true` 時有意義）|
@@ -92,8 +96,41 @@
 | `gtodiag.repairAbortBroadcast` | `false` | 擋單時聊天室廣播缺料（**對全伺服器玩家**送出，多人會洗頻）|
 | `gtodiag.repairFreezeProbe` | `false` | 不擋單也跑「必凍」判定並留 log |
 
-> ⚠ 預期副作用：`repairGuard` 退回 4000 後，UHV 那種 157 任務的大計畫會再度「缺口未解完」而中止；
-> 但因 `repairBlockOnAbort=off`，中止只會**還原後照原樣送出**（＝3.8.0 行為），不會再每 10 秒擋一次。
+> ⚠ **3.12.0 的預設值不等於 3.8.0**：`repairDeficitSrc=on`（不再把「從沒加進 usedItems 的量」倒扣成負值）
+> 與 `bootstrapMaxPass=200000`（自舉模擬有上限）兩項刻意不同，都是修 3.8.0 自己的 bug。
+> 要做純 3.8.0 對照組請加：
+> `-Dgtodiag.repairGuard=4000 -Dgtodiag.repairBudgetMs=0 -Dgtodiag.repairDeficitSrc=off`
+> `-Dgtodiag.bootstrapMaxPass=2147483647 -Dgtodiag.repairBalanceLog=false`
+
+## 3.12.0 修掉的 18 個 bug（稽核＋兩輪對抗式覆核）
+
+**修補側（7 個，其中 5 個 3.8.0 就有）**
+
+| # | 問題 | 後果 | 退路旗標 |
+|---|---|---|---|
+| B1 | 缺口沖銷對「非來自 usedItems」的缺口也照扣 → `usedItems` 寫成負值 | `KeyCounter` 不擋負數、`extract` 負量回 0、連 `waitingFor` 都不掛 → **該量無聲蒸發**，網路無貨的中間料在遞迴補料時必踩 | `repairDeficitSrc=off` |
+| B2 | ③最終產出短缺：加了輪次又從 usedItems 扣掉等量 | 供給原地踏步，修了等於沒修，還多吃一輪原料 | 同上 |
+| B3 | `catch(Throwable)` 不還原（快照宣告在 try 內，catch 看不到）| 例外時送出半套計畫＝必凍，違反「全有全無」核心不變式；含一個可達的 NPE | 無（純修復）|
+| B5 | 中止路徑 `return` 讓真缺料守衛永遠碰不到 | 非 slim 建置上真缺料守衛在「修補中止」時整個消失 | 無 |
+| B6 | 外圈 4 輪跑滿仍有缺口時靜默放行 | 不還原、不記錄，log 還印「補N項」看起來成功 | `repairStrictRounds` |
+| B8 | 修補加了輪次卻沒更新 `plan.bytes()` | CPU 大小保護從未觸發（挑 CPU 是拿 bytes 比 `getAvailableStorage()`）| `repairUpdateBytes` |
+| B9 | 自舉模擬 `while(progress)` 無上限、跑主緒且不受時間預算約束 | 回饋型配方每 pass 只前進 1 輪 → 單次提交可卡主緒數秒 | `bootstrapMaxPass` |
+
+**診斷側（11 個，全部 3.8.0 就有，不影響合成路徑）**
+
+| # | 問題 | 後果 |
+|---|---|---|
+| B10 | 「提前收單」判定：`insert()` 在 `remaining` 歸零的同一次呼叫內就 `finishJob()`＋`job=null`，每 tick 取樣永遠看不到末批 | **每張正常完成的單都誤報提前收單** → 改用 link 三態（取消／完成／未結案），standalone 與 link 讀不到一律標「無法判定」|
+| B11 | 替代輸入用「庫存掉最多的變體」回推歸戶；且 `extractPatternInputs` 實際會**跨變體混扣**（原註解寫反）| 兩個 key 同時累加等量反號的假 drift、假「對不上」→ 改成不可審計群組，drift 照記但報告分可信／不可信兩段 |
+| B12 | `Snap.job` 強引用經 `link → cpu → craftingLogic` 繞回 `WeakHashMap` 的 key | 弱鍵失效、拆 CPU 後整張 tasks 圖永久滯留 → 改弱引用＋閒置回收 |
+| B13 | 早期警報不查 `paused` | 暫停中的 CPU 被逐樣板誤判成「執行器沉默：疑 parallel==1 死角」（本 mod 最想抓的指紋）|
+| B14 | 快照回寫在方法尾端、外層 `catch` 靜默吞例外 | `ext` 沒清空 → 下一 tick 二次計入 → 假 drift；回寫改一律放 `finally` |
+| B15 | `getField("value")` 每 entry 每 tick 未快取 | 500 任務 × 30 CPU × 20tps ≈ 每秒 30 萬次反射，全在主緒 |
+| B16 | 不變量審計每 tick 無條件跑完，`changed` 卻在之後才算 | 絕大多數 tick 白建 7-8 個容器算出全 0 |
+| B17 | 額度耗盡後靜默且仍付計算成本；`SPENT` 溢位後額度自己復活 | 分不出「沒異常」與「被靜音」 |
+| B18 | `SUBMITS` 的 key 含數量、滿 256 整表 clear | 「反覆重下單」計數幾乎永遠顯示首次 |
+| B19 | 「供應器全忙」拿 `allBusy.size()` 比 `curRounds.size()`（後者含已完成任務）| 該分支實務上幾乎不成立，被誤判成「缺料鏈斷在根」或「未分類」|
+| B20 | `runnableRounds` 重複計算 | 純浪費 |
 
 ## 修正內容
 

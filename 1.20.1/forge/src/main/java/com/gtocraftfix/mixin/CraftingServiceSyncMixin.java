@@ -153,6 +153,30 @@ public abstract class CraftingServiceSyncMixin {
     private static final AtomicInteger gtocraftfix$balLog = new AtomicInteger();
     private static final int gtocraftfix$BAL_MAX = 5000;
 
+    /**
+     * [3.11.2／X2] 3.11.x 新增訊息的獨立額度。M5 才把配平觀測移出 balLog，同一輪的 M1／M2 又各自
+     * 新增一個 balLog 消費者——機器源每 2 秒重試一次的話，5000 次額度約 2.8 小時就會被燒光，
+     * 3.8.0 時代的四種診斷（開單即缺／最終產出短缺／循環自舉缺口／計畫修補）全部跟著靜音。
+     */
+    private static final AtomicInteger gtocraftfix$repairNoteLog = new AtomicInteger();
+    private static final int gtocraftfix$NOTE_LOG_MAX = 2000;
+
+    /**
+     * [3.11.2／M5] 配平觀測（{@code repairBalanceLog} 預設 on）專用額度。
+     * <p>原本與「開單即缺／最終產出短缺／循環自舉缺口／計畫修補」共用 {@link #gtocraftfix$balLog}
+     * 的終身 5000 次額度——配平觀測是**每次提交必印一行**的新增訊息，會把 3.8.0 時代就有的診斷
+     * 提前燒光而靜音（等於用新診斷換掉舊診斷）。獨立額度後兩邊互不影響。
+     */
+    private static final AtomicInteger gtocraftfix$balanceLog = new AtomicInteger();
+    private static final int gtocraftfix$BALANCE_LOG_MAX = 2000;
+
+    /** [3.11.2／M5] B2「修補後最終產出仍不足」驗證專用額度（理由同上，也不與 balLog 共用）。 */
+    private static final AtomicInteger gtocraftfix$finalCheckLog = new AtomicInteger();
+    private static final int gtocraftfix$FINAL_CHECK_LOG_MAX = 2000;
+
+    /** [3.11.2／M4] 缺口來源標記讀不到（SRC_UNKNOWN）的 WARN 額度：只印前 5 次，避免逐項洗版。 */
+    private static final AtomicInteger gtocraftfix$srcUnknownLog = new AtomicInteger();
+
     // ==================== [3.11.0] 修補旗標 ====================
     // 背景：3.9.0～3.10.2 四個版本裡有兩次實測退步（3.9.0 讓 LUV 電路交付從 466/500 掉到 8/500；
     // 3.10.0 把 157 任務／217 萬輪的正常 UHV 計畫每 10 秒擋一次）。原因是多個行為綁在一起上線，
@@ -166,14 +190,14 @@ public abstract class CraftingServiceSyncMixin {
      * 更早的 96 是「幻影缺口時代」的值，已證實會讓大電路交出半套計畫而必凍。
      * 上限本身必須留（遞迴補料遇循環配方可以無限長，而且跑在伺服器主緒），**耗盡時整組還原**。
      */
-    private static final int gtocraftfix$REPAIR_GUARD = Integer.getInteger("gtodiag.repairGuard", 4000);
+    private static final int gtocraftfix$REPAIR_GUARD = Integer.getInteger("gtodiag.repairGuard", 20000);
 
     /**
      * [3.10.1/3.11.0] 修補的**時間**預算（毫秒），**預設 0＝停用**（3.8.0 沒有時間維度）。
      * 用 0 停用而不是「設一個很大的值」——{@code ms * 1_000_000} 在極大值會溢位成負數，
      * 反而變成每次都超時。要啟用建議 200（＝4 個 tick，命中即為可感知卡頓）。
      */
-    private static final long gtocraftfix$REPAIR_BUDGET_MS = Long.getLong("gtodiag.repairBudgetMs", 0L);
+    private static final long gtocraftfix$REPAIR_BUDGET_MS = Long.getLong("gtodiag.repairBudgetMs", 200L);
     private static final long gtocraftfix$REPAIR_BUDGET_NS = gtocraftfix$REPAIR_BUDGET_MS <= 0
             ? Long.MAX_VALUE
             : gtocraftfix$REPAIR_BUDGET_MS * 1_000_000L;
@@ -220,6 +244,85 @@ public abstract class CraftingServiceSyncMixin {
     private static final boolean gtocraftfix$REPAIR_FREEZE_PROBE =
             Boolean.getBoolean("gtodiag.repairFreezeProbe");
 
+    /**
+     * [3.11.1／B1] 缺口沖銷方向：{@code on}（預設，完整來源判定）／{@code clamp}（不分來源，但沖銷量
+     * 一律夾在 0 以上）／{@code off}（3.8.0 原樣，用於 A/B）。
+     * <p>病灶：只有「usedItems 幻影」的缺口才該把 usedItems 降下來（那筆 usedItems 是網路給不出的謊報）；
+     * 其他來源（新增 runs 的輸入／最終產出短缺／循環自舉）從來沒把量加進 usedItems，照樣沖銷就會把
+     * usedItems **寫成負值**——KeyCounter.add 不擋負數、removeZeros 只刪 0、NetworkStorage.extract
+     * 對負量回 0，而 GTO 的 tryExtractInitialItemsIgnoreMissing 對負量連 waitingFor 都不掛
+     * → 該量在執行期無聲蒸發（計畫看起來補好了，實際少了一批料）。
+     */
+    private static final String gtocraftfix$REPAIR_DEFICIT_SRC =
+            System.getProperty("gtodiag.repairDeficitSrc", "on").trim().toLowerCase(java.util.Locale.ROOT);
+
+    /** [3.11.1／B1] 缺口來源標記（缺口元組第 4 欄）：來自 {@code missingItems}，可沖銷 missingItems。 */
+    private static final String gtocraftfix$SRC_MISSING = "missing";
+    /** [3.11.1／B1] 來源＝usedItems 幻影（網路給不出的謊報），**唯一**可沖銷 usedItems 的來源。 */
+    private static final String gtocraftfix$SRC_USED = "used";
+    /** [3.11.1／B1] 來源＝最終產出短缺（B2：沖銷 usedItems 會讓「加輪次」被自己抵銷成原地踏步）。 */
+    private static final String gtocraftfix$SRC_FINAL = "final";
+    /** [3.11.1／B1] 來源＝新增 runs 的輸入需求（從未加進 usedItems，不可沖銷）。 */
+    private static final String gtocraftfix$SRC_INPUT = "input";
+    /** [3.11.1／B1] 來源＝循環自舉（可執行性模擬猜的量，從未加進 usedItems，不可沖銷）。 */
+    private static final String gtocraftfix$SRC_BOOTSTRAP = "bootstrap";
+    /**
+     * [3.11.2／M4] 來源不明的哨兵：缺口元組沒帶第 4 欄（日後新增入列點漏標）時用它。
+     * <p>語意＝**什麼都不沖銷**（missingItems／usedItems 都不動）。原本預設值是 {@link #gtocraftfix$SRC_USED}，
+     * 等於「漏標一個入列點就靜默退回 B1 的病灶」——把沒加進 usedItems 的量從 usedItems 扣掉 → 寫成負值 →
+     * NetworkStorage.extract 對負量回 0、GTO 的 tryExtractInitialItemsIgnoreMissing 對負量連 waitingFor
+     * 都不掛 → 該批料在執行期無聲蒸發。改成「不沖銷」最多是多留一筆 usedItems（保守、可執行），
+     * 遇到時另印 WARN 讓人去補標，不會靜默壞掉。
+     */
+    private static final String gtocraftfix$SRC_UNKNOWN = "unknown";
+
+    /**
+     * [3.11.1／B6，3.11.2／M1 改預設 off] 外圈 4 輪跑滿仍有未解缺口時視為「修補沒做完」＝中止（整組還原）。
+     * <p>⚠ **預設 false**，理由（實證推導，勿再改回 true）：外圈 {@code while} 只有兩種出口
+     * ——(a) 缺口清空，(b) guard／runCap／時間預算耗盡，而 (b) 一定會設 {@code abortReason} 並 break。
+     * 因此「{@code abortReason == null} 且佇列非空」**只可能**發生在第 4 輪（{@code round == 3}）末尾：
+     * {@code findBootstrapDeficits} 又回報缺口、for 因 {@code round < 4} 結束。而自舉缺口一律是 soft
+     * （{@code Boolean.FALSE}），也就是說觸發集合 100% 是「所有硬缺口都已修好、只剩近似模擬的猜測」。
+     * 這種計畫被整組還原成**未修補的原計畫** → 幻影 usedItems 沒補 → IgnoreMissing 掛出永遠等不到的
+     * waitingFor → CPU 必凍，比不修更糟。而且 {@code findBootstrapDeficits} 只用 {@code poss[0]} 主變體
+     * 判斷，靠替代輸入滿足的樣板會被誤判成卡死、每輪回報同一筆 → 這是**確定性重現**，不是偶發。
+     * <p>開成 true 只適合 A/B 觀測；預設路徑改成「印一行 WARN，不設 abortReason、不還原」。
+     */
+    private static final boolean gtocraftfix$REPAIR_STRICT_ROUNDS =
+            Boolean.getBoolean("gtodiag.repairStrictRounds");
+
+    /**
+     * [3.11.1／B8] 修補新增輪次後，依比例把 {@code plan.bytes()} 調高（反射寫 final 欄位，作法同
+     * simulation 翻轉）。**預設 off**：findSuitableCraftingCPU 與 trySubmitJob 都是拿 bytes 比
+     * {@code cluster.getAvailableStorage()}，調高後原本擠得上小 CPU 的計畫會改吃 CPU_TOO_SMALL
+     * ——這是行為變化，要自己開才生效。
+     * <p>[3.11.2／M6a] 更正舊註解的事實錯誤：{@code javap} 證實 {@code appeng.crafting.CraftingPlan}
+     * 是 {@code public final class}（**不是 record**）、欄位是 {@code private final long bytes}，
+     * 而 JDK 21 對「非 record 的 final 實例欄位」在 {@code setAccessible(true)} 後**可寫**
+     * （只有 record 元件與靜態 final 才會擋）。所以這裡不存在「反射寫不進去所以沒事」的僥倖：
+     * 旗標一開，bytes 就一定會被改，CPU_TOO_SMALL 的行為變化**必然發生**。
+     */
+    private static final boolean gtocraftfix$REPAIR_UPDATE_BYTES =
+            Boolean.getBoolean("gtodiag.repairUpdateBytes");
+
+    /**
+     * [3.11.1／B9] 循環自舉模擬（可執行性模擬）的 pass 數上限，預設 20 萬。
+     * 回饋型配方會退化成每 pass 只前進 1 輪，而計畫合法可有數百萬輪、又跑在伺服器主緒
+     * → 單次提交可卡住數秒。超過上限即視為「無法判定」，回空清單（不補自舉缺口）。
+     */
+    private static final int gtocraftfix$BOOTSTRAP_MAX_PASS =
+            Integer.getInteger("gtodiag.bootstrapMaxPass", 200_000);
+
+    /**
+     * [3.11.1／B9，3.11.2／M7] 自舉模擬超上限的 WARN 去重鍵（成品 key 字串）。
+     * <p>原本是「全域只印一次」——第一個踩到的成品把額度用光，之後任何成品都靜音，而超上限＝
+     * 「本次跳過自舉補齊」是會影響計畫正確性的事實，必須看得到是**哪些**成品受影響。
+     * 改成每個成品 key 印一次；上限 128 筆即 clear（同 noPatternLogged 的作法，避免無限長大）。
+     * 方法是 static，故容器用 ConcurrentHashMap 的 key set（提交雖在伺服器主緒，但不假設）。
+     */
+    private static final Set<String> gtocraftfix$bootstrapCapLogged =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     /** [3.10.0] 修補中止已通知過的成品（聊天室去重）。 */
     private final Set<String> gtocraftfix$abortNotified = new HashSet<>();
 
@@ -233,7 +336,11 @@ public abstract class CraftingServiceSyncMixin {
                 + "(onAbort=" + gtocraftfix$REPAIR_BALANCE_ON_ABORT
                 + ",log=" + gtocraftfix$REPAIR_BALANCE_LOG + ")"
                 + " block=" + gtocraftfix$REPAIR_BLOCK
-                + " freezeProbe=" + gtocraftfix$REPAIR_FREEZE_PROBE;
+                + " freezeProbe=" + gtocraftfix$REPAIR_FREEZE_PROBE
+                + " deficitSrc=" + gtocraftfix$REPAIR_DEFICIT_SRC // [3.11.1]
+                + " strictRounds=" + gtocraftfix$REPAIR_STRICT_ROUNDS
+                + " updateBytes=" + gtocraftfix$REPAIR_UPDATE_BYTES
+                + " bootstrapMaxPass=" + gtocraftfix$BOOTSTRAP_MAX_PASS;
     }
 
     /** [3.8.0] 把 KeyCounter 倒回快照值（以差額回沖，KeyCounter.add 吃負數）。 */
@@ -249,6 +356,31 @@ public abstract class CraftingServiceSyncMixin {
             }
         }
         kc.removeZeros();
+    }
+
+    /**
+     * [3.11.1／B3] 把計畫的三本帳（patternTimes／usedItems／missingItems）整組倒回修補前的快照。
+     * 「正常中止路徑」與「catch(Throwable) 路徑」共用同一份還原，維持「全有全無」核心不變式
+     * ——半套計畫（輪次加了、輸入沒補）＝必凍，比不修更糟。快照為 null（還沒留底就出事）時不動。
+     */
+    private static void gtocraftfix$restorePlan(Map<IPatternDetails, Long> pt,
+                                                appeng.api.stacks.KeyCounter used,
+                                                appeng.api.stacks.KeyCounter missing,
+                                                Map<IPatternDetails, Long> snapPt,
+                                                Map<AEKey, Long> snapUsed,
+                                                Map<AEKey, Long> snapMissing) {
+        if (pt != null && snapPt != null) {
+            pt.keySet().removeIf(k -> !snapPt.containsKey(k));
+            for (var e : snapPt.entrySet()) {
+                pt.put(e.getKey(), e.getValue());
+            }
+        }
+        if (used != null && snapUsed != null) {
+            gtocraftfix$restoreCounter(used, snapUsed);
+        }
+        if (missing != null && snapMissing != null) {
+            gtocraftfix$restoreCounter(missing, snapMissing);
+        }
     }
 
     /** [3.6.0] 逐輪記帳快照：cluster → {job, 樣板→剩餘輪數, key→CPU庫存, key→在途}。 */
@@ -843,16 +975,42 @@ public abstract class CraftingServiceSyncMixin {
             }
         }
         boolean blockSubmit = false;
+        // [3.11.1／B3] 計畫三本帳的參照與修補前快照**宣告在 try 之外**：原本宣告在 try 內部，
+        // catch(Throwable) 看不到 → 例外時直接送出半套計畫（輪次加了、輸入沒補）＝必凍。
+        Map<IPatternDetails, Long> pt = null;
+        appeng.api.stacks.KeyCounter used = null;
+        appeng.api.stacks.KeyCounter missing = null;
+        Map<IPatternDetails, Long> snapPt = null;
+        Map<AEKey, Long> snapUsed = null;
+        Map<AEKey, Long> snapMissing = null;
+        // [3.11.1／B5，3.11.2／M2 收斂] 中止路徑改成旗標 fall-through 到方法尾端的統一出口，
+        // 但**只在擋單旗標為 on/force 時才 fall-through**：預設 off 必須維持 3.8.0 的「中止即 return」，
+        // 否則 SLIM=false 的建置會在中止後多走尾端的 blockSubmit／退化計畫兩道拒單 → 機器每 2 秒重試
+        // 被擋（3.10.0 那次退步的形狀），而且完全不受 repairBlockOnAbort 控制。詳見中止區塊內註解。
+        boolean aborted = false;
+        // [3.11.2／M6b] resultSet 只是**防禦性**旗標：mixin 0.8.7 對 cancellable=true 的 @Inject，
+        // CallbackInfoReturnable.setReturnValue 是冪等的（重複呼叫不會拋 CancellationException——
+        // 那是 cancellable=false 時呼叫 cancel/setReturnValue 才有的事）。保留它是為了語意清楚：
+        // 一次提交只由一個判斷決定回傳值，後面的判斷不覆寫前面的。
+        boolean resultSet = false;
+        // [3.11.2／M3] 修補是否已「成功走完」：catch(Throwable) 只在**尚未成功**時才整組還原。
+        // 病灶：try 內從「修補成功」到方法結束之間還有數段不在自家 try 裡的程式碼（B2 最終產出驗證、
+        // 配平段、removeZeros、log、bytes／sim 反射），其中任何一句拋例外，原本的無條件還原都會把
+        // **已經修好的計畫**倒回幻影計畫（＝必凍），比不修更糟。
+        boolean repairDone = false;
+        boolean snapReady = false; // [3.11.2／X5] 三份快照都填完才可以拿去還原
         try {
             var storage = grid.getStorageService().getInventory();
-            var used = plan.usedItems();
-            var missing = plan.missingItems();
-            var pt = plan.patternTimes(); // 同一個可變 map（Object2LongOpenHashMap）
+            used = plan.usedItems();
+            missing = plan.missingItems();
+            pt = plan.patternTimes(); // 同一個可變 map（Object2LongOpenHashMap）
 
             // 可用量帳本：avail=實際可取（SIMULATE），reserved=本計畫已預定
             Map<AEKey, Long> avail = new HashMap<>();
             Map<AEKey, Long> reserved = new HashMap<>();
-            var deficits = new ArrayDeque<Object[]>(); // {AEKey, Long short}
+            // [3.11.1／B1] 缺口元組＝{AEKey, Long 短缺量, Boolean hard, String 來源}；
+            // 第 4 欄的來源決定「這筆缺口可以沖銷哪一本帳」（只有 SRC_USED 能降 usedItems）。
+            var deficits = new ArrayDeque<Object[]>();
 
             // ① missingItems：算料器標「缺」的量——有樣板就能補排（sim 計畫的病灶）。
             //    機器源的 sim 計畫會被 submitJob 守衛靜默拒單（玩家反而放行），全補完就把 sim 翻回 false。
@@ -860,10 +1018,10 @@ public abstract class CraftingServiceSyncMixin {
                 var key = e.getKey();
                 long want = e.getLongValue();
                 if (want > 0) {
-                    deficits.add(new Object[] { key, want, Boolean.TRUE });
+                    deficits.add(new Object[] { key, want, Boolean.TRUE, gtocraftfix$SRC_MISSING });
                 }
             }
-            // ② usedItems 超出實際可取的幻影缺口
+            // ② usedItems 超出實際可取的幻影缺口（**唯一**該把 usedItems 降下來的來源：那筆量是謊報）
             for (var e : used) {
                 var key = e.getKey();
                 long want = e.getLongValue();
@@ -871,7 +1029,7 @@ public abstract class CraftingServiceSyncMixin {
                         k -> storage.extract(k, Long.MAX_VALUE / 2, Actionable.SIMULATE, src));
                 long take = Math.min(want, a - reserved.getOrDefault(key, 0L));
                 if (take < want) {
-                    deficits.add(new Object[] { key, want - take, Boolean.TRUE });
+                    deficits.add(new Object[] { key, want - take, Boolean.TRUE, gtocraftfix$SRC_USED });
                 }
                 reserved.merge(key, Math.max(0, take), Long::sum);
             }
@@ -893,7 +1051,9 @@ public abstract class CraftingServiceSyncMixin {
                 }
                 long needOut = plan.finalOutput().amount() - supply;
                 if (needOut > 0) {
-                    deficits.add(new Object[] { outKey, needOut, Boolean.TRUE });
+                    // [3.11.1／B2] 標 SRC_FINAL：這筆缺口從沒加進 usedItems，沖銷它等於「加了輪次
+                    // 又從 usedItems 扣掉等量」＝供給原地踏步（自我抵銷），下方沖銷段一律不碰。
+                    deficits.add(new Object[] { outKey, needOut, Boolean.TRUE, gtocraftfix$SRC_FINAL });
                     if (gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
                         LOG.info("[craftfix] 最終產出短缺 {} x{}（out={}）", outKey, needOut, plan.finalOutput());
                     }
@@ -909,15 +1069,22 @@ public abstract class CraftingServiceSyncMixin {
             String abortReason = null;
             StringBuilder note = new StringBuilder();
             // [3.8.0] 修補前留底：修不完整就整組還原——半套計畫（輪次加了、輸入沒補）＝必凍，比不修更糟
-            var snapPt = new HashMap<>(pt);
-            var snapUsed = new HashMap<AEKey, Long>();
+            // [3.11.1／B3] 三個快照的**宣告**已上移到 try 之外，這裡只負責填值（catch 才看得到）
+            // [3.11.2／X5] 三份快照要「全部填完」才算可用：填 snapUsed 的迴圈中途拋例外時，
+            // 用半份快照回沖會把不在快照裡的 usedItems 全部歸零（delta = 0 - 現值），等於清掉取料清單。
+            snapReady = false;
+            snapPt = new HashMap<>(pt);
+            var snapUsed0 = new HashMap<AEKey, Long>();
             for (var e : used) {
-                snapUsed.put(e.getKey(), e.getLongValue());
+                snapUsed0.put(e.getKey(), e.getLongValue());
             }
-            var snapMissing = new HashMap<AEKey, Long>();
+            var snapMissing0 = new HashMap<AEKey, Long>();
             for (var e : missing) {
-                snapMissing.put(e.getKey(), e.getLongValue());
+                snapMissing0.put(e.getKey(), e.getLongValue());
             }
+            snapUsed = snapUsed0;
+            snapMissing = snapMissing0;
+            snapReady = true;
             var finalKey = plan.finalOutput() == null ? null : plan.finalOutput().what();
             // 外圈：解缺口 → 可執行性模擬（抓循環自舉缺口）→ 再解，最多 4 輪
             long t0 = System.nanoTime();
@@ -934,6 +1101,20 @@ public abstract class CraftingServiceSyncMixin {
                 long shortAmt = (Long) d[1];
                 // hard=真實記帳缺口（missing/usedItems/最終產出/新增輸入）；自舉猜測（近似模擬）為 soft
                 boolean hard = d.length > 2 && Boolean.TRUE.equals(d[2]);
+                // [3.11.1／B1] 來源（第 4 欄）：決定下方沖銷哪一本帳。
+                // [3.11.2／M4] 讀不到來源的預設值從 SRC_USED 改成 SRC_UNKNOWN（＝什麼都不沖銷）：
+                // 舊預設等於「日後任何入列點漏標，就靜默退回 B1 的病灶」——把沒進過 usedItems 的量
+                // 從 usedItems 扣成負值 → 執行期無聲蒸發。不沖銷最壞只是多留一筆 usedItems（保守），
+                // 並另印 WARN 指出是哪個 key，讓漏標當場曝光而不是變成隱性錯帳。
+                String srcTag = gtocraftfix$SRC_UNKNOWN;
+                if (d.length > 3 && d[3] instanceof String) {
+                    srcTag = (String) d[3];
+                }
+                if (gtocraftfix$SRC_UNKNOWN.equals(srcTag)
+                        && gtocraftfix$srcUnknownLog.incrementAndGet() <= 5) {
+                    LOG.warn("[craftfix] 缺口來源未標記（視為 UNKNOWN → 不沖銷任何一本帳）：{} x{} out={}"
+                            + "（請補上缺口入列點的第 4 欄來源）", key, shortAmt, plan.finalOutput());
+                }
 
                 // [3.9.0，3.11.0 起預設關閉 `-Dgtodiag.repairNetSpot=true` 開啟]
                 // 先拿網路現貨：缺的量網路有就直接記進 usedItems（開局一次取進 CPU），比排樣板便宜也即時。
@@ -1008,7 +1189,9 @@ public abstract class CraftingServiceSyncMixin {
                         var server = grid.getPivot() != null && grid.getPivot().getLevel() != null
                                 ? grid.getPivot().getLevel().getServer()
                                 : null;
-                        if (server != null) {
+                        // [3.11.1／B3] finalOutput() 可能為 null（同方法他處都判過，只有這裡沒判），
+                        // 下面直接 .what().getDisplayName() 是實際可達的 NPE → 補判斷。
+                        if (server != null && plan.finalOutput() != null) {
                             server.getPlayerList().broadcastSystemMessage(
                                     net.minecraft.network.chat.Component.literal("[合成修復] 缺料且無樣板可做：")
                                             .append(key.getDisplayName())
@@ -1029,13 +1212,31 @@ public abstract class CraftingServiceSyncMixin {
                     break;
                 }
                 pt.merge(pat, runs, Long::sum);
-                // 缺口來源：先沖銷 missingItems（sim 計畫的缺），剩下沖銷 usedItems（幻影引用）
-                long fromMissing = Math.min(shortAmt, Math.max(0, missing.get(key)));
-                if (fromMissing > 0) {
-                    missing.add(key, -fromMissing);
+                // [3.11.1／B1+B2] 缺口沖銷：**只有 SRC_USED（usedItems 幻影）才可以降 usedItems**——
+                // 那筆 usedItems 是網路給不出的謊報，降下來才對得上帳；其他來源（SRC_FINAL 最終產出短缺、
+                // SRC_INPUT 新增 runs 的輸入、SRC_BOOTSTRAP 循環自舉）從來沒把量加進 usedItems，
+                // 照樣沖銷就會把 usedItems 寫成負值 → 執行期無聲蒸發（且 SRC_FINAL 還會自我抵銷：
+                // 加了輪次又扣掉等量供給，等於原地踏步）。沖銷量一律 clamp 在 0 以上。
+                // 旗標 -Dgtodiag.repairDeficitSrc：on（預設）／clamp（不分來源只防負值）／off（3.8.0 原樣）。
+                boolean srcOn = "on".equals(gtocraftfix$REPAIR_DEFICIT_SRC);
+                boolean srcOff = "off".equals(gtocraftfix$REPAIR_DEFICIT_SRC);
+                // [3.11.2／M4] UNKNOWN＝來源不明 → 兩本帳都不動（連 clamp/off 的 A/B 模式也不例外：
+                // 那兩個模式是「不分來源」的實驗值，前提是缺口確實有來源；來源根本讀不到時，
+                // 唯一安全的選擇是不沖銷。現行四個入列點都有標來源，這條路只會在日後漏標時走到）。
+                boolean srcUnknown = gtocraftfix$SRC_UNKNOWN.equals(srcTag);
+                long rest = shortAmt;
+                if (!srcUnknown && (!srcOn || gtocraftfix$SRC_MISSING.equals(srcTag))) {
+                    long fromMissing = Math.min(rest, Math.max(0, missing.get(key)));
+                    if (fromMissing > 0) {
+                        missing.add(key, -fromMissing);
+                        rest -= fromMissing;
+                    }
                 }
-                if (shortAmt - fromMissing > 0) {
-                    used.add(key, -(shortAmt - fromMissing));
+                if (rest > 0 && !srcUnknown && (!srcOn || gtocraftfix$SRC_USED.equals(srcTag))) {
+                    long fromUsed = srcOff ? rest : Math.min(rest, Math.max(0, used.get(key)));
+                    if (fromUsed > 0) {
+                        used.add(key, -fromUsed);
+                    }
                 }
                 repaired++;
                 if (repaired <= 8) {
@@ -1060,7 +1261,9 @@ public abstract class CraftingServiceSyncMixin {
                         reserved.merge(inKey, fromNet, Long::sum);
                     }
                     if (need - fromNet > 0) {
-                        deficits.add(new Object[] { inKey, need - fromNet, Boolean.TRUE });
+                        // [3.11.1／B1] SRC_INPUT：新增 runs 的輸入需求，從未加進 usedItems → 不可沖銷
+                        deficits.add(new Object[] { inKey, need - fromNet, Boolean.TRUE,
+                                gtocraftfix$SRC_INPUT });
                     }
                 }
             }
@@ -1086,6 +1289,71 @@ public abstract class CraftingServiceSyncMixin {
                 break;
             }
             }
+            // [3.11.1／B6，3.11.2／M1 改成預設只記錄] 外圈 4 輪跑滿仍有缺口。
+            // 推導（見 REPAIR_STRICT_ROUNDS 的 javadoc）：內圈 while 只有「缺口清空」與「guard／runCap／
+            // 時間預算耗盡（已設 abortReason 並 break）」兩種出口，所以走到這裡且 abortReason==null
+            // ⇒ 必然是第 4 輪末尾 findBootstrapDeficits 又回報缺口 ⇒ **殘留的一定是 soft 自舉猜測**、
+            // 所有硬缺口都已修好。把這種計畫整組還原成未修補的原計畫＝幻影 usedItems 沒補 →
+            // IgnoreMissing 掛出永遠等不到的 waitingFor → 必凍；而 findBootstrapDeficits 只看
+            // poss[0] 主變體，靠替代輸入滿足的樣板會被誤判、每輪回報同一筆 → 確定性重現。
+            // 故預設**只印一行 WARN**（不設 abortReason、不還原）；要嚴格中止請自己開旗標 A/B。
+            if (abortReason == null && !deficits.isEmpty()) {
+                boolean allSoft = true;
+                for (var d : deficits) {
+                    if (d.length > 2 && Boolean.TRUE.equals(d[2])) {
+                        allSoft = false;
+                        break;
+                    }
+                }
+                if (gtocraftfix$REPAIR_STRICT_ROUNDS) {
+                    abortReason = "外圈 4 輪仍有未解缺口（剩 " + deficits.size() + " 項"
+                            + (allSoft ? "、全為 soft" : "、含 hard") + "）";
+                } else if (gtocraftfix$repairNoteLog.incrementAndGet() <= gtocraftfix$NOTE_LOG_MAX) {
+                    LOG.warn("[craftfix] 外圈 4 輪後仍有殘留缺口：剩 {} 項（{}）→ 照送已修好的計畫"
+                            + "（預設不還原：還原成原計畫才是必凍）out={}",
+                            deficits.size(),
+                            allSoft ? "全為 soft＝近似模擬的自舉猜測" : "含 hard 缺口，請查 log 上文",
+                            plan.finalOutput());
+                }
+            }
+            // [3.11.2／X1] **repairDone 必須在這裡設**，不能等到 try 的最後一行——
+            // 那樣 catch 內恆為 false，整個「例外時不要倒掉修好的計畫」機制就是死碼。
+            // 走到這裡代表：外圈已收斂、abortReason 為 null ＝ pt/used/missing 已是修好的狀態。
+            // 之後的每一段（B2 驗證、配平觀測、removeZeros、log、sim 翻轉）都不改變修補結論，
+            // 任何一段拋例外都不該讓計畫被倒回幻影狀態。
+            if (abortReason == null) {
+                repairDone = true;
+            }
+            // [3.11.1／B2] 最終產出驗證：排定產出 ＋ usedItems ＋ emittedItems 必須 ≥ 需求量。
+            // 只印 WARN、**不自動再補**（再補會回到「加輪次 → 新輸入缺口 → 再補」的遞迴發散）。
+            // [3.11.2／M3] 自己包一層 try/catch：這段是**純觀測**，卻位在「修補已成功」之後、
+            // 外層 catch 的還原範圍之內——任何一句拋例外都會把修好的計畫倒回幻影計畫。
+            // [3.11.2／M5] 額度改用獨立的 finalCheckLog，不再吃 balLog（避免燒掉 3.8.0 就有的診斷）。
+            if (abortReason == null && finalKey != null && plan.finalOutput() != null) {
+                try {
+                    long outSupply = used.get(finalKey) + plan.emittedItems().get(finalKey);
+                    for (var en : pt.entrySet()) {
+                        Long r2 = en.getValue();
+                        if (r2 == null || r2 <= 0) {
+                            continue;
+                        }
+                        for (var o : en.getKey().getOutputs()) {
+                            if (finalKey.equals(o.what())) {
+                                outSupply += o.amount() * r2;
+                            }
+                        }
+                    }
+                    if (outSupply < plan.finalOutput().amount()
+                            && gtocraftfix$finalCheckLog.incrementAndGet() <= gtocraftfix$FINAL_CHECK_LOG_MAX) {
+                        LOG.warn("[craftfix] 修補後最終產出仍不足：{} 供給{}/需求{}（不自動再補，避免遞迴）out={}",
+                                finalKey, outSupply, plan.finalOutput().amount(), plan.finalOutput());
+                    }
+                } catch (Throwable t2) {
+                    if (gtocraftfix$finalCheckLog.incrementAndGet() <= 5) {
+                        LOG.warn("[craftfix] 最終產出驗證失敗（純觀測，不影響計畫）：{}", t2.toString());
+                    }
+                }
+            }
             // [3.9.1] 第五維：內部配平**只做網路現貨補齊**，一趟做完、不排樣板、不遞迴。
             // 3.9.0 曾把配平缺口丟回缺口佇列（＝補樣板輪次），結果遞迴發散：實測 LUV 電路的缺口
             // 6 輪後從 glowstone 147456 膨脹到 3833856，計畫被灌大且仍不平，交付量從 466/500 掉到 8/500。
@@ -1095,12 +1363,8 @@ public abstract class CraftingServiceSyncMixin {
             // [3.8.0] 修補不完整 → 整組還原成修補前的計畫（寧可被拒單重試，也不交半套計畫）。
             // [3.10.2] 還原必須在配平補齊**之前**做，否則補進 usedItems 的現貨會被還原一起洗掉。
             if (abortReason != null) {
-                pt.keySet().removeIf(k -> !snapPt.containsKey(k));
-                for (var e : snapPt.entrySet()) {
-                    pt.put(e.getKey(), e.getValue());
-                }
-                gtocraftfix$restoreCounter(used, snapUsed);
-                gtocraftfix$restoreCounter(missing, snapMissing);
+                // [3.11.1／B3] 還原抽成共用私有方法，與 catch(Throwable) 路徑走同一份程式碼
+                gtocraftfix$restorePlan(pt, used, missing, snapPt, snapUsed, snapMissing);
             }
             // ---- 第五維：內部配平（[3.9.1] 補齊、[3.10.2] 中止也做、[3.11.0] 全部改成旗標）----
             // apply=真的把缺口用網路現貨補進 usedItems（`-Dgtodiag.repairBalance=true`）；
@@ -1147,7 +1411,11 @@ public abstract class CraftingServiceSyncMixin {
                         miss.append(bk).append(" x").append(need - take1).append("; ");
                     }
                 }
-                if ((filled > 0 || mn > 0) && gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
+                // [3.11.2／M5] 配平觀測是每次提交都可能印的新訊息，額度改走獨立的 balanceLog：
+                // 原本共用 balLog 會把「開單即缺／最終產出短缺／循環自舉缺口／計畫修補」這些
+                // 3.8.0 時代就有的診斷提前燒到靜音。
+                if ((filled > 0 || mn > 0)
+                        && gtocraftfix$balanceLog.incrementAndGet() <= gtocraftfix$BALANCE_LOG_MAX) {
                     LOG.info("[craftfix] 內部配平 out={} {}{}", plan.finalOutput(),
                             balApply ? "網路補齊" + filled + "單位" : "（只觀測，未補齊）",
                             mn == 0 ? "（帳已平）" : "；仍缺：" + miss);
@@ -1211,9 +1479,10 @@ public abstract class CraftingServiceSyncMixin {
                                                 : "照原樣送出",
                         left, plan.finalOutput());
                 if (doBlock && machineSrc2 && willFreeze) {
-                    String sig2 = "abort|" + plan.finalOutput().what();
                     // [3.11.0] 廣播另開旗標：這是對**全伺服器所有玩家**送訊息，多人環境會洗頻
-                    if (gtocraftfix$REPAIR_ABORT_BROADCAST && gtocraftfix$abortNotified.add(sig2)) {
+                    // [3.11.1] finalOutput 可能為 null → 去重鍵與廣播都先判斷（擋單本身不受影響）
+                    if (gtocraftfix$REPAIR_ABORT_BROADCAST && plan.finalOutput() != null
+                            && gtocraftfix$abortNotified.add("abort|" + plan.finalOutput().what())) {
                         if (gtocraftfix$abortNotified.size() > 128) {
                             gtocraftfix$abortNotified.clear();
                         }
@@ -1230,58 +1499,156 @@ public abstract class CraftingServiceSyncMixin {
                         }
                     }
                     cir.setReturnValue(appeng.crafting.execution.CraftingSubmitResult.INCOMPLETE_PLAN);
+                    resultSet = true;
                 }
-                return;
-            }
-            used.removeZeros();
-            missing.removeZeros();
-            if (repaired > 0 && gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
-                LOG.info("[craftfix] 計畫修補 out={} 補{}項/新增{}輪：{}",
-                        plan.finalOutput(), repaired, addedRuns, note);
-            }
-            // sim 計畫的缺全補齊 → 翻回可執行，machine+sim 守衛不再靜默拒單（手動能、自動不能的分歧點）
-            if (plan.simulation() && missing.size() == 0) {
-                try {
-                    var f = CraftingPlan.class.getDeclaredField("simulation");
-                    f.setAccessible(true);
-                    f.setBoolean(plan, false);
-                    int c = gtocraftfix$sitterLog.incrementAndGet();
-                    if (c <= 200) {
-                        LOG.info("[craftfix] 計畫修補 sim→可執行 out={}", plan.finalOutput());
+                // [3.11.1／B5 → 3.11.2／M2] fall-through **只在擋單旗標開著時**才做。
+                // 實證：3.8.0 在這裡是直接 return，方法尾端的 blockSubmit（真缺料守衛）與退化計畫拒單
+                // 在「修補中止」時**永遠碰不到**。B5 改成無條件 fall-through 後，SLIM=false 的建置
+                // 會在中止後多走那兩道拒單 → 機器每 2 秒重試都被擋，正是 3.10.0 那次退步的形狀，
+                // 而且完全不受 repairBlockOnAbort 控制（等於偷偷把擋單預設打開）。
+                // 規則：off（預設）＝行為等同 3.8.0，直接 return；on/force＝才 fall-through 到統一出口
+                //（SLIM 例外語意由尾端自行維持：slim 只修計畫、不擋單）。
+                boolean blockCfg = "on".equals(gtocraftfix$REPAIR_BLOCK)
+                        || "force".equals(gtocraftfix$REPAIR_BLOCK);
+                // [3.11.2／X4] 再加一道 machineSrc2：force ＋ 玩家源時，上面的 WARN 印「玩家路徑照原樣送出」
+                // 卻 fall-through 到尾端拒單（SLIM=false 建置），log 與實際行為相反。玩家源一律 return。
+                if (!blockCfg || !machineSrc2) {
+                    // 不吞掉「真缺料」這件事：本次若曾判定過硬缺口無樣板可補，明說守衛被略過的理由。
+                    if (blockSubmit
+                            && gtocraftfix$repairNoteLog.incrementAndGet() <= gtocraftfix$NOTE_LOG_MAX) {
+                        LOG.info("[craftfix] 真缺料守衛因修補中止而略過（3.8.0 行為；"
+                                + "要在中止後擋單請設 -Dgtodiag.repairBlockOnAbort=on/force）out={}",
+                                plan.finalOutput());
                     }
-                } catch (Throwable t) {
-                    int c = gtocraftfix$sitterLog.incrementAndGet();
-                    if (c <= 5) {
-                        LOG.warn("[craftfix] sim 旗標翻轉失敗（維持原行為）：{}", t.toString());
+                    return;
+                }
+                aborted = true;
+            }
+            if (!aborted) {
+                used.removeZeros();
+                missing.removeZeros();
+                if (repaired > 0 && gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
+                    LOG.info("[craftfix] 計畫修補 out={} 補{}項/新增{}輪：{}",
+                            plan.finalOutput(), repaired, addedRuns, note);
+                }
+                // [3.11.1／B8] 修補新增輪次後同步調高 plan.bytes()（預設關閉）。findSuitableCraftingCPU
+                // 與 trySubmitJob 都是拿 bytes 比 cluster.getAvailableStorage()，而 bytes 是 CraftingPlan
+                // 的 private final 欄位、修補全程沒動 → 「計畫過大 GTO 會自己拒絕」這道保護從未觸發。
+                // 反射寫法比照下方 simulation 翻轉。
+                // [3.11.2／M6a] 事實更正：javap 證實 CraftingPlan 是 `public final class`（**不是 record**）、
+                // 欄位是 `private final long bytes`，JDK 21 對非 record 的 final 實例欄位在 setAccessible 後
+                // **可寫**。所以開啟這個旗標時 bytes 一定寫得進去，CPU_TOO_SMALL 的行為變化是必然發生
+                // ——不能靠「反射大概會失敗」當安全網；下方 catch 只涵蓋真正的意外（安全管理員等）。
+                if (gtocraftfix$REPAIR_UPDATE_BYTES && addedRuns > 0) {
+                    try {
+                        long baseRuns = 0;
+                        for (var v : snapPt.values()) {
+                            if (v != null && v > 0) {
+                                baseRuns += v;
+                            }
+                        }
+                        long nowRuns = 0;
+                        for (var v : pt.values()) {
+                            if (v != null && v > 0) {
+                                nowRuns += v;
+                            }
+                        }
+                        long oldBytes = plan.bytes();
+                        if (baseRuns > 0 && nowRuns > baseRuns && oldBytes > 0) {
+                            double ratio = (double) nowRuns / (double) baseRuns;
+                            double scaled = Math.ceil(oldBytes * ratio);
+                            long newBytes = scaled >= (double) Long.MAX_VALUE
+                                    ? Long.MAX_VALUE
+                                    : Math.max(oldBytes, (long) scaled);
+                            var fb = CraftingPlan.class.getDeclaredField("bytes");
+                            fb.setAccessible(true);
+                            fb.setLong(plan, newBytes);
+                            int c = gtocraftfix$sitterLog.incrementAndGet();
+                            if (c <= 200) {
+                                LOG.info("[craftfix] 計畫修補 bytes {}→{}（輪數 {}→{}）out={}",
+                                        oldBytes, newBytes, baseRuns, nowRuns, plan.finalOutput());
+                            }
+                        }
+                    } catch (Throwable t) {
+                        int c = gtocraftfix$sitterLog.incrementAndGet();
+                        if (c <= 5) {
+                            LOG.warn("[craftfix] bytes 調整失敗（維持原值）：{}", t.toString());
+                        }
                     }
                 }
+                // sim 計畫的缺全補齊 → 翻回可執行，machine+sim 守衛不再靜默拒單（手動能、自動不能的分歧點）
+                if (plan.simulation() && missing.size() == 0) {
+                    try {
+                        var f = CraftingPlan.class.getDeclaredField("simulation");
+                        f.setAccessible(true);
+                        f.setBoolean(plan, false);
+                        int c = gtocraftfix$sitterLog.incrementAndGet();
+                        if (c <= 200) {
+                            LOG.info("[craftfix] 計畫修補 sim→可執行 out={}", plan.finalOutput());
+                        }
+                    } catch (Throwable t) {
+                        int c = gtocraftfix$sitterLog.incrementAndGet();
+                        if (c <= 5) {
+                            LOG.warn("[craftfix] sim 旗標翻轉失敗（維持原行為）：{}", t.toString());
+                        }
+                    }
+                }
+                // [3.11.2／X1] repairDone 已在外圈收斂處（abortReason==null 當下）設好，這裡不再重設——
+                // 設在這裡等於是 try 的最後一行，catch 內永遠讀到 false，機制形同死碼。
             }
         } catch (Throwable t) {
+            // [3.11.1／B3] 例外也要整組還原：原本只記 log 就放行，等於把「輪次加了、輸入沒補」的
+            // 半套計畫送出去（必凍），違反「全有全無」核心不變式。與正常中止路徑共用同一份還原。
+            // [3.11.2／M3] 但**只在修補尚未成功收尾時**還原：try 內「修補成功」之後仍有數段不在
+            // 自家 try 裡的程式碼（B2 最終產出驗證、配平段、removeZeros、log、bytes／sim 反射），
+            // 無條件還原會把已經修好的計畫倒回幻影計畫。repairDone=true 之後只記 log。
+            if (!repairDone && snapReady) {
+                try {
+                    gtocraftfix$restorePlan(pt, used, missing, snapPt, snapUsed, snapMissing);
+                    if (snapPt != null) {
+                        LOG.warn("[craftfix] 計畫修補例外 → **已整組還原成原計畫**（避免送出半套計畫）");
+                    }
+                } catch (Throwable t2) {
+                    LOG.error("[craftfix] 計畫修補例外後還原失敗（計畫可能已被改到一半）", t2);
+                }
+            }
             int c = gtocraftfix$sitterLog.incrementAndGet();
             if (c <= 5) {
-                LOG.error("[craftfix] 計畫修補例外（放行原計畫）", t);
+                LOG.error("[craftfix] 計畫修補例外（{}）",
+                        repairDone ? "修補已完成，保留修好的計畫、不還原" : "放行原計畫", t);
             }
         }
         // 真缺料（無樣板可補的硬缺口）→ 擋下提交：提交了必凍。機器每 2 秒重試（聊天室/log 已去重）；
         // 玩家按確認會沒反應，但聊天室已說明缺什麼。
+        // [3.11.1／B5 → 3.11.2／M2] 中止路徑**只有在 repairBlockOnAbort=on/force 時**才 fall-through
+        // 到這裡（預設 off 已在中止區塊直接 return＝3.8.0 行為），所以擋單前先看 resultSet。
+        // [3.11.2／M6b] 事實更正：mixin 0.8.7 對 cancellable=true 的 @Inject，setReturnValue 是**冪等**的
+        // （不會拋 CancellationException——那是 cancellable=false 時呼叫才有的事），resultSet 純屬防禦性
+        // 寫法／語意宣告：一次提交的回傳值只由最先判定的那個守衛決定。SLIM 例外語意維持不變。
         if (blockSubmit) {
             if (gtocraftfix$SLIM) {
                 return; // [slim 3.3.0] 只修計畫不擋單：真缺料照樣提交（log/聊天已點名）
             }
-            cir.setReturnValue(appeng.crafting.execution.CraftingSubmitResult.INCOMPLETE_PLAN);
+            if (!resultSet) {
+                cir.setReturnValue(appeng.crafting.execution.CraftingSubmitResult.INCOMPLETE_PLAN);
+                resultSet = true;
+            }
             return;
         }
         // 機器源退化計畫（修補後仍無任何合成任務）→ 拒單。GTO 沒有「開局吸入的現貨交給 link」
         // 的步驟，這種 job 會抱著現貨永凍（實測 NAND 625）。拒掉後接口下一輪 acquireFromNetwork
         // 會自己拉現貨，自然收斂。
-        if (src.player().isEmpty() && plan.patternTimes().isEmpty()) {
+        // [3.11.1／B5] src 補 null 判斷：中止路徑改成 fall-through 後這行才會在「中止」時被走到，
+        // 而上方必凍探針早就寫著 src 可能為 null（原本 return 掉所以碰不到）。
+        if (src != null && src.player().isEmpty() && plan.patternTimes().isEmpty()) {
             int c = gtocraftfix$sitterLog.incrementAndGet();
             if (c <= 200) {
                 LOG.warn("[craftfix] 退化計畫（無合成任務）out={}{}", plan.finalOutput(),
                         gtocraftfix$SLIM ? "（slim：不拒單，僅紀錄）" : "→ 拒收");
             }
-            if (!gtocraftfix$SLIM) { // [slim 3.3.0] 只修計畫不擋單
+            if (!gtocraftfix$SLIM && !resultSet) { // [slim 3.3.0] 只修計畫不擋單
                 cir.setReturnValue(appeng.crafting.execution.CraftingSubmitResult.INCOMPLETE_PLAN);
+                resultSet = true;
             }
         }
     }
@@ -2042,6 +2409,9 @@ public abstract class CraftingServiceSyncMixin {
     /**
      * 可執行性模擬：以 usedItems 為起始庫存、逐輪執行可滿足輸入的樣板（主替代品近似）。
      * 回傳「卡死樣板中、庫存為 0 的輸入」各一輪 run 的量＝循環自舉缺口；可全部跑完則回空。
+     * <p>[3.11.1／B9] 加 pass 數上限（{@code -Dgtodiag.bootstrapMaxPass}，預設 20 萬）：本方法跑在
+     * **伺服器主緒**且不受修補的時間預算約束，而回饋型配方會退化成每 pass 只前進 1 輪、計畫又合法可有
+     * 數百萬輪 → 單次提交就能把主緒卡住數秒。超過上限＝視為無法判定，回空清單（不補自舉缺口）。
      */
     private static java.util.List<Object[]> gtocraftfix$findBootstrapDeficits(CraftingPlan plan) {
         var inv = new HashMap<AEKey, Long>();
@@ -2055,7 +2425,25 @@ public abstract class CraftingServiceSyncMixin {
             }
         });
         boolean progress = true;
+        int pass = 0; // [3.11.1／B9]
         while (progress && !remaining.isEmpty()) {
+            if (++pass > gtocraftfix$BOOTSTRAP_MAX_PASS) {
+                // [3.11.2／M7] 回空清單＝把「無法判定」當成「沒有缺口」，這是刻意的：改成中止會讓
+                // 整組還原（＝退回幻影計畫、必凍）更糟。但既然是會影響正確性的靜默跳過，log 就不能
+                // 「全域只印一次」——第一個踩到的成品會把之後所有成品都消音。改成**每個成品 key
+                // 印一次**（上限 128 筆即 clear，同 noPatternLogged 的作法），並在訊息裡明說跳過。
+                String capKey = String.valueOf(plan.finalOutput() == null ? "?" : plan.finalOutput().what());
+                if (gtocraftfix$bootstrapCapLogged.add(capKey)) {
+                    if (gtocraftfix$bootstrapCapLogged.size() > 128) {
+                        gtocraftfix$bootstrapCapLogged.clear();
+                    }
+                    LOG.warn("[craftfix] 循環自舉模擬超過 {} 趟上限（剩 {} 種樣板未跑完）→ 視為無法判定、"
+                            + "**本次跳過自舉補齊**（計畫照原樣送出，若真有自舉缺口仍可能卡住）"
+                            + " out={}（-Dgtodiag.bootstrapMaxPass 可調）",
+                            gtocraftfix$BOOTSTRAP_MAX_PASS, remaining.size(), plan.finalOutput());
+                }
+                return new java.util.ArrayList<>();
+            }
             progress = false;
             for (var it = remaining.entrySet().iterator(); it.hasNext();) {
                 var en = it.next();
@@ -2111,7 +2499,9 @@ public abstract class CraftingServiceSyncMixin {
                 var k = poss[0].what();
                 long per = poss[0].amount() * input.getMultiplier();
                 if (per > 0 && inv.getOrDefault(k, 0L) <= 0 && added.add(k)) {
-                    res.add(new Object[] { k, per }); // 補一輪 run 的量當自舉
+                    // 補一輪 run 的量當自舉；[3.11.1／B1] 第 3 欄 soft（近似模擬猜的量，語意同舊格式的
+                    // 「長度 2＝非 hard」）、第 4 欄 SRC_BOOTSTRAP（從未加進 usedItems → 不可沖銷）
+                    res.add(new Object[] { k, per, Boolean.FALSE, gtocraftfix$SRC_BOOTSTRAP });
                 }
             }
         }
