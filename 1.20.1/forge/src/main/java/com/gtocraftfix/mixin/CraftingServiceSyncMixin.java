@@ -211,6 +211,22 @@ public abstract class CraftingServiceSyncMixin {
      */
     private static final long gtocraftfix$REPAIR_RUN_CAP = Long.getLong("gtodiag.repairRunCap", 2_000_000L);
 
+    /**
+     * [3.13.0] 修補上限的**比例項**：實際上限 = min(runHardCap, max(runCap, 原計畫總輪數 × runFactor))。
+     * <p>病灶（3.12.0 實錄）：{@code universal_circuit_uhv x100} 的原計畫 1,119,456 輪，修補要新增
+     * 2,011,267 輪 → 只超過固定上限 200 萬的 **0.56%** 就整組還原、照原樣送出 → CPU 等 17 種
+     * 「網存 0 且無任務產它」的料，靜止 600 秒以上（＝必凍）。
+     * <p>固定常數的問題是它與計畫規模無關：小計畫的 200 萬形同無限，大計畫的 200 萬卻在正常修補量
+     * 就撞牆。改成「跟著原計畫規模縮放」＝同一個相對嚴格度適用所有尺寸；真正的**發散**護欄是
+     * {@code repairBudgetMs}（時間預算）與 {@code runHardCap}（絕對天花板），不是這條。
+     * <p>係數設 0 ＝停用比例項、退回純固定上限（3.8.0～3.12.0 行為）。
+     */
+    private static final long gtocraftfix$REPAIR_RUN_FACTOR = Long.getLong("gtodiag.repairRunFactor", 4L);
+
+    /** [3.13.0] 比例上限的絕對天花板：再大的計畫也不會讓修補超過這個新增輪數。 */
+    private static final long gtocraftfix$REPAIR_RUN_HARD_CAP =
+            Long.getLong("gtodiag.repairRunHardCap", 50_000_000L);
+
     /** [3.9.0/3.11.0] 缺口優先吃網路現貨（否則一律排樣板）。預設 **off**＝3.8.0 行為。 */
     private static final boolean gtocraftfix$REPAIR_NET_SPOT = Boolean.getBoolean("gtodiag.repairNetSpot");
 
@@ -326,6 +342,74 @@ public abstract class CraftingServiceSyncMixin {
     /** [3.10.0] 修補中止已通知過的成品（聊天室去重）。 */
     private final Set<String> gtocraftfix$abortNotified = new HashSet<>();
 
+    // ---------------------------------------------------------------- [3.13.0] 執行期救援
+
+    /**
+     * [3.13.0] 保母餵料（把網路現貨直接補進 CPU 的 waitingFor 缺口）。slim 分支自 2.x 起停用，
+     * 3.13.0 起**預設重新開啟**——但改成只餵「幻影 key」（見 {@link #gtocraftfix$FEED_PHANTOM_ONLY}）。
+     * <p>理由（3.12.0 實錄）：{@code gtocore:order} 卡在 {@code supercritical_steam 等78.5億／網2450億}
+     * ——CPU 等一個網路裡明明堆滿的東西，而沒有任何任務會產它（＝那筆 waitingFor 是執行期長出來的
+     * 幻影，永遠不會有機器送貨來銷帳）。這種缺口除了從網路直接餵，沒有別的解。
+     */
+    private static final boolean gtocraftfix$FEED =
+            !"false".equalsIgnoreCase(System.getProperty("gtodiag.sitterFeed", "true"));
+
+    /**
+     * [3.13.0] 餵料只針對**幻影 key**：沒有任何剩餘任務會產它，且沒有樣板正押在供應器上。
+     * <p>舊版（2.x）是無差別餵：任何 waitingFor 都從網路抓。那會把「機器 2 秒後就會送回來」的正常
+     * 在途料也搶先餵掉，機器回貨時 {@code insert} 已無額度可銷 → 貨彈回網路，帳雖不會少但整網空轉，
+     * 且會跟其他單搶料。加上這道指紋後，餵料只會發生在**證明不會有人送貨**的 key 上。
+     */
+    private static final boolean gtocraftfix$FEED_PHANTOM_ONLY =
+            !"false".equalsIgnoreCase(System.getProperty("gtodiag.sitterFeedPhantomOnly", "true"));
+
+    /**
+     * [3.13.0] 保母補輸入（把剩餘任務的輸入從網路補進 CPU 庫存）：**維持 slim 的停用狀態**。
+     * <p>這條跟餵料不同，它沒有 waitingFor 當額度上限，實測曾「把單一料的全網存量吸進一顆 CPU、
+     * 餓死其他單」（見 {@code gtodiag.topupRounds} 的註解）。三個實錄卡單都不需要它，故不預設開啟。
+     */
+    private static final boolean gtocraftfix$SITTER_TOPUP = Boolean.getBoolean("gtodiag.sitterTopUp");
+
+    /**
+     * [3.13.0] 卡死救援：對「證明等不到貨」且長時間零進度的 CPU 取消整張單。
+     * <p>這是最後一道，也是唯一能解「網路沒貨、計畫也沒排生產」的手段。取消會把 CPU 手上的半成品
+     * 全數退回網路 → 機器請求器 10 秒後自己重下、玩家單則需手動重下（會廣播一行聊天訊息）；
+     * 新計畫是拿**當下**的網路存量重算，剛退回的中間產物都算得到，通常會小很多也就做得完。
+     * <p>不採「執行期補單」是因為那等於巢狀／代下請求——本 mod 兩度實證會滾出巨量碎單拖垮伺服器。
+     */
+    private static final boolean gtocraftfix$STALL_CANCEL =
+            !"false".equalsIgnoreCase(System.getProperty("gtodiag.stallCancel", "true"));
+
+    /** [3.13.0] 判定卡死所需的「零進度」秒數（實錄卡單靜止 600 秒以上仍在增加）。 */
+    private static final int gtocraftfix$STALL_SEC = Integer.getInteger("gtodiag.stallCancelSec", 300);
+
+    /** [3.13.0] 同一顆 CPU 兩次救援的最短間隔（秒）：防「取消→重下→再卡→再取消」高頻空轉。 */
+    private static final int gtocraftfix$STALL_COOLDOWN_SEC =
+            Integer.getInteger("gtodiag.stallCancelCooldownSec", 600);
+
+    /** [3.13.0] 救援時在聊天室廣播（玩家單被取消時不廣播就等於無聲吞單）。 */
+    private static final boolean gtocraftfix$STALL_BROADCAST =
+            !"false".equalsIgnoreCase(System.getProperty("gtodiag.stallCancelBroadcast", "true"));
+
+    /** [3.13.0] 每顆 CPU 的進度追蹤：{進度指紋, 指紋最後變動的 tick, 上次救援的 tick}。 */
+    private final Map<appeng.crafting.execution.CraftingCpuLogic, long[]> gtocraftfix$stallState =
+            new java.util.WeakHashMap<>();
+
+    /** [3.13.0] 救援次數（純計數，用來在 log 裡看有沒有進入取消迴圈）。 */
+    private static final AtomicInteger gtocraftfix$stallCancels = new AtomicInteger();
+
+    /**
+     * [3.13.0] 救援廣播去重：成品 key → 上次廣播的 tick。
+     * <p>冷卻是綁在 CPU 上的，但重下的單常常落到**另一顆** CPU（那顆沒有冷卻）→ 對一個真的做不出來的
+     * 配方，取消會每 5 分鐘循環一次。log 該留（那是事實），但聊天室不該每 5 分鐘洗一次同一句話。
+     */
+    private final Map<String, Integer> gtocraftfix$stallNotified = new HashMap<>();
+
+    private static volatile java.lang.reflect.Field gtocraftfix$fRemaining;
+    private static volatile java.lang.reflect.Field gtocraftfix$fPaused;
+    private static volatile Method gtocraftfix$mPending;
+    private static volatile Method gtocraftfix$mPaused;
+
     /** [3.11.0] 現行旗標一覽（啟動時印一次，方便對照 log 與設定）。 */
     private static String gtocraftfix$flagLine() {
         return "guard=" + gtocraftfix$REPAIR_GUARD
@@ -340,7 +424,15 @@ public abstract class CraftingServiceSyncMixin {
                 + " deficitSrc=" + gtocraftfix$REPAIR_DEFICIT_SRC // [3.11.1]
                 + " strictRounds=" + gtocraftfix$REPAIR_STRICT_ROUNDS
                 + " updateBytes=" + gtocraftfix$REPAIR_UPDATE_BYTES
-                + " bootstrapMaxPass=" + gtocraftfix$BOOTSTRAP_MAX_PASS;
+                + " bootstrapMaxPass=" + gtocraftfix$BOOTSTRAP_MAX_PASS
+                // [3.13.0]
+                + " runFactor=" + gtocraftfix$REPAIR_RUN_FACTOR
+                + " runHardCap=" + gtocraftfix$REPAIR_RUN_HARD_CAP
+                + " feed=" + gtocraftfix$FEED + "(phantomOnly=" + gtocraftfix$FEED_PHANTOM_ONLY + ")"
+                + " topUp=" + gtocraftfix$SITTER_TOPUP
+                + " stallCancel=" + gtocraftfix$STALL_CANCEL
+                + "(" + gtocraftfix$STALL_SEC + "s,cd=" + gtocraftfix$STALL_COOLDOWN_SEC
+                + "s,broadcast=" + gtocraftfix$STALL_BROADCAST + ")";
     }
 
     /** [3.8.0] 把 KeyCounter 倒回快照值（以差額回沖，KeyCounter.add 吃負數）。 */
@@ -697,7 +789,14 @@ public abstract class CraftingServiceSyncMixin {
      *  反射呼叫）：印前 2 個座標。語意＝「樣板送去過這裡」，貨沒回來時的第一現場。讀不到回 null。 */
     private static String gtocraftfix$pendingAt(Object logic, AEKey key) {
         try {
-            Object r = logic.getClass().getMethod("getPendingRequests", AEKey.class).invoke(logic, key);
+            // [3.13.0] Method 快取：3.13.0 起這條從「每 400 tick 診斷用」變成餵料的判斷條件之一，
+            // 未快取的 getMethod（會複製整個 Method 陣列）會變成每秒數千次的主緒成本。
+            var m = gtocraftfix$mPending;
+            if (m == null) {
+                m = logic.getClass().getMethod("getPendingRequests", AEKey.class);
+                gtocraftfix$mPending = m;
+            }
+            Object r = m.invoke(logic, key);
             if (!(r instanceof java.util.Collection<?> col) || col.isEmpty()) {
                 return null;
             }
@@ -766,6 +865,262 @@ public abstract class CraftingServiceSyncMixin {
             return (appeng.crafting.inv.ListCraftingInventory) gtocraftfix$fInv.get(logic);
         } catch (Throwable t) {
             return null;
+        }
+    }
+
+    // ---------------------------------------------------------------- [3.13.0] 卡死救援
+
+    /** GTO job 物件（{@code OptimizedCraftingCpuLogic.job}）；沒單或反射失效回 null。 */
+    private Object gtocraftfix$jobOf(appeng.crafting.execution.CraftingCpuLogic logic) {
+        try {
+            if (gtocraftfix$fJob == null) {
+                var fj = logic.getClass().getDeclaredField("job");
+                fj.setAccessible(true);
+                gtocraftfix$fJob = fj;
+            }
+            return gtocraftfix$fJob.get(logic);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 待交付量（{@code ExecutingCraftingJob.remainingAmount}）；讀不到回 −1。 */
+    private long gtocraftfix$remainingAmount(Object job) {
+        try {
+            if (job == null) {
+                return -1;
+            }
+            if (gtocraftfix$fRemaining == null) {
+                var fr = job.getClass().getDeclaredField("remainingAmount");
+                fr.setAccessible(true);
+                gtocraftfix$fRemaining = fr;
+            }
+            return gtocraftfix$fRemaining.getLong(job);
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** 剩餘任務輪數總和；讀不到回 −1。 */
+    private long gtocraftfix$remainingRounds(Object job) {
+        try {
+            if (job == null) {
+                return -1;
+            }
+            if (gtocraftfix$fTasks == null) {
+                var ft = job.getClass().getDeclaredField("tasks");
+                ft.setAccessible(true);
+                gtocraftfix$fTasks = ft;
+            }
+            Map<?, ?> tasks = (Map<?, ?>) gtocraftfix$fTasks.get(job);
+            if (tasks == null) {
+                return -1;
+            }
+            long sum = 0;
+            for (var v : tasks.values()) {
+                if (gtocraftfix$fHolderVal == null) {
+                    var fv = v.getClass().getField("value");
+                    fv.setAccessible(true);
+                    gtocraftfix$fHolderVal = fv;
+                }
+                long r = gtocraftfix$fHolderVal.getLong(v);
+                if (r > 0) {
+                    sum += r;
+                }
+            }
+            return sum;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /**
+     * GTO 的暫停單（玩家在 CPU 介面按暫停）：刻意停著，不是卡死，一律不救。
+     * <p>兩條路都要試——{@code isPaused()} 方法若不存在而只回 false，暫停中的單會被當成
+     * 「零進度」一路數到 300 秒然後被取消，這是本救援唯一有實際傷害的誤判。
+     * 故方法讀不到就退回讀 job 的 {@code paused} 欄位（作法同 {@code CraftDiag.paused}）。
+     */
+    private boolean gtocraftfix$isPaused(appeng.crafting.execution.CraftingCpuLogic logic) {
+        try {
+            var m = gtocraftfix$mPaused;
+            if (m == null) {
+                m = logic.getClass().getMethod("isPaused");
+                gtocraftfix$mPaused = m;
+            }
+            return Boolean.TRUE.equals(m.invoke(logic));
+        } catch (Throwable ignored) {
+        }
+        try {
+            Object job = gtocraftfix$jobOf(logic);
+            if (job == null) {
+                return false;
+            }
+            if (gtocraftfix$fPaused == null) {
+                var fp = job.getClass().getDeclaredField("paused");
+                fp.setAccessible(true);
+                gtocraftfix$fPaused = fp;
+            }
+            return gtocraftfix$fPaused.getBoolean(job);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * 進度指紋：任何一項變了就算「這一秒有進度」。涵蓋推樣板（剩餘輪數↓、庫存↓）、
+     * 機器回貨（在途↓、庫存↑）、交付（待交付↓）三種前進方式。
+     */
+    private long gtocraftfix$progressSig(appeng.crafting.execution.CraftingCpuLogic logic) {
+        long h = 17;
+        try {
+            Set<AEKey> waiting = new HashSet<>();
+            logic.getAllWaitingFor(waiting);
+            long ws = 0;
+            for (var k : waiting) {
+                ws += logic.getWaitingFor(k);
+            }
+            h = h * 31 + ws;
+            h = h * 31 + waiting.size();
+            Object job = gtocraftfix$jobOf(logic);
+            h = h * 31 + gtocraftfix$remainingAmount(job);
+            h = h * 31 + gtocraftfix$remainingRounds(job);
+            var inv = gtocraftfix$invOf(logic);
+            if (inv != null) {
+                long s = 0;
+                for (var e : inv.list) {
+                    s += e.getLongValue();
+                }
+                h = h * 31 + s;
+            }
+        } catch (Throwable ignored) {
+        }
+        return h;
+    }
+
+    /**
+     * 找出一筆「證明等不到」的 waitingFor：沒有剩餘任務會產它、沒有樣板押在供應器上、網路也一滴都抽不到。
+     * <p>三個條件缺一不可——少任何一個都可能是「還在路上」而誤殺一張正常的單。讀不到 job 時回 null
+     * （寧可不救也不誤判）。
+     */
+    private AEKey gtocraftfix$frozenKey(appeng.crafting.execution.CraftingCpuLogic logic,
+                                        appeng.api.storage.MEStorage storage, IActionSource src) {
+        Set<AEKey> waiting = new HashSet<>();
+        logic.getAllWaitingFor(waiting);
+        if (waiting.isEmpty()) {
+            return null;
+        }
+        var producible = gtocraftfix$taskOutputs(logic);
+        if (producible == null) {
+            return null;
+        }
+        for (var k : waiting) {
+            if (logic.getWaitingFor(k) <= 0 || producible.contains(k)) {
+                continue;
+            }
+            if (gtocraftfix$pendingAt(logic, k) != null) {
+                continue; // 樣板已押在供應器上＝貨在路上
+            }
+            if (storage.extract(k, 1, Actionable.SIMULATE, src) > 0) {
+                continue; // 網路還抽得到 → 交給保母餵料，不必動刀
+            }
+            return k;
+        }
+        return null;
+    }
+
+    /**
+     * [3.13.0] 每秒一次：長時間零進度 ＋ 有一筆證明等不到的在途料 → 取消整張單。
+     * <p>取消會把 CPU 手上的半成品全退回網路，機器請求器 10 秒後自己重下（新計畫拿當下存量重算，
+     * 剛退回的中間產物都算得到）。玩家單不會自動重下，故一律廣播一行訊息。
+     */
+    private void gtocraftfix$stallWatch() {
+        appeng.api.storage.MEStorage storage;
+        try {
+            storage = grid.getStorageService().getInventory();
+        } catch (Throwable t) {
+            return;
+        }
+        for (var cluster : craftingCPUClusters) {
+            try {
+                var logic = cluster.craftingLogic;
+                var st = gtocraftfix$stallState.get(logic);
+                if (st == null) {
+                    st = new long[] { Long.MIN_VALUE, gtocraftfix$tickCounter, Long.MIN_VALUE / 4 };
+                    gtocraftfix$stallState.put(logic, st);
+                }
+                var out = logic.getFinalJobOutput();
+                // 沒單／暫停中 → 重置計時器（暫停是刻意的，不算卡死）
+                if (out == null || gtocraftfix$isPaused(logic)) {
+                    st[0] = Long.MIN_VALUE;
+                    st[1] = gtocraftfix$tickCounter;
+                    continue;
+                }
+                long sig = gtocraftfix$progressSig(logic);
+                if (sig != st[0]) {
+                    st[0] = sig;
+                    st[1] = gtocraftfix$tickCounter;
+                    continue;
+                }
+                long stalledTicks = gtocraftfix$tickCounter - st[1];
+                if (stalledTicks < gtocraftfix$STALL_SEC * 20L) {
+                    continue;
+                }
+                if (gtocraftfix$tickCounter - st[2] < gtocraftfix$STALL_COOLDOWN_SEC * 20L) {
+                    continue; // 冷卻中：同一顆 CPU 不連續開刀
+                }
+                var frozen = gtocraftfix$frozenKey(logic, storage, cluster.getSrc());
+                if (frozen == null) {
+                    continue;
+                }
+                long want = logic.getWaitingFor(frozen);
+                st[2] = gtocraftfix$tickCounter;
+                st[1] = gtocraftfix$tickCounter;
+                st[0] = Long.MIN_VALUE;
+                int n = gtocraftfix$stallCancels.incrementAndGet();
+                LOG.warn("[craftfix] 卡死救援：取消整張單 out={} —— 靜止 {}s、等 {} x{}"
+                        + "（無任務產它／無樣板在途／網路抽不到）；半成品退回網路，"
+                        + "機器單會自動重下、玩家單請手動重下。累計第 {} 次",
+                        out, stalledTicks / 20, frozen, want, n);
+                logic.cancel();
+                // 廣播去重：同一成品 10 分鐘內只說一次（重下的單常落到別顆沒冷卻的 CPU）
+                boolean sayIt = false;
+                if (gtocraftfix$STALL_BROADCAST) {
+                    String ok = String.valueOf(out.what());
+                    Integer last = gtocraftfix$stallNotified.get(ok);
+                    if (last == null || gtocraftfix$tickCounter - last >= 12000) {
+                        sayIt = true;
+                        gtocraftfix$stallNotified.put(ok, gtocraftfix$tickCounter);
+                        if (gtocraftfix$stallNotified.size() > 128) {
+                            gtocraftfix$stallNotified.clear();
+                        }
+                    }
+                }
+                if (sayIt) {
+                    try {
+                        var server = grid.getPivot() != null && grid.getPivot().getLevel() != null
+                                ? grid.getPivot().getLevel().getServer()
+                                : null;
+                        if (server != null) {
+                            server.getPlayerList().broadcastSystemMessage(
+                                    net.minecraft.network.chat.Component.literal("[合成修復] 卡死救援：已取消 ")
+                                            .append(out.what().getDisplayName())
+                                            .append(net.minecraft.network.chat.Component.literal(
+                                                    " 的合成（等不到 "))
+                                            .append(frozen.getDisplayName())
+                                            .append(net.minecraft.network.chat.Component.literal(
+                                                    " x" + want + "，已靜止 " + (stalledTicks / 20)
+                                                            + " 秒）；料已退回網路，請重新下單")),
+                                    false);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            } catch (Throwable t) {
+                int c = gtocraftfix$sitterLog.incrementAndGet();
+                if (c <= 5) {
+                    LOG.error("[craftfix] 卡死救援例外", t);
+                }
+            }
         }
     }
 
@@ -1086,6 +1441,27 @@ public abstract class CraftingServiceSyncMixin {
             snapMissing = snapMissing0;
             snapReady = true;
             var finalKey = plan.finalOutput() == null ? null : plan.finalOutput().what();
+            // [3.13.0] 本次修補的新增輪數上限：跟著原計畫規模縮放（見 REPAIR_RUN_FACTOR 的 javadoc）。
+            // 固定 200 萬對 112 萬輪的計畫來說，正常修補量就會撞牆 → 整組還原 → 必凍。
+            long planRounds = 0;
+            for (var v : snapPt.values()) {
+                if (v != null && v > 0) {
+                    planRounds += v;
+                }
+            }
+            long runCap = gtocraftfix$REPAIR_RUN_CAP;
+            if (gtocraftfix$REPAIR_RUN_FACTOR > 0 && planRounds > 0) {
+                long scaled;
+                try {
+                    scaled = Math.multiplyExact(planRounds, gtocraftfix$REPAIR_RUN_FACTOR);
+                } catch (ArithmeticException overflow) {
+                    scaled = Long.MAX_VALUE;
+                }
+                runCap = Math.max(runCap, scaled);
+            }
+            if (gtocraftfix$REPAIR_RUN_HARD_CAP > 0) {
+                runCap = Math.min(runCap, gtocraftfix$REPAIR_RUN_HARD_CAP);
+            }
             // 外圈：解缺口 → 可執行性模擬（抓循環自舉缺口）→ 再解，最多 4 輪
             long t0 = System.nanoTime();
             for (int round = 0; round < 4; round++) {
@@ -1207,8 +1583,11 @@ public abstract class CraftingServiceSyncMixin {
                 long batch = Math.max(1, batchOut);
                 long runs = (shortAmt + batch - 1) / batch; // ceil
                 addedRuns += runs;
-                if (addedRuns > gtocraftfix$REPAIR_RUN_CAP) {
-                    abortReason = "新增輪數 " + addedRuns + " 超過上限 " + gtocraftfix$REPAIR_RUN_CAP;
+                if (addedRuns > runCap) {
+                    abortReason = "新增輪數 " + addedRuns + " 超過上限 " + runCap
+                            + "（原計畫 " + planRounds + " 輪 × 係數 " + gtocraftfix$REPAIR_RUN_FACTOR
+                            + "，底線 " + gtocraftfix$REPAIR_RUN_CAP
+                            + "、天花板 " + gtocraftfix$REPAIR_RUN_HARD_CAP + "）";
                     break;
                 }
                 pt.merge(pat, runs, Long::sum);
@@ -1531,6 +1910,14 @@ public abstract class CraftingServiceSyncMixin {
                     LOG.info("[craftfix] 計畫修補 out={} 補{}項/新增{}輪：{}",
                             plan.finalOutput(), repaired, addedRuns, note);
                 }
+                // [3.13.0] 修補量超過原計畫規模＝計算器漏掉的比排出來的還多，或修補在發散。
+                // 兩者都不該靜默通過：3.9.0 的遞迴發散就是先出現這個形狀（glowstone 147456→3833856）。
+                if (planRounds > 0 && addedRuns > planRounds
+                        && gtocraftfix$repairNoteLog.incrementAndGet() <= gtocraftfix$NOTE_LOG_MAX) {
+                    LOG.warn("[craftfix] 修補量超過原計畫規模：新增 {} 輪 > 原計畫 {} 輪（上限 {}）"
+                            + " → 計畫已照補送出，但請留意這張單的執行時間與 CPU 佔用 out={}",
+                            addedRuns, planRounds, runCap, plan.finalOutput());
+                }
                 // [3.11.1／B8] 修補新增輪次後同步調高 plan.bytes()（預設關閉）。findSuitableCraftingCPU
                 // 與 trySubmitJob 都是拿 bytes 比 cluster.getAvailableStorage()，而 bytes 是 CraftingPlan
                 // 的 private final 欄位、修補全程沒動 → 「計畫過大 GTO 會自己拒絕」這道保護從未觸發。
@@ -1815,6 +2202,10 @@ public abstract class CraftingServiceSyncMixin {
         // 取代 3.6.0 的每 2 tick 取樣式 pushAudit（取樣會把任務移除誤算成巨量 Δ）。
         com.gtocraftfix.diag.CraftDiag.tick(gtocraftfix$tickCounter, (CraftingService) (Object) this,
                 grid, craftingCPUClusters);
+        // [3.13.0] 卡死救援：每秒取樣一次進度指紋，長時間零進度且證明等不到貨 → 取消整張單
+        if (gtocraftfix$STALL_CANCEL && gtocraftfix$tickCounter % 20 == 0) {
+            gtocraftfix$stallWatch();
+        }
         if (gtocraftfix$tickCounter % 400 == 0) {
             for (var cluster : craftingCPUClusters) {
                 try {
@@ -2038,12 +2429,33 @@ public abstract class CraftingServiceSyncMixin {
                 Set<AEKey> waiting = new HashSet<>();
                 logic.getAllWaitingFor(waiting);
                 int handledBefore = handled;
+                // [3.13.0] 幻影模式的判斷本身有成本（taskOutputs 要走完整張 tasks 圖、pendingAt 要反射
+                // 呼叫），而「補一筆永遠不會來的料」不是每 tick 都得做的事 → 降到 1Hz。
+                // 無差別模式維持每 tick（那是 2.x 兩單搶料時的原始節奏）。
+                boolean feedTick = gtocraftfix$FEED
+                        && (!gtocraftfix$FEED_PHANTOM_ONLY || gtocraftfix$tickCounter % 20 == 0);
+                // 本單剩餘任務會產出的 key；讀不到 job（反射失效）回 null → 幻影模式下一律不餵（保守）。
+                // 惰性求值：真的有 key 要判時才算。
+                java.util.Set<AEKey> producible = null;
+                boolean producibleReady = false;
                 for (var key : waiting) {
-                    if (gtocraftfix$SLIM) {
-                        break; // [slim] 保母餵料停用（孤兒 waitingFor 交回 GTO 自己處理）
+                    if (!feedTick) {
+                        break; // 餵料停用（-Dgtodiag.sitterFeed=false）或本 tick 不是幻影掃描週期
                     }
                     if (handled >= 8) {
                         break;
+                    }
+                    // [3.13.0] 只餵幻影：沒有剩餘任務會產它，也沒有樣板正押在供應器上
+                    // ＝證明「不會有機器送貨來銷這筆 waitingFor」，這時從網路直接補才是對的。
+                    if (gtocraftfix$FEED_PHANTOM_ONLY) {
+                        if (!producibleReady) {
+                            producible = gtocraftfix$taskOutputs(logic);
+                            producibleReady = true;
+                        }
+                        if (producible == null || producible.contains(key)
+                                || gtocraftfix$pendingAt(logic, key) != null) {
+                            continue;
+                        }
                     }
                     boolean isFinal = key.equals(finalOut.what());
                     if (isFinal) {
@@ -2077,14 +2489,17 @@ public abstract class CraftingServiceSyncMixin {
                         handled++;
                         int c = gtocraftfix$sitterLog.incrementAndGet();
                         if (c <= 200) {
-                            LOG.info("[craftfix] 保母餵料 {} x{}", key, accepted);
+                            LOG.info("[craftfix] 保母餵料 {} x{}（{}；out={}）", key, accepted,
+                                    gtocraftfix$FEED_PHANTOM_ONLY ? "幻影缺口：無任務產它、無樣板在途" : "無差別餵",
+                                    finalOut);
                         }
                     }
                 }
                 // 輸入補給：剩餘任務輸入不足一輪＝每 tick 取料失敗、無聲凍結 → 從網路補進 CPU 庫存。
                 // [2.4.0] 閘門放寬：原本只在 waiting 空時跑，但「有在途＋另一任務缺料」（兩單搶料實錄：
                 // 在途 qbit 晶圓擋住整個補給）同樣要補；本輪沒餵到料時一律跑。
-                if (!gtocraftfix$SLIM // [slim] 補輸入停用
+                // [3.13.0] slim 仍預設停用（沒有 waitingFor 當額度、會吸乾單料）；要開用 -Dgtodiag.sitterTopUp=true
+                if ((!gtocraftfix$SLIM || gtocraftfix$SITTER_TOPUP)
                         && (waiting.isEmpty() || handled == handledBefore) && handled < 8) {
                     gtocraftfix$topUpInputs(logic, storage, cluster.getSrc());
                 }

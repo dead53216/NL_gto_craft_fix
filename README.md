@@ -82,7 +82,9 @@
 | 系統屬性 | 預設 | 作用 |
 |---|---|---|
 | `gtodiag.repairGuard` | `20000`（3.11.1）| 修補迴圈可處理的缺口數上限（耗盡＝整組還原）。3.8.0 是 4000，實測有機陽液／陰液「已處理 4001 項、仍剩 9 項」就整組還原→幻影缺口變成永遠等不到的 `waitingFor` |
-| `gtodiag.repairRunCap` | `2000000` | 修補可新增的總輪數上限（3.8.0 值）|
+| `gtodiag.repairRunCap` | `2000000` | 修補可新增的總輪數上限**底線**（3.8.0 值）|
+| `gtodiag.repairRunFactor` | `4`（3.13.0）| 上限的比例項：實際上限 = min(`runHardCap`, max(`runCap`, 原計畫總輪數 × 本係數))。設 `0` ＝停用比例項、退回純固定上限 |
+| `gtodiag.repairRunHardCap` | `50000000`（3.13.0）| 比例上限的絕對天花板 |
 | `gtodiag.repairBudgetMs` | `200`（3.11.1）| 修補時間預算——護欄從「數到 N 就放棄」改成時間制（用固定次數擋遞迴補料迴圈本身是錯的設計：96→4000→10 萬三次都設錯）。**用 0 停用，不要設超大值**（`ms×1e6` 會溢位成負數→變成每次都超時）|
 | `gtodiag.repairDeficitSrc` | `on`（3.12.0）| 缺口沖銷只准動「真的來自 usedItems」的那本帳：`on`＝完整來源判定／`clamp`＝不分來源但不寫負值／`off`＝3.8.0 原樣 |
 | `gtodiag.repairStrictRounds` | `false` | 外圈 4 輪後仍有殘留缺口就整組還原。**預設 false**：唯一能帶著殘留缺口離開外圈的路徑只剩 soft 自舉猜測，還原＝退回幻影計畫＝必凍 |
@@ -101,6 +103,79 @@
 > 要做純 3.8.0 對照組請加：
 > `-Dgtodiag.repairGuard=4000 -Dgtodiag.repairBudgetMs=0 -Dgtodiag.repairDeficitSrc=off`
 > `-Dgtodiag.bootstrapMaxPass=2147483647 -Dgtodiag.repairBalanceLog=false`
+
+## 執行期救援旗標（3.13.0）
+
+修補只在 `submitJob` 那一瞬間跑，**下單後才長出來的缺口它看不到也補不到**。3.13.0 補上執行期的兩道。
+
+| 系統屬性 | 預設 | 作用 |
+|---|---|---|
+| `gtodiag.sitterFeed` | `true` | 保母餵料：把網路現貨直接補進 CPU 的 `waitingFor` 缺口（slim 自 2.x 停用，3.13.0 重開）|
+| `gtodiag.sitterFeedPhantomOnly` | `true` | 只餵**幻影 key**（無剩餘任務產它＋無樣板押在供應器上）。設 `false` 回到 2.x 的無差別餵 |
+| `gtodiag.sitterTopUp` | `false` | 保母補輸入（把剩餘任務的輸入補進 CPU 庫存）。**維持停用**：它沒有 `waitingFor` 當額度上限，實測會把單一料的全網存量吸進一顆 CPU |
+| `gtodiag.stallCancel` | `true` | 卡死救援：零進度 ＋ 證明等不到貨 → 取消整張單 |
+| `gtodiag.stallCancelSec` | `300` | 判定卡死所需的零進度秒數 |
+| `gtodiag.stallCancelCooldownSec` | `600` | 同一顆 CPU 兩次救援的最短間隔（防取消→重下→再卡的高頻空轉）|
+| `gtodiag.stallCancelBroadcast` | `true` | 救援時聊天室廣播（玩家單不會自動重下，不廣播＝無聲吞單）|
+
+## 3.13.0：三種卡單、三種病、三種修法
+
+2026-08-18 的實錄（3.12.0 執行中）同時卡住三張單，**病因互不相同**，這是設計這三道修法的直接證據。
+
+### ① `universal_circuit_uhv x100` —— 修補撞上限後整組還原
+
+```
+提交 任務214種/總輪1,119,456 missing=0
+**計畫修補放棄**（新增輪數 2,011,267 超過上限 2,000,000）→ 已還原成原計畫，照原樣送出
+未解缺口：naquadria x1,179,648; soldering_alloy x1,179,648; naquadah_ingot x6,135; …
+→ CPU 等 17 種「網存 0 且無任務產它」的料，靜止 600s 以上
+```
+
+只超過上限 **0.56%** 就整組還原。固定常數的問題是它與計畫規模無關：小計畫的 200 萬形同無限，
+112 萬輪的計畫卻在正常修補量就撞牆。**修法＝上限跟著原計畫規模縮放**（`repairRunFactor`）；
+真正的發散護欄是時間預算（`repairBudgetMs`）與絕對天花板（`repairRunHardCap`），不是這條。
+
+「全有全無」的還原策略本身沒錯（3.8.0 實證：半套計畫比不修更糟），錯的是門檻。
+另加一行 WARN：新增輪數 > 原計畫輪數時明說，因為 3.9.0 的遞迴發散就是先出現這個形狀。
+
+### ② `helium_plasma x1000000` —— 幻影 `waitingFor`，網路也沒貨
+
+```
+剩餘輪=0 在途113 庫存0 待交付113 靜止621s
+waiting[1]=helium_plasma(等113/網0/無任務產它)  剩餘任務=[(無)]
+```
+
+計畫只有 8000 輪、`missing=0`、開單時不缺，**跟修補完全無關**。輪次全推完了，帳上卻還記著
+「在等 113」，而網路沒貨、也沒有任何任務會再產它 → 永遠等一個不會來的東西。
+網路無貨時餵料無能為力，只能走 ③ 的取消。
+
+### ③ `gtocore:order` —— 開單時不缺，跑到一半才缺
+
+```
+提交 來源=玩家 任務301種/總輪1,840,818 used=264種(2.97億) missing=0（修補完全沒觸發）
+waiting[5]= supercritical_steam 等78.5億/網2450億   ← 等一個網路裡堆滿的東西
+             wetware_processor_computer 等752/網0/無任務產它
+             enriched_naquadah_trinium_europium_duranide_single_wire 等12032/網0/無任務產它
+```
+
+`supercritical_steam` 這種「網路有貨、但沒人會送來銷帳」的幻影缺口，只有**保母餵料**解得掉。
+其餘網存 0 的，仍然只能取消。
+
+### 為什麼不做「執行期補單」
+
+那等於巢狀／代下合成請求——本 mod **兩度實證**會滾出巨量碎單拖垮伺服器（見 mod `CLAUDE.md`）。
+取消則相反：把半成品全退回網路，機器請求器 10 秒後自己重下，新計畫拿**當下**存量重算，
+剛退回的中間產物都算得到，通常小很多也就做得完。代價是玩家單要手動重下（故一律廣播）。
+
+### 取消的三道安全閘
+
+缺一不可，任何一個放寬都可能誤殺正在慢慢前進的單：
+
+1. **零進度**：進度指紋（在途總量／在途 key 數／待交付／剩餘輪數／CPU 庫存總量）連續 `stallCancelSec` 秒不變。
+   涵蓋推樣板、機器回貨、交付三種前進方式；暫停中的單一律重置計時器。
+2. **證明等不到**：至少一筆 `waitingFor` 同時滿足「無剩餘任務產它」「無樣板押在供應器上（`getPendingRequests`）」
+   「網路 SIMULATE 一滴都抽不到」。讀不到 job 就不判（寧可不救也不誤判）。
+3. **冷卻**：同一顆 CPU `stallCancelCooldownSec` 秒內不再開刀。
 
 ## 3.12.0 修掉的 18 個 bug（稽核＋兩輪對抗式覆核）
 
