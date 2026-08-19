@@ -371,14 +371,23 @@ public abstract class CraftingServiceSyncMixin {
     private static final boolean gtocraftfix$SITTER_TOPUP = Boolean.getBoolean("gtodiag.sitterTopUp");
 
     /**
-     * [3.13.0] 卡死救援：對「證明等不到貨」且長時間零進度的 CPU 取消整張單。
-     * <p>這是最後一道，也是唯一能解「網路沒貨、計畫也沒排生產」的手段。取消會把 CPU 手上的半成品
-     * 全數退回網路 → 機器請求器 10 秒後自己重下、玩家單則需手動重下（會廣播一行聊天訊息）；
-     * 新計畫是拿**當下**的網路存量重算，剛退回的中間產物都算得到，通常會小很多也就做得完。
-     * <p>不採「執行期補單」是因為那等於巢狀／代下請求——本 mod 兩度實證會滾出巨量碎單拖垮伺服器。
+     * [3.13.0，3.13.1 起**預設關閉**] 卡死救援：對「證明等不到貨」且長時間零進度的 CPU 取消整張單。
+     * <p>要開請自己設 {@code -Dgtodiag.stallCancel=true}；關閉時 {@link #gtocraftfix$stallWatch()}
+     * 連呼叫都不會發生（tick 鉤子先判旗標），零成本、零行為。
+     * <p>⚠ **為什麼 3.13.1 就把它關掉**——2026-08-19 實測，當時網路上兩種真實的卡單形狀它一種都碰不到：
+     * <ul>
+     *   <li>密銀／索륨：每 4 秒開一張新單、每張只活 2 秒就離場，{@code stallCancelSec=300} 的
+     *       零進度計時器**永遠累積不到**（單活得比門檻短兩個數量級）。</li>
+     *   <li>並行控制倉：零進度 21 分鐘、無任務產它、網存 0，三道閘門全過，卻卡在第四道——
+     *       {@code getPendingRequests} 回報樣板還押在供應器上（那筆推送其實早就丟了）→ 一票否決。</li>
+     * </ul>
+     * 也就是說它目前**只有誤殺風險、沒有實際效益**。而且真正的病灶是「請求器滿足判定看網路現貨
+     * ＋ 降量重算硬開單」構成的迴圈（見 README「3.13.1」段），取消單並不治它。
+     * <p>程式碼保留不刪：這是本 mod 對新行為的一貫作法（見 3.11.0「程式碼保留但預設關閉」），
+     * 保留才能在修好 pendingAt 誤判後直接 A/B，而不是重寫一次。
      */
     private static final boolean gtocraftfix$STALL_CANCEL =
-            !"false".equalsIgnoreCase(System.getProperty("gtodiag.stallCancel", "true"));
+            Boolean.getBoolean("gtodiag.stallCancel");
 
     /** [3.13.0] 判定卡死所需的「零進度」秒數（實錄卡單靜止 600 秒以上仍在增加）。 */
     private static final int gtocraftfix$STALL_SEC = Integer.getInteger("gtodiag.stallCancelSec", 300);
