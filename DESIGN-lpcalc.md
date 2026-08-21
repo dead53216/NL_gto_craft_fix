@@ -1,17 +1,21 @@
-# DESIGN-lpcalc.md — 結構化需求傳播算料器（package com.gtodiag.lpcalc）最終實作規格
+# DESIGN-lpcalc.md — 結構化需求傳播算料器（package com.gtocraftfix.lpcalc）未啟用草案
 
-狀態：定案（設計評審三輪後的最終版）。本文件是實作的唯一依據；與早期草案、
-評審簡報衝突時以本文件為準。文內「鐵則 N」指驗收標準第 N 條（見 §2），
-鐵則與任何設計偏好衝突時鐵則贏。
+狀態：**完整版設計草案，尚未啟用、尚未驗收**。目前 `slim` 以
+`CraftingServiceSyncMixin.gtocraftfix$SLIM=true` 在外層硬停用 lpcalc；即使
+`-Dgtodiag.lpcalc.enabled=true` 也不會進入本路徑。本文件描述重新啟用前要達成的目標，
+不是目前 JAR 的行為承諾；與 [README.md](README.md) 的 slim 現況衝突時，以 README 與程式硬閘門為準。
+
+文內「鐵則 N」指驗收標準第 N 條（見 §2）。所有項目必須有自動測試或遊戲內證據後才能
+由「待驗收」改成「通過」，不能只因原始碼已存在便視為完成。
 
 - 環境：MC 1.20.1 Forge、Java 21、AE2 API（AEKey/KeyCounter/GenericStack/IPatternDetails/Object2LongMap）。
 - 程式註解繁體中文、UTF-8 無 BOM，只在「程式本身看不出的約束」處下註解。
 - 執行層是 gtolib 閉源 `OptimizedCraftingCpuLogic`，完全不可改；一切設計以
   「執行可行」壓倒「材料最優」。
 
-行號證據來源（下文縮寫）：
-- Mixin = `src/main/java/com/gtodiag/mixin/CraftingServiceSyncMixin.java`（849 行）
-- Node/Proc/Calc/Sim/Helper/NetSim = `src/main/java/com/gtodiag/calc/` 下的
+路徑縮寫（舊版 `Mixin:行號` 等數字只保留為歷史定位，不是目前程式的可靠錨點）：
+- Mixin = `1.20.1/forge/src/main/java/com/gtocraftfix/mixin/CraftingServiceSyncMixin.java`
+- Node/Proc/Calc/Sim/Helper/NetSim = `1.20.1/forge/src/main/java/com/gtocraftfix/calc/` 下的
   CraftingTreeNode / CraftingTreeProcess / CraftingCalculation / CraftingSimulationState /
   CraftingCpuHelper / NetworkCraftingSimulationState
 - Cpu = GTOCore repo `OptimizedCraftingCpuLogic.java`、Job = `ExecutingCraftingJob.java`
@@ -21,16 +25,16 @@
 ## 1. 目標與非目標
 
 **目標**
-1. 機器來源的算料請求（Mixin:197-202 現行導向 `com.gtodiag.calc.CraftingCalculation`）
-   優先改走 lpcalc：成本只與樣板圖大小成正比，與請求數量無關（10000 鈦錠 ≈ 10 鈦錠）。
+1. 未來重新啟用後，讓機器來源的算料請求優先改走 lpcalc：成本只與樣板圖大小成正比，
+   與請求數量無關（10000 鈦錠 ≈ 10 鈦錠）。
 2. 修復循環配方（Kroll 鈦、NaOH、蒽醌 H2O2 等）：樹狀版被 `notRecursive`（Node:135-153）
    剪光路徑而報缺料，lpcalc 以 SCC 正規求解。
-3. 任何不支援 / 不確定的情形回退 `com.gtodiag.calc` 樹狀版，行為與今日完全相同。
+3. 任何不支援 / 不確定的情形回退 `com.gtocraftfix.calc` 樹狀版。
 
 **非目標**
 - 不追求材料最優（超產一律接受；短產 / 死鎖零容忍）。
 - 不支援：容器物品、多樣板分攤、模糊模板載重合成、多輸入替代品載重——全部回退。
-- 不改任何 `com.gtodiag.calc` 檔案、不改 Mixin 的不可動件（§10.3）。
+- 不改任何 `com.gtocraftfix.calc` 檔案、不改 Mixin 的不可動件（§10.3）。
 
 ---
 
@@ -49,7 +53,7 @@
 | 9 | CRAFT_LESS 每個候選 R 過精確整數傳播＋完整 LpAuditor 才可回傳；R_max==0 的 sim 計畫受鐵則 2 約束 | §7 |
 | 10 | missing 溯源 v1 粗化：missing 非空且閉包內任一 key ≥2 候選樣板或模糊變體存量 → 一律回退 | §6.7 |
 | 11 | LpStats：FallbackReason 逐項計數＋fastPathHit 率＋節流 log（[craftfix] 風格） | §11 |
-| 12 | `-Dgtodiag.lpcalc.enabled=false` 一鍵停用（預設 true） | §9.1、§10 |
+| 12 | 完整版內層保留 `-Dgtodiag.lpcalc.enabled=false` kill switch；目前 slim 另有不可由屬性繞過的外層硬停用 | §9.1、§10 |
 | 13 | 不可動件清單；patternTimes key 用 getCraftingFor() 原始實例、容器用 new Object2LongOpenHashMap | §6.9、§10.3 |
 | 14 | 快照期 nanoTime 硬預算（~1ms）與規模上限，超限 → CLOSURE_CAP 回退 | §5.6 |
 | 15 | usedItems 語意 =「相對網路起始庫存的最大下探水位」（峰值需求）；LP 產出保守可偏大、不可偏小 | §6.6 |
@@ -74,7 +78,7 @@
   │    → LpFallbackQueue.enqueueShadow(req, lpSimPlan, future)
   └─ 任何回退觸發 → LpFallbackQueue.enqueue(req, reason, future)
   ↓
-伺服器執行緒（onServerEndTick，Mixin:566 CalcTicker.tick() 之後新插一行）
+伺服器執行緒（onServerEndTick，在既有 CalcTicker.tick() 後排空 LP 回退佇列）
   └─ LpFallbackQueue.drainOnServerTick()
        → 在伺服器執行緒 new calc.CraftingCalculation（ctor 讀 grid 安全）
        → CALC_POOL.submit(() -> future.complete(calc.run()))    （+1 tick 可接受）
@@ -85,14 +89,14 @@
 - `LpSolver` 全程只讀 snapshot 內資料；`getCraftingFor / canEmitFor / getFuzzyCraftable /
   IInput.isValid(…, level)` 只允許出現在 capture 內（Sim:73-91、Node:96 證據：isValid 吃 Level）。
 - LP 路徑不註冊 CalcTicker（快照後零 grid 存取，不需要握手）；回退路徑照舊註冊，
-  由 Mixin:566 的 `CalcTicker.tick()` 發預算——該行**一個字都不能動**。
+  由 Mixin 既有的 `CalcTicker.tick()` 發預算——重新接線時必須保留這項語意。
 
 ---
 
 ## 4. 類別清單與 public API
 
-全部放 `src/main/java/com/gtodiag/lpcalc/`。相依：AE2 API、fastutil、
-`com.gtodiag.calc`（僅回退建構）、`appeng.crafting.CraftingPlan`（Mixin:247 已在用）。
+全部放 `1.20.1/forge/src/main/java/com/gtocraftfix/lpcalc/`。相依：AE2 API、fastutil、
+`com.gtocraftfix.calc`（僅回退建構）、`appeng.crafting.CraftingPlan`。
 
 ### 4.1 LpConfig（系統屬性集中讀取，final class，全 static）
 ```java
@@ -100,6 +104,7 @@ public final class LpConfig {
     public static boolean enabled();                // gtodiag.lpcalc.enabled，預設 true（鐵則 12）
     public static boolean shadowVerifyOnMissing();  // gtodiag.lpcalc.shadowVerifyOnMissing，預設 true（鐵則 8）
     public static long snapshotBudgetNanos();       // gtodiag.lpcalc.snapshotBudgetNanos，預設 1_000_000（鐵則 14）
+    public static long solveBudgetNanos();          // gtodiag.lpcalc.solveBudgetNanos，預設 100_000_000
     public static int maxKeys();                    // gtodiag.lpcalc.maxKeys，預設 4096
     public static int maxPatterns();                // gtodiag.lpcalc.maxPatterns，預設 16384
     public static int maxPasses();                  // 固定 4（鐵則 7）
@@ -163,7 +168,7 @@ final class LpPattern {
     final IPatternDetails details;   // 原始實例（鐵則 13；hashCode 已在快照期暖機）
     final AEKey[] inKey;             // 每槽解析後 key（唯一重導向已代入，§5.3）
     final long[]  inAmt;             // 每輪 = getPossibleInputs()[i].amount() * getMultiplier()
-                                     //（與執行器 extractPatternInputs / topUpInputs 口徑一致，Mixin:731-732）
+                                     //（與執行器 extractPatternInputs / topUpInputs 的槽位口徑一致）
     final AEKey[] outKey; final long[] outAmt;   // getOutputs() 全部
     final AEKey primaryOut; final long primaryOutAmt;    // getPrimaryOutput
     final boolean parallelOrUnknown; // §5.4；true ⇒ 啟動料權重 w≥2 ＋ audit 死角規則（鐵則 1）
@@ -269,12 +274,12 @@ public final class LpFallbackQueue {
 }
 ```
 `drainOnServerTick()`：把佇列抽乾（ConcurrentLinkedQueue，量少）；每筆 try-catch：
-- 一般回退：`var calc = new com.gtodiag.calc.CraftingCalculation(req.level(), req.grid(),
+- 一般回退：`var calc = new com.gtocraftfix.calc.CraftingCalculation(req.level(), req.grid(),
   req.simRequester(), new GenericStack(req.what(), req.amount()), req.strategy());`
   （ctor 的 grid 讀取就在此刻、伺服器執行緒完成，Calc:57-70）→
   `req.pool().submit(() -> { try { future.complete(calc.run()); }
   catch (Throwable t) { future.completeExceptionally(t); } });`
-  calc.run() 自行 register CalcTicker，預算由既有 Mixin:566 泵。
+  calc.run() 自行 register CalcTicker，預算由既有 Mixin tick 鉤子泵送。
 - shadow 筆：同法建樹狀版；背景完成時比較——
   `treePlan != null && !treePlan.simulation()` → `future.complete(treePlan)`＋
   `LpStats.shadowAdopted()`；否則 `future.complete(lpSimPlan)`（樹狀版也失敗
@@ -294,7 +299,7 @@ public final class LpEntry {
 ```
 行為（鐵則 5、12）：
 1. `!LpConfig.enabled()` → `LpStats.fallback(DISABLED)` → 當場建樹狀版＋
-   `calcPool.submit(calc::run)` 回傳（與現行 Mixin:197-202 完全相同）。
+   `calcPool.submit(calc::run)` 回傳（維持現行樹狀回退的 Future 語意）。
 2. `LpCraftSnapshot.capture(...)`；`fallbackReason != null` → 計數 → 當場建樹狀版回傳
    （伺服器執行緒、單份快照——樹狀版 ctor 自己拷貝庫存，LP 快照已丟棄）。
 3. 成功 → `CompletableFuture` ＋ `calcPool.submit(new LpCalcTask(...))` → 回傳 future。
@@ -336,7 +341,7 @@ while queue 非空:
     快照庫存 findFuzzy(K, IGNORE_ALL) 有主 key 以外變體 → fuzzyStocked += K
     for P in pats:                                        # 全部候選都編譯（回退判定要用）
         compile(P)（§5.3）；把 P 的解析後輸入 key 全部 enqueue
-    每 64 個 pop 檢查一次 nanoTime 預算與 caps（§5.6）
+    每個 pop、每張樣板編譯前後都檢查 nanoTime 預算與 caps（§5.6）
 ```
 注意：閉包收全部候選樣板（不只首位），因為鐵則 10 的粗化判定與 multiCandidate
 需要完整名單；但傳播只用首位（§6.1）。
@@ -363,7 +368,7 @@ Class<?> iface = Class.forName("com.gtolib.api.ae2.pattern.IParallelPatternDetai
 - 解析成功 → `parallelOrUnknown = iface.isInstance(details)`。
 - **解析失敗（ClassNotFound 或任何 Throwable）→ 全部樣板 `parallelOrUnknown = true`**。
   理由：Cpu:222-238——`isParallel && 剩餘>1 && 庫存只夠 1 輪` 兩個分支都不抽料、
-  永久跳過；topUpInputs 只補一輪（Mixin:731-742）救不了。「證書會抓到」不成立：
+  永久跳過；topUpInputs 只補一輪也救不了。「證書會抓到」不成立：
   證書用同一個缺了規則的模型模擬，抓不到自己不知道的死角。偵測不到一律當並行，
   代價只是啟動料多備一輪（超產側，安全）。
 
@@ -372,14 +377,20 @@ capture 內對閉包每張 IPatternDetails 呼叫一次 `details.hashCode()`（�
 防背景緒首次組 `Object2LongOpenHashMap` 時觸發樣板惰性 NBT 初始化的執行緒競爭。
 
 ### 5.6 規模上限與 nanoTime 預算（鐵則 14）
-- `t0 = System.nanoTime()` 於 capture 開頭；BFS 每 64 個 pop 檢查
-  `nanoTime() - t0 > LpConfig.snapshotBudgetNanos()`（預設 1ms）→ `CLOSURE_CAP`。
+- `t0 = System.nanoTime()` 於 capture 開頭；每個 BFS pop、每張樣板編譯及每次可能較慢的
+  grid/API 呼叫前後都檢查 `nanoTime() - t0 > LpConfig.snapshotBudgetNanos()`（預設 1ms），
+  並在回傳成功 snapshot 前做最後一次檢查；超時 → `CLOSURE_CAP`。單一外部呼叫無法中途搶占，
+  但不得再用「每 64／256 項才看一次」冒充硬預算。
 - `visited.size() > maxKeys(4096)` 或編譯樣板數 > `maxPatterns(16384)` → `CLOSURE_CAP`。
 - capture 內任何未預期 Throwable → `SNAPSHOT_ERROR`（不外拋，帶 reason 回傳）。
 
 ---
 
 ## 6. 求解演算法（背景執行緒，LpSolver.solve）
+
+`solveBudgetNanos` 是整次求解的共用 deadline；圖建構／Tarjan、高斯消去、整數修補、傳播、
+候選搜尋與 auditor 的內層迴圈都必須定期檢查同一個 `LpBudget`。只在各大階段開始前檢查不算達標，
+因為單一病態 SCC 或重放本身就可能吃完整個預算；超時一律 `SOLVE_BUDGET` 回退。
 
 ### 6.1 圖建構與 SCC（LpGraph.build）
 1. 每 key 選 `patternsByKey[K]` 首位為 `selectedPattern(K)`（樹狀版貪婪首選的近似；
@@ -469,23 +480,30 @@ PATTERN 來源在 §6.2 已擋 SCC_FEEDS_PATTERN）。
    超產部分不記任何欄位。
 5. **內部淨耗（觸媒損耗環）**：整數化後仍有 `net[K] < 0` 的內部 key（如每輪損耗
    觸媒）→ 外部補給量 `|net[K]|` 以 BOOTSTRAP 來源回灌（步驟 7 同路徑）。
-6. **啟動料**（執行可行性核心）：
-   `bootstrap[K] = Σ_{P∈P(C)} in_P[K] × w_P`，K ∈ K(C)；
-   `w_P = min(x_P, P.parallelOrUnknown ? 2 : 1)`——並行（或偵測不確定，鐵則 1）
-   樣板至少備 2 輪料，繞開 Cpu:222-238 的 parallel==1 死角。
-   SCC 外部 key 的輸入不算 bootstrap：`in_P[K'] × x_P` 全額以 PATTERN 來源
-   addDemand 傳播下游（毛量，鐵則 15）。
+6. **最小啟動種子**（執行可行性核心）：
+   - 不得再把 SCC 每張樣板的內部輸入全部相加；那會把 Kroll 的 Mg 與 MgCl2 兩側都列成
+     必要啟動料，明明任一側就能啟動卻誤報 `LOOP_NO_BOOTSTRAP`。
+   - `w_P = min(x_P, P.parallelOrUnknown ? 2 : 1)`；以每張 P 的「內部輸入 × w_P」分別作為
+     單一入口候選，逐一做 §6.8 同語意的 SCC 波次重放。能讓整個 SCC 完成的候選才可採用。
+   - 若單一入口都不足，才從全入口保守向量開始，依穩定 key 順序反覆移除／縮減種子並重放；
+     每次移除後仍可完成就永久移除，直到任何剩餘分量再縮都會卡死。結果必須是
+     **包含關係最小（inclusion-minimal）**的可行種子，不要求全域材料量最優。
+   - 多個可行種子先選 `avail` 不足量最小者，再選總量較小者，最後以穩定 pattern/key id
+     決勝；所有候選與縮減都受 solve budget 約束，超限即 `SOLVE_BUDGET` 回退。
+   - SCC 外部 key 的輸入不算 bootstrap：`in_P[K'] × x_P` 全額以 PATTERN 來源
+     addDemand 傳播下游（毛量，鐵則 15）。
 7. **啟動料來源**：先扣 `avail` → `used`（同時記 `ledger.bootstrap`）；不足餘量以
    `addDemand(K, 餘量, BOOTSTRAP(C))` 回灌，交多趟傳播由 **SCC 外**樣板生產
    （notRecursive 對啟動料的語意保留）；該回灌鏈在 §6.2 落入循環 SCC → `LOOP_NESTED`；
    落到無樣板無庫存 → **不出 missing**，`LOOP_NO_BOOTSTRAP`（鐵則 2：啟動料 key
    幾乎必有樣板——本 SCC 自己的——repairPlan 會錯誤加 runs 沖銷）。
 8. **SCC 波次可行性證書**（局部預檢，最終仍以 §6.8 全計畫 audit 為準）：
-   起始庫存 = bootstrap ＋ SCC 外部輸入毛量；對 P(C) 做批次波模擬
+   起始庫存 = 選定的最小 bootstrap ＋ SCC 外部輸入毛量；對 P(C) 做批次波模擬
    （`可執行輪數 = min(剩餘, floor(庫存/每輪))`；parallelOrUnknown 且剩餘>1 且
-   只夠 1 輪 → 0 輪）；穩態快轉與 64 波上限同 §6.8。卡死 → bootstrap 全體 ×2
-   重試（`used/bootstrap` 同步加，超出 avail 的部分走步驟 7 回灌），至多 3 次倍增，
-   仍卡 → `SCC_WAVE_STUCK`。
+   只夠 1 輪 → 0 輪）；穩態快轉與 64 波上限同 §6.8。卡死時只可在**同一候選 seed key 集**
+   內倍增（`used/bootstrap` 同步加，超出 avail 的部分走步驟 7 回灌），至多 3 次；再失敗就
+   換下一個已證明可行的最小候選，全部失敗才 `SCC_WAVE_STUCK`。不得為了重試無條件恢復成
+   「SCC 每一側都要啟動料」。
 
 ### 6.4 啟動料與多趟的交互（鐵則 7）
 - pass 2+ 因 BOOTSTRAP 回灌新增的 runs / used / flow 一律進總帳，最終 audit 與
@@ -496,7 +514,8 @@ PATTERN 來源在 §6.2 已擋 SCC_FEEDS_PATTERN）。
 
 ### 6.5 整數域紀律
 全程 long ＋ `Math.addExact/multiplyExact`（ArithmeticException → OVERFLOW）；
-ceil 統一 `(d + p - 1) / p`（p ≥ 1 由 §5.3 BAD_PATTERN 保證）。
+正整數 ceil 統一 `d == 0 ? 0 : 1 + (d - 1) / p`，避免 `(d + p - 1)` 在 Long.MAX_VALUE
+附近先溢位（p ≥ 1 由 §5.3 BAD_PATTERN 保證）。
 patternTimes 永遠是正 long；runs==0 的樣板不進 patternTimes。
 
 ### 6.6 usedItems 峰值語意（鐵則 15）
@@ -509,14 +528,14 @@ lpcalc 的輸出定義：**used[K] = 需求傳播直接吃庫存的毛量 ＋ SC
 - 循環回收料不折抵、不進 used 之外的任何欄位；順序可行性由波次重放證明
   （取代樹狀版「模擬順序=執行順序」的隱式保證）。
 - 偏大代價：庫存貼地時可能比樹狀版嚴一點點被 MISSING_INGREDIENT 退單；
-  IgnoreMissing present-once 包裝（Mixin:509-561）下缺量進 waitingFor 由回流補——比死鎖好。
+  IgnoreMissing present-once 包裝下缺量進 waitingFor 由回流補——比死鎖好。
 
 ### 6.7 missing 不變量與粗化溯源（鐵則 2、10）
 傳播與 SCC 全部完成、audit 之前依序檢查：
 
 1. **鐵則 2 不變量**：對 missing 每個 key K：
    `patternsByKey[K]` 非空 **或** K 是任何 `runs>0` 樣板的主/副產出 → 不得出 sim 計畫，
-   `throw LOOP_NO_BOOTSTRAP`。理由：repairPlan（Mixin:327-393）會對有樣板的 missing
+   `throw LOOP_NO_BOOTSTRAP`。理由：repairPlan 會對有樣板的 missing
    自動加 runs 沖銷、:445-449 把 sim 翻 false，把不可行計畫當可執行提交。
 2. **鐵則 10 粗化**：missing 非空 且（`multiCandidate` 非空 或 `fuzzyStocked` 非空
    或 `snapshot.anyMultiInput`）→ `throw MULTI_PATH_LOAD_BEARING` /
@@ -525,11 +544,11 @@ lpcalc 的輸出定義：**used[K] = 需求傳播直接吃庫存的毛量 ＋ SC
 3. 兩關全過 → 誠實 sim 計畫候選：`simulation = true`、missing 逐 key 缺額、
    used/emitted/patternTimes 保留已排定部分（≤ availOriginal 不變量照守）→ 交 §9.3
    shadow 流程。**本算料器只產出兩種形狀**：sim=false＋missing 空、或
-   sim=true＋missing 非空（Mixin:445-449 會把 sim=true＋missing 空強翻可執行；
+   sim=true＋missing 非空（提交修補會把 sim=true＋missing 空翻成可執行；
    sim=false 帶 missing 在嚴格取料路徑是死路——missingItems 完全不被讀）。
 
 「真缺料且無樣板無變體」不回退——直接出誠實 sim（回退樹狀版只會更慢得出同一結論），
-交 blockSubmit（Mixin:469-472）擋單＋聊天室廣播；廣播沿用 repair 既有去重，算料器不重複做。
+交 blockSubmit 擋單＋聊天室廣播；廣播沿用 repair 既有去重，算料器不重複做。
 
 ### 6.8 LpAuditor.verify（守恆＋雙順序波次重放）
 違反任一 → `AUDIT_FAIL`（絕不輸出爛帳）：
@@ -539,14 +558,17 @@ lpcalc 的輸出定義：**used[K] = 需求傳播直接吃庫存的毛量 ＋ SC
 （amount' = 本計畫實際交付量；CRAFT_LESS 時為 R）。
 **(b) 上界**：每 key `used[K] ≤ availOriginal[K]`。
 **(c) patternTimes**：全部 ≥1、無零項。
-**(d) finalOutput 供給**：`used[what] + emitted[what] + Σ 樣板產出×runs ≥ amount'`
-（與 repair :285-306 同式，先自查過關 ⇒ repair 的 deficits 掃描必然無事可做、:308 直接 return）。
+**(d) finalOutput 可交付供給**：`emitted[what] + Σ 樣板產出×runs ≥ amount'`。
+`used[what]` **不得**列入：GTOCore 不會把 CPU 開局吸入的 final key 交給 link；把它當供給會產生
+抱著現貨卻永遠少交的計畫。先自查過關後，repair 的 final deficit 掃描也應無事可做。
 
 **(e) 波次重放（鐵則 4）**——至少兩種順序都 PASS 才算過：
 - 起始庫存：**只灌 usedItems**（絕不預灌任何折抵副產物；emitted 也不灌數字——
   emitable key 的輸入槽在重放中視為恆足，外部發射器語意）。
 - 任務集：patternTimes 逐項（剩餘 runs）。
 - 每波：依當前順序掃描任務，`可執行輪數 = min(剩餘, floor(庫存/每輪輸入))`；
+  同一樣板若多個輸入槽解析成同一 AEKey，必須先把每輪量以 exact/saturating 規則聚合後再算
+  floor 並一次扣除，不能逐槽各自用同一份庫存判斷而把庫存扣成負值仍判 PASS；
   **parallel 死角規則（鐵則 1）**：`parallelOrUnknown && 剩餘 > 1 && floor(...) == 1`
   → 本波 0 輪（複刻 Cpu:225-238）；執行即扣輸入、加全部輸出（含副產物——
   對應執行器 expectedOutputs→waitingFor→回收進 CPU 庫存，Cpu:340-342、715-718）。
@@ -561,7 +583,8 @@ lpcalc 的輸出定義：**used[K] = 需求傳播直接吃庫存的毛量 ＋ SC
   floor(本波最低水位/每波淨減量) )`。這是模擬壓縮而非證書跳躍：跳過的每一波都可逐波
   平移論證依原順序執行；完成／卡死仍由全部 runs 歸零／無任務可推進裁決，
   凍結任務（exec==0 且剩餘>0）不會被放行（避免 O(數量) 波數的目的不變）。
-- 完成判定：全部 runs 歸零，且累計產出＋used 起始量 ≥ finalOutput 交付量。
+- 完成判定：全部 runs 歸零，且 `emitted[what]＋累計樣板產出[what] ≥ finalOutput`；
+  `used[what]` 仍不得當成已交付成品。
 - 64 波（快轉計 1 波）內未完成 → FAIL。
 - missing 非空的誠實 sim 計畫：重放時把 missing 量視為起始庫存追加（模擬
   IgnoreMissing 下缺料由 waitingFor 回流——sim 計畫本來就會被 blockSubmit 擋，
@@ -576,18 +599,20 @@ lpcalc 的輸出定義：**used[K] = 需求傳播直接吃庫存的毛量 ＋ SC
 var patternTimes = new Object2LongOpenHashMap<IPatternDetails>();  // 鐵則 13：新容器
 runs 逐項放入（key = getCraftingFor() 回傳的原始 IPatternDetails 實例，絕不包裝/複製；
  執行器強轉 (IDetails) 且靠 equals 對上 NetworkCraftingProviders 註冊實例）;
-long bytes = ceil( Σ_K flow[K] * 8.0 / K.getType().getAmountPerByte()   // Sim:35-38 口徑
-                 + Σ runs                                               // 每 craft 1 byte（Proc:132）
-                 + 閉包涉及 key 數 * 8 );                               // nodeCount 近似（Calc:142），刻意輕微高估
+long bytes = Σ_K ceilDivExact(flow[K] * 8, K.getType().getAmountPerByte()) // Sim 口徑，整數／BigInteger
+                 + Σ runs                                                 // 每 craft 1 byte
+                 + 閉包涉及 key 數 * 8;                                   // nodeCount 近似，刻意輕微高估
 boolean simulation = !missing.isEmpty();                                // §6.7 的兩形狀之一
 return new appeng.crafting.CraftingPlan(new GenericStack(what, amount'), bytes, simulation,
         graph.multiplePaths(),
         usedCopy, emittedCopy, missingCopy,     // 各自 new KeyCounter，不共用快照
         patternTimes);
 ```
-- 必須回 `appeng.crafting.CraftingPlan` 具體類（Mixin:247 instanceof 才放行 repair 防線）。
+- 必須回 `appeng.crafting.CraftingPlan` 具體類（repair 防線會先做 instanceof 檢查）。
 - `gtocore$allocations` 恆不設（null → 執行側整套 INSUFFICIENT_PRIORITY 邏輯跳過，Job:74-86）。
-- bytes 只准高估不准低估（低估 → 小 CPU 接單爆容量；高估 → 換大 CPU，可見可解釋）。
+- bytes 全程用整數／BigInteger 向上取整，不得經 `double`（>2^53 會失去整數精度並可能向下）；
+  超過 long 或 128-bit 護欄時 `OVERFLOW` 回退。bytes 只准高估不准低估（低估 → 小 CPU 接單爆容量；
+  高估 → 換大 CPU，可見可解釋）。
 
 ---
 
@@ -610,7 +635,7 @@ return new appeng.crafting.CraftingPlan(new GenericStack(what, amount'), bytes, 
      至多 4 次修正；未收斂 → 退 `R_lo` 再驗一次（理論保證可行，仍必須實跑驗證）。
    - 期間任何非 missing 類回退原因 → 整體回退。
 5. `R_max ≥ 1` → `sim=false`、`finalOutput=(what, R_max)` 的可執行計畫
-   （做多少先交多少，追蹤器下輪補餘量——與 Mixin:206-230 降量段語意一致但精確）。
+   （做多少先交多少，追蹤器下輪補餘量——與既有降量段語意一致但精確）。
 6. `R_max == 0` → 對原始 amount 出誠實 sim 計畫，**同樣受 §6.7 鐵則 2/10 約束**
    （違反 → 回退樹狀版），過關才走 §9.3 shadow。
 7. 已知次優性：回傳 R 可能比理論最大小 ≤ `max(c_K/r_K)` 個單位——不依賴可行集
@@ -625,6 +650,7 @@ return new appeng.crafting.CraftingPlan(new GenericStack(what, amount'), bytes, 
 | `DISABLED` | LpEntry（伺服器緒） | `-Dgtodiag.lpcalc.enabled=false`（鐵則 12） |
 | `SNAPSHOT_ERROR` | capture（伺服器緒） | 快照期任何未預期 Throwable |
 | `CLOSURE_CAP` | capture（伺服器緒） | BFS 超過 maxKeys/maxPatterns 或 nanoTime 預算 ~1ms（鐵則 14） |
+| `SOLVE_BUDGET` | 求解期 | 背景求解累計超過 solveBudgetNanos；回退樹狀版 |
 | `CONTAINER_ITEM` | capture（伺服器緒） | 任一輸入 `getRemainingKey(primary) != null`（Proc:95-97） |
 | `BAD_PATTERN` | capture（伺服器緒） | 主產出 ≤0、輸入量 ≤0 等編譯異常 |
 | `REDIRECT_AMBIGUOUS` | 求解期 | 多候選重導向槽所屬樣板 runs > 0 |
@@ -650,8 +676,9 @@ return new appeng.crafting.CraftingPlan(new GenericStack(what, amount'), bytes, 
 ## 9. 回退與影子驗證接線
 
 ### 9.1 kill switch（鐵則 12）
-`LpEntry` 第一件事查 `LpConfig.enabled()`；false → 完整走現行路徑
-（new CraftingCalculation ＋ CALC_POOL.submit(calc::run)），LP 零介入。
+完整版接線後，`LpEntry` 第一件事查 `LpConfig.enabled()`；false → 完整走樹狀回退路徑
+（new CraftingCalculation ＋ CALC_POOL.submit(calc::run)），LP 零介入。**目前 slim 更早就被
+`gtocraftfix$SLIM` 擋住，根本不會呼叫 `LpEntry`；這個屬性只能停用，不能在 slim 啟用。**
 
 ### 9.2 LpFallbackQueue（鐵則 5）
 - 佇列：`ConcurrentLinkedQueue<Entry>`；Entry 含 Request、reason 或 lpSimPlan、future。
@@ -662,6 +689,10 @@ return new appeng.crafting.CraftingPlan(new GenericStack(what, amount'), bytes, 
   run() 包 RuntimeException 進 Future 的呼叫端語意一致。
 - `CompletableFuture.cancel` 不會中斷背景工作（現行 `pool.submit` 的
   `cancel(true)` 可以）——已知輕微行為差，呼叫端（AE2 CraftingService）未依賴中斷，接受。
+- backpressure 必須涵蓋「等待 server tick 的 staging queue」與「已送入 executor、尚未完成」兩段；
+  只檢查 `ConcurrentLinkedQueue.size()` 後再一次 drain 全部，無法限制固定執行緒池的無界工作佇列。
+  建議以單一 outstanding permit（固定上限 256）從 enqueue 持有到 future 完成，並限制每個 server tick
+  最多轉送 16 筆；無 permit 時直接走明確回退／拒絕，不得靜默堆積。
 
 ### 9.3 shadowVerifyOnMissing（鐵則 8）
 LP 產出誠實 sim 計畫（§6.7 全過）時：
@@ -672,18 +703,22 @@ LP 產出誠實 sim 計畫（§6.7 全過）時：
     `LpStats.shadowAdopted()`（分歧計數；護住 LP 因首選樣板/精確鍵模型誤報缺料的未知面）。
   - 樹狀版也 sim / 拋例外 → `future.complete(lpSimPlan)`（LP 的缺料結論被佐證）。
 - 穩定上線後可 `-Dgtodiag.lpcalc.shadowVerifyOnMissing=false` 關閉省算力。
+- shadow 節流鍵必須至少包含 grid identity＋requester identity＋AEKey；不同網路即使請求同 key，
+  庫存與樣板閉包也可能完全不同，不能共用只以 AEKey 為鍵的 10 秒結論。
 
 ---
 
-## 10. mixin 整合 diff 規格
+## 10. mixin 整合意圖（歷史 diff，重新啟用時須重做 review）
 
-改動集中在 `CraftingServiceSyncMixin.java`，**恰兩處**：
+以下是最初接線意圖；相關程式已存在，但目前被 `gtocraftfix$SLIM` 硬閘門擋住。舊行號與
+「恰兩處」不能再當成可直接套用的 patch。重新啟用時必須以目前符號與實際 diff 重新確認
+執行緒、回退、修補及停機清理路徑。
 
-### 10.1 替換 machineSrc0 分支（現 :197-202）
+### 10.1 machineSrc0 分支的預期接線
 原：
 ```java
 if (machineSrc0) {
-    var calc = new com.gtodiag.calc.CraftingCalculation(level, grid, simRequester,
+    var calc = new com.gtocraftfix.calc.CraftingCalculation(level, grid, simRequester,
             new appeng.api.stacks.GenericStack(what, amount), strategy);
     cir.setReturnValue(gtocraftfix$CALC_POOL.submit(calc::run));
     return;
@@ -692,8 +727,8 @@ if (machineSrc0) {
 改為：
 ```java
 if (machineSrc0) {
-    // 機器源改走 lpcalc（不支援/失敗回退 com.gtodiag.calc 樹狀版；-Dgtodiag.lpcalc.enabled=false 一鍵停用）
-    cir.setReturnValue(com.gtodiag.lpcalc.LpEntry.beginMachineCalc(
+    // 機器源改走 lpcalc（不支援/失敗回退 com.gtocraftfix.calc 樹狀版；-Dgtodiag.lpcalc.enabled=false 一鍵停用）
+    cir.setReturnValue(com.gtocraftfix.lpcalc.LpEntry.beginMachineCalc(
             level, grid, (ICraftingService) (Object) this, simRequester,
             what, amount, strategy, gtocraftfix$CALC_POOL));
     return;
@@ -703,22 +738,22 @@ if (machineSrc0) {
 - `LpEntry` 內部自行 try-catch 一切（含 capture）；理論上不外拋，但外層 :232-234 的
   catch（不 setReturnValue → 退 GTO async）照舊當最後防線。
 
-### 10.2 onServerEndTick 新增一行（現 :566 之後）
+### 10.2 onServerEndTick 的預期接線
 ```java
-com.gtodiag.calc.CalcTicker.tick(); // ← 原行，一字不動
-com.gtodiag.lpcalc.LpFallbackQueue.drainOnServerTick(); // ← 新增：LP 晚期回退/影子驗證的伺服器緒建構點
+com.gtocraftfix.calc.CalcTicker.tick(); // ← 既有回退預算泵
+com.gtocraftfix.lpcalc.LpFallbackQueue.drainOnServerTick(); // ← LP 晚期回退/影子驗證的伺服器緒建構點
 ```
 
-### 10.3 不可動件（鐵則 13，驗收時逐項核對 diff 未觸碰）
-- :566 `CalcTicker.tick()` 呼叫點——回退路徑的預算泵；LP 路徑不註冊 CalcTicker，
+### 10.3 不可動語意（鐵則 13，驗收時依符號逐項核對）
+- `CalcTicker.tick()` 呼叫點——回退路徑的預算泵；LP 路徑不註冊 CalcTicker，
   ACTIVE 空時 tick() 是 O(1) no-op，同池共存無干擾。
-- :104-130 inject 頭、machineSrc0 判定、:121-124 executeV2 反射失敗即 return 的回退鏈。
-- :126-193 無樣板守衛與匿名誠實 sim 計畫（算料前置防線，LP 沿用其語意、不重複實作）。
-- :243-482 repairPlan 全套（LP 計畫過 audit ⇒ deficits 空 ⇒ :308 直接 return，
-  只在「算料後庫存漂移」時才動手——這正是要保留它的原因）。
-- :445-449 sim→false 翻轉、:469-482 blockSubmit／退化計畫拒單。
-- :509-561 IgnoreMissing present-once 包裝、:563-683 保母、:685-754 topUpInputs。
-- :206-230 玩家路徑降量段（machineSrc0 已在前面攔走，維持現狀死碼，避免無關 diff）。
+- beginCraftingCalculation inject 頭、machineSrc0 判定與 executeV2 反射失敗的回退鏈。
+- 無樣板守衛與匿名誠實 sim 計畫（算料前置防線，LP 沿用其語意、不重複實作）。
+- repairPlan 全套（LP 計畫過 audit ⇒ deficits 應為空，
+   只在「算料後庫存漂移」時才動手——這正是要保留它的原因）。
+- sim→false 翻轉、blockSubmit／退化計畫拒單。
+- IgnoreMissing present-once 包裝、保母與 topUpInputs。
+- 玩家路徑降量段（machineSrc0 若先被 lpcalc 攔走，須確認不會誤改玩家語意）。
 
 ---
 
@@ -742,9 +777,10 @@ com.gtodiag.lpcalc.LpFallbackQueue.drainOnServerTick(); // ← 新增：LP 晚�
 
 | 屬性 | 預設 | 語意 |
 |---|---|---|
-| `gtodiag.lpcalc.enabled` | `true` | 一鍵停用（false → 機器路徑完全走現行樹狀版） |
+| `gtodiag.lpcalc.enabled` | `true` | 完整版內層 kill switch；false 走樹狀回退。slim 外層硬停用，所以 true 也不會啟用 LP |
 | `gtodiag.lpcalc.shadowVerifyOnMissing` | `true` | missing 非空時影子跑樹狀版 |
 | `gtodiag.lpcalc.snapshotBudgetNanos` | `1000000` | 快照期 nanoTime 硬預算 |
+| `gtodiag.lpcalc.solveBudgetNanos` | `100000000` | 求解期背景緒預算；超限回退樹狀版 |
 | `gtodiag.lpcalc.maxKeys` | `4096` | 閉包 key 上限 |
 | `gtodiag.lpcalc.maxPatterns` | `16384` | 閉包樣板上限 |
 
@@ -752,11 +788,23 @@ com.gtodiag.lpcalc.LpFallbackQueue.drainOnServerTick(); // ← 新增：LP 晚�
 
 ## 13. 驗收測試清單
 
-單元測試（純數字模型，int 索引＋long[]，不需 MC bootstrap）：
+現況標記（2026-08-21，slim 3.13.2 修正中）：
+
+| 範圍 | 現況 |
+|---|---|
+| 1～12 純數字單元測試 | **待驗收**；只有實際納入 `src/test` 且 `test` 成功的案例才能逐項改為通過 |
+| 13～19 整合／遊戲內測試 | **未執行**；lpcalc 仍由 slim 外層硬停用 |
+| 20 建置／版本 | **待本次發行流程驗證**；建置成功不等同 lpcalc 功能通過 |
+
+3.13.2 新增的 `CraftingHotfixSupportTest` 驗證 final 供給、餵料 fail-closed、飽和算術與 deadline；
+它屬於 slim hotfix 回歸測試，**不等同**下列 lpcalc 純數字模型測試。
+
+待驗收單元測試（純數字模型，int 索引＋long[]，不需 MC bootstrap）：
 1. **Kroll 二樣板環（跨樣板 SCC）**：A: TiCl4+2Mg→Ti+2MgCl2、B: 2MgCl2→2Mg+Cl2，
    MgCl2 無自己樣板 → 副產供給邊使 {A,B} 成 SCC；d[Ti]=10 → pin x_A=10、
-   相依方程代入得 x_B=10；bootstrap[Mg]=2·w_A、[MgCl2]=2·w_B；
-   非並行 w=1、並行/未知 w=2；雙順序重放 PASS；Cl2 不入任何欄位。
+   相依方程代入得 x_B=10；最小種子可以是 `bootstrap[Mg]=2·w_A` **或**
+   `bootstrap[MgCl2]=2·w_B`，不得要求兩者同時存在。分別測「只有 Mg」「只有 MgCl2」皆 PASS、
+   兩者皆無且無外部來源才 `LOOP_NO_BOOTSTRAP`；非並行 w=1、並行/未知 w=2；Cl2 不入任何欄位。
 2. **Kroll 單樣板自迴圈變體**（同配方編成一張帶 Mg 自迴圈的樣板）：閉式解
    `x = ceilDiv(d, b−a)`，兩種形狀結果一致（事實包矛盾的雙保險）。
 3. **NaOH 拜耳法環、蒽醌三步環**：3+ 樣板 SCC 高斯；線性相依列代入消元；
@@ -767,7 +815,8 @@ com.gtodiag.lpcalc.LpFallbackQueue.drainOnServerTick(); // ← 新增：LP 晚�
    `SCC_FEEDS_PATTERN` 回退，**不得**出任何計畫；直接請求 X（finalOutput）→ 可解，
    且對抗序重放（消費者先跑）PASS（必要時 bootstrap 倍增）。
 6. **parallel==1 死角（鐵則 1）**：(a) 反射失敗情境 → 全樣板 w≥2、重放套死角規則；
-   (b) 並行樣板剩餘 2、庫存僅 1 輪 → 重放判 0 輪（不推進）；(c) 剩餘恰 1 → 可推進。
+   (b) 並行樣板剩餘 2、庫存僅 1 輪 → 重放判 0 輪（不推進）；(c) 剩餘恰 1 → 可推進；
+   (d) 兩個輸入槽解析成同 key 時先聚合每輪需求，不得重複使用同一份庫存通過 audit。
 7. **多趟帳本（鐵則 7）**：構造 bootstrap 回灌落在已處理節點 → pass 2 只吃增量、
    surplus 折抵不重複、總帳 audit 全量一致；5 趟不收斂 → PASS_LIMIT。
 8. **surplus 折抵守衛**：電解水 H2+O2 場景折抵成功；構造折抵會成環 → 不折抵改超產；
@@ -779,7 +828,8 @@ com.gtodiag.lpcalc.LpFallbackQueue.drainOnServerTick(); // ← 新增：LP 晚�
 11. **CRAFT_LESS（鐵則 9）**：候選 R 逐一過完整 audit；驗證回傳 R 可行；
     R_max==0 → sim 受鐵則 2 約束；「10000 鈦錠歸零病」重現測試：啟動料是 c_K 常數項，
     R_max ≈ 供給上界而非 0。
-12. **Rational/溢位**：gcd、BigInteger 升格、>128 bit → OVERFLOW。
+12. **Rational/溢位**：gcd、BigInteger 升格、>128 bit → OVERFLOW；bytes 在 2^53 前後與
+    Long.MAX_VALUE 邊界仍只會精確向上或回退，禁止 double 捨入成較小 CPU 需求。
 
 整合／遊戲內驗收：
 13. **10000 大量請求**：求解毫秒級（與 10 個同數量級）；計畫形狀與小量一致。
@@ -787,13 +837,17 @@ com.gtodiag.lpcalc.LpFallbackQueue.drainOnServerTick(); // ← 新增：LP 晚�
     patternTimes/used/missing 未被改寫（log 無「計畫修補」字樣）。
 15. **kill switch**：`-Dgtodiag.lpcalc.enabled=false` → 行為與改動前逐位一致。
 16. **shadow**：人為讓 LP 誤報缺料（例：靠模糊模板才可行的布局其實會先被鐵則 10
-    攔下——用首選樣板不可行、次選可行的布局）→ 樹狀版計畫被採用＋shadowAdopted++。
-17. **快照預算**：超大閉包（>4096 key）→ CLOSURE_CAP 回退、tick 無尖峰、樹狀版照常出計畫。
+    攔下——用首選樣板不可行、次選可行的布局）→ 樹狀版計畫被採用＋shadowAdopted++；
+    兩張 grid 同時請求同 key 時各自驗證，不得被另一張 grid 的節流結果跳過。
+17. **快照預算／backpressure**：超大閉包（>4096 key）→ CLOSURE_CAP 回退、tick 無尖峰、
+    樹狀版照常出計畫；突發超過 outstanding 上限時，staging＋executor 待辦總量仍有界且 future
+    全部得到明確完成／回退，不得無限堆積或懸空。
 18. **執行緒安全走查**（code review checklist）：lpcalc 內 grep 不得出現
     `getCraftingFor|canEmitFor|getFuzzyCraftable|isValid\(|getStorageService|getInventory\(`
     於 capture 之外；`CraftingCalculation` 建構只出現在 LpEntry 與 LpFallbackQueue.drain。
-19. **純現貨/emitable 頂層請求**：空 patternTimes 被 :476-482 拒單——既有刻意行為
-    （接口下輪自己拉現貨），寫進 README，不視為 bug。
+19. **無樣板／純現貨／emitable 頂層請求**：機器來源在 begin 查無樣板時回誠實 sim；
+    submit 收到 `patternTimes` 空的機器計畫時回 `INCOMPLETE_PLAN`，接口下輪自行拉現貨或重試。
+    玩家來源不得因此被拒；lpcalc 重新啟用後必須保留這個 3.13.2 slim 安全語意。
 20. **建置**：`.\build-jar.bat`（JDK 21）成功、無 build-error.log、JAR 含版本；
     VERSION 升 MINOR。
 
@@ -827,7 +881,9 @@ com.gtodiag.lpcalc.LpFallbackQueue.drainOnServerTick(); // ← 新增：LP 晚�
 
 ---
 
-## 15. 實作順序建議
+## 15. 重新啟用前的整改／驗收順序
+
+現有類別不代表已通過；以下順序應理解為「逐層修正、補測與重新審核」，不是照舊碼直接打開硬閘門。
 
 1. `Rational`、`FallbackReason`、`LpFallbackException`、`LpConfig`、`LpStats`（無相依，先測）。
 2. `LpPattern`、`LpCraftSnapshot`（快照層＋暖機＋預算）。

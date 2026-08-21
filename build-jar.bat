@@ -37,14 +37,42 @@ echo  Building %MODNAME%
 echo ============================================
 echo.
 
-rem --- Require a Java 21+ JVM (fabric-loom 1.15 needs it; 1.20.1 still targets 17 via toolchains) ---
+rem --- Require the same Java 21+ JVM that gradlew.bat will select. ---
+set "JAVA_EXE=java.exe"
+if defined JAVA_HOME (
+    set "JAVA_EXE=%JAVA_HOME%\bin\java.exe"
+    if not exist "!JAVA_EXE!" (
+        echo ERROR: JAVA_HOME does not contain bin\java.exe: %JAVA_HOME%
+        exit /b 1
+    )
+) else (
+    where java.exe >nul 2>&1
+    if errorlevel 1 (
+        echo ERROR: Java was not found. Set JAVA_HOME to a JDK 21 installation.
+        exit /b 1
+    )
+)
+
 set "JV="
-for /f "tokens=3" %%v in ('java -version 2^>^&1 ^| findstr /i "version"') do (
+set "JAVA_CHECK=%TEMP%\nl-build-java-%RANDOM%-%RANDOM%.tmp"
+"!JAVA_EXE!" -version >"!JAVA_CHECK!" 2>&1
+if errorlevel 1 (
+    echo ERROR: Failed to run the Java selected by gradlew.bat: !JAVA_EXE!
+    if exist "!JAVA_CHECK!" del /q "!JAVA_CHECK!"
+    exit /b 1
+)
+for /f "tokens=3" %%v in ('findstr /i "version" "!JAVA_CHECK!"') do (
     if not defined JV set "JV=%%~v"
 )
-for /f "tokens=1 delims=." %%a in ("%JV%") do set "JMAJOR=%%a"
-if defined JMAJOR if %JMAJOR% LSS 21 (
-    echo ERROR: This build needs a Java 21 JDK ^(detected Java %JV%^).
+del /q "!JAVA_CHECK!"
+for /f "tokens=1 delims=." %%a in ("!JV!") do set "JMAJOR=%%a"
+if not defined JMAJOR (
+    echo ERROR: Could not determine the selected Java version.
+    echo        Set JAVA_HOME to a JDK 21 installation.
+    exit /b 1
+)
+if !JMAJOR! LSS 21 (
+    echo ERROR: This build needs a Java 21 JDK ^(detected Java !JV!^).
     echo        Point JAVA_HOME at a JDK 21, e.g.  set "JAVA_HOME=C:\Path\to\jdk-21"
     echo.
     exit /b 1
@@ -53,6 +81,10 @@ if defined JMAJOR if %JMAJOR% LSS 21 (
 rem --- Error log: all gradle output goes here; deleted on success, kept on failure ---
 set "LOG=%~dp0build-error.log"
 if exist "%LOG%" del /q "%LOG%"
+if exist "%LOG%" (
+    echo ERROR: Could not remove the stale build log: %LOG%
+    exit /b 1
+)
 
 rem --- Build every <version>\<loader> project that exists (forge / fabric / neoforge) ---
 for /d %%V in (1.*) do (
@@ -60,7 +92,12 @@ for /d %%V in (1.*) do (
         echo === Building %%V\%%~nxL ===
         echo ======== Building %%V\%%~nxL ========>> "%LOG%"
         pushd "%%V\%%~nxL" || goto build_failed
-        call gradlew.bat build >> "%LOG%" 2>&1
+        if not exist ".\gradlew.bat" (
+            echo ERROR: Missing Gradle wrapper: %%V\%%~nxL\gradlew.bat>> "%LOG%"
+            popd
+            goto build_failed
+        )
+        call .\gradlew.bat build >> "%LOG%" 2>&1
         set "RC=!ERRORLEVEL!"
         popd
         if not "!RC!"=="0" goto build_failed
@@ -71,6 +108,7 @@ for /d %%V in (1.*) do (
 
 echo Collecting jars into dist\ and mirroring into "%NLMOD%" ...
 if not exist dist mkdir dist
+set "COLLECTED_CURRENT=0"
 
 for /d %%V in (1.*) do (
     for /d %%L in ("%%V\*") do (
@@ -80,6 +118,7 @@ for /d %%V in (1.*) do (
         if exist "%%V\%%~nxL\gradle.properties" (
             for /f "tokens=2 delims==" %%m in ('findstr /b /i /c:"minecraft_version=" "%%V\%%~nxL\gradle.properties"') do set "MCVER=%%m"
         )
+        set "FOUND_CURRENT=0"
         for %%F in ("%%V\%%~nxL\build\libs\*.jar") do (
             echo %%~nF| findstr /i /c:"-slim" /c:"-sources" >nul
             if errorlevel 1 (
@@ -89,11 +128,17 @@ for /d %%V in (1.*) do (
                 echo %%~nF| findstr /e /c:"-%MODVER%" >nul
                 if not errorlevel 1 (
                     set "OUT=%MODNAME%-!LOADER!-!MCVER!-!MODVER!.jar"
-                    copy /y "%%F" "dist\!OUT!" >nul
+                    copy /y "%%F" "dist\!OUT!" >nul || goto build_failed
                     if not exist "%NLMOD%\!MCVER!\!LOADER!" mkdir "%NLMOD%\!MCVER!\!LOADER!"
-                    copy /y "%%F" "%NLMOD%\!MCVER!\!LOADER!\!OUT!" >nul
+                    copy /y "%%F" "%NLMOD%\!MCVER!\!LOADER!\!OUT!" >nul || goto build_failed
+                    set "FOUND_CURRENT=1"
+                    set "COLLECTED_CURRENT=1"
                 )
             )
+        )
+        if "!FOUND_CURRENT!"=="0" (
+            echo ERROR: No current-version jar found for %%V\%%~nxL ^(expected filename suffix -!MODVER!.jar^).>> "%LOG%"
+            goto build_failed
         )
         if defined PREVVER (
             set "OLDOUT=%MODNAME%-!LOADER!-!MCVER!-!PREVVER!.jar"
@@ -103,7 +148,16 @@ for /d %%V in (1.*) do (
     )
 )
 
+if "!COLLECTED_CURRENT!"=="0" (
+    echo ERROR: No CURRENT_VERSION jar was collected for any platform.>> "%LOG%"
+    goto build_failed
+)
+
 del /q "%LOG%" 2>nul
+if exist "%LOG%" (
+    echo ERROR: Build finished, but the success log could not be removed: %LOG%
+    exit /b 1
+)
 
 echo.
 echo Build complete. Jars in dist\ (also in %NLMOD%\^<mcversion^>\^<loader^>\):

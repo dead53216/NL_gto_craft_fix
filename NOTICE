@@ -1,0 +1,21 @@
+NL_gto_craft_fix licensing and attribution
+============================================
+
+Original NL_gto_craft_fix files are licensed under the MIT License; see
+LICENSE-MIT.txt.
+
+Files under
+1.20.1/forge/src/main/java/com/gtocraftfix/calc/
+that retain Applied Energistics 2 copyright and license headers are derived
+from Applied Energistics 2 and are licensed under the GNU Lesser General
+Public License, version 3 or (at your option) any later version. See COPYING
+and COPYING.LESSER. Their retained source headers identify the applicable
+copyright holders, including AlgorithmX2 and TeamAppliedEnergistics.
+
+Those derivative files have been adapted for NL_gto_craft_fix. No endorsement
+by the original Applied Energistics 2 authors is implied.
+
+In particular, calc/InputTemplate.java is adapted from
+appeng/crafting/execution/InputTemplate.java in the AE2 forge/1.20.1 branch;
+its package was relocated, and the AE2 LGPL attribution is supplied here and
+in the retained-style source header.

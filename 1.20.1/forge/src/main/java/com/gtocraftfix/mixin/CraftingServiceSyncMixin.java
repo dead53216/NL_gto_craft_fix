@@ -60,11 +60,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       無限拒單。正解 = IgnoreMissing：取現有、缺的記 {@code missingIng} → {@code waitingFor}，
  *       回流認領。GTO 只讓「有 player」的來源走該分支 → 包一層 present-once：{@code player()} 首呼
  *       （trySubmitJob 的條件判斷）回 present 走 IgnoreMissing，其後回 empty 用 machine 身分取料。</li>
- *   <li><b>保母（只餵料）</b>（{@code onServerEndTick} 每 5 秒）：job 的 {@code waitingFor} 缺口
- *       若網路有現貨（GTO 的認領只在「插入事件」觸發，既有庫存不會被回收），直接搬進 CPU 認領。
- *       不代下巢狀合成單——實測會生出大量小任務佔滿 CPU，反而害玩家下不了單。
- *       缺口若網路無貨（算料器批量餘數幻影，見 ISSUE.md 根因二），需玩家手動下該料的單，
- *       貨一落網路保母即自動餵入解凍。</li>
+ *   <li><b>保母（只餵料）</b>（{@code onServerEndTick}）：job 的 {@code waitingFor} 缺口若網路有現貨，
+ *       只在「非 final、全單無樣板在途、反射狀態已知」時搬進 CPU；幻影模式每秒掃一次，明確關掉
+ *       phantom-only 時才每 tick 掃。它不代下巢狀合成單；網路無貨就維持等待，不另生任務。</li>
  * </ol>
  */
 @Mixin(value = CraftingService.class, priority = 1500, remap = false)
@@ -77,8 +75,8 @@ public abstract class CraftingServiceSyncMixin {
      * （請求器/接口/合成卡）③並行死角解鎖 ④機器源降量重算（3.1.0）⑤**計畫修補（3.3.0）**——
      * 根因二實證後加回：算料器把網路沒有、也沒排生產的量寫進 usedItems，IgnoreMissing 讓它變成
      * 永遠等不到的 waitingFor；修補把缺口補成真正的樣板輪次，是這條鏈唯一的根治點。
-     * 仍停用：無樣板守衛、lpcalc 接管、**兩個拒單守衛**（真缺料擋單／退化計畫拒收，改為只記 log
-     * ——slim 原則是「只修計畫、不擋單」）、保母餵料/補輸入。停用處程式碼保留、log 照印。
+     * 仍停用：lpcalc 接管、真缺料擋單、保母補輸入。機器源「無樣板／退化計畫」會明確拒收，避免
+     * used-only 計畫上機永凍；保母只餵可證明無在途的非成品幻影 key。
      * 改 false 即恢復完整版行為（各處以 {@code gtocraftfix$SLIM} 判斷）。
      */
     private static final boolean gtocraftfix$SLIM = true;
@@ -94,10 +92,18 @@ public abstract class CraftingServiceSyncMixin {
     private static volatile Method gtocraftfix$executeV2;
     private static volatile boolean gtocraftfix$resolved;
     private static final AtomicInteger gtocraftfix$sitterLog = new AtomicInteger();
+    /** 餵料回補異常另設 ERROR 額度，避免壞掉的 storage 每 tick 洗滿 log。 */
+    private static final AtomicInteger gtocraftfix$feedErrorLog = new AtomicInteger();
     private int gtocraftfix$tickCounter;
     private final Set<AEKey> gtocraftfix$noPatternLogged = new HashSet<>();
-    /** 成品餵料被 link 拒收（回 0）的 key → 拒收時 tick；10 分鐘內不再試（防 x0 空轉）。 */
-    private final Map<AEKey, Integer> gtocraftfix$feedRefused = new HashMap<>();
+    /** storage 暫時拒收時由本 mod 保管、下 tick 優先回補的餵料餘額。 */
+    private final Map<AEKey, Long> gtocraftfix$feedRefunds = new HashMap<>();
+    /**
+     * NetworkStorage／CPU waiting 帳一旦無法以 before/after 證明，整張 grid 的自動搬料永久隔離到重啟；
+     * 不可再重播「可能已部分成功」的數量。map 只供 ERROR 說明人工介入範圍，絕不自動套用。
+     */
+    private boolean gtocraftfix$transferQuarantined;
+    private final Map<AEKey, Long> gtocraftfix$manualTransferAttention = new HashMap<>();
     /** 內置原版算料器的背景執行緒池（daemon）。 */
     private static final java.util.concurrent.ExecutorService gtocraftfix$CALC_POOL =
             java.util.concurrent.Executors.newFixedThreadPool(2, r -> {
@@ -109,6 +115,7 @@ public abstract class CraftingServiceSyncMixin {
     private static volatile java.lang.reflect.Field gtocraftfix$fTasks;
     private static volatile java.lang.reflect.Field gtocraftfix$fInv;
     private static volatile java.lang.reflect.Field gtocraftfix$fHolderVal;
+    private static volatile java.lang.reflect.Field gtocraftfix$fWaitingFor;
     private final Set<String> gtocraftfix$failLogged = new HashSet<>();
     /** [2.0.1 純診斷] 欄位普查已做過的 cluster（每場遊戲每 cluster 只倒一次，避免洗版）。 */
     private final Set<String> gtocraftfix$censusDone = new HashSet<>();
@@ -185,22 +192,21 @@ public abstract class CraftingServiceSyncMixin {
     // 刻意不做「一鍵全開」的總開關——那正是釀成退步的做法。
 
     /**
-     * [3.8.0/3.11.0] 修補迴圈可處理的缺口數上限，**預設退回 3.8.0 的 4000**。
-     * （3.8.0 實測：LUV 電路修補補 3650 項即完成、交付 466/500，是目前最好的基線。）
+     * [3.8.0/3.13.2] 修補迴圈可處理的缺口數上限，預設 20000。
+     * （3.8.0 實測：LUV 電路修補補 3650 項即完成、交付 466/500；現在保留更大的安全餘裕。）
      * 更早的 96 是「幻影缺口時代」的值，已證實會讓大電路交出半套計畫而必凍。
      * 上限本身必須留（遞迴補料遇循環配方可以無限長，而且跑在伺服器主緒），**耗盡時整組還原**。
      */
     private static final int gtocraftfix$REPAIR_GUARD = Integer.getInteger("gtodiag.repairGuard", 20000);
 
     /**
-     * [3.10.1/3.11.0] 修補的**時間**預算（毫秒），**預設 0＝停用**（3.8.0 沒有時間維度）。
-     * 用 0 停用而不是「設一個很大的值」——{@code ms * 1_000_000} 在極大值會溢位成負數，
-     * 反而變成每次都超時。要啟用建議 200（＝4 個 tick，命中即為可感知卡頓）。
+     * [3.10.1/3.13.2] 修補的**共用時間**預算（毫秒），預設 200（約 4 個 tick）；0＝停用。
+     * 毫秒轉奈秒使用 checked／saturating arithmetic，極大值不會溢位成負數；主迴圈與 bootstrap
+     * 共用同一個起始時間，不會在昂貴子步驟重新取得一份預算。
      */
     private static final long gtocraftfix$REPAIR_BUDGET_MS = Long.getLong("gtodiag.repairBudgetMs", 200L);
-    private static final long gtocraftfix$REPAIR_BUDGET_NS = gtocraftfix$REPAIR_BUDGET_MS <= 0
-            ? Long.MAX_VALUE
-            : gtocraftfix$REPAIR_BUDGET_MS * 1_000_000L;
+    private static final long gtocraftfix$REPAIR_BUDGET_NS =
+            CraftingHotfixSupport.budgetNanos(gtocraftfix$REPAIR_BUDGET_MS);
 
     /**
      * [3.8.0/3.11.0] 修補可新增的「總輪數」上限，**預設退回 3.8.0 的 200 萬**。
@@ -242,9 +248,9 @@ public abstract class CraftingServiceSyncMixin {
             !"false".equalsIgnoreCase(System.getProperty("gtodiag.repairBalanceLog", "true"));
 
     /**
-     * [3.10.0/3.11.0] 修補中止後擋下機器源提交：{@code off}（預設）／{@code on}／{@code force}。
-     * {@code on} 在 slim 分支自動不生效（slim 原則＝只修計畫、不擋單，見 mod CLAUDE.md）；
-     * 要在 slim 上擋單必須明寫 {@code force}。
+     * [3.10.0/3.13.2] 修補中止後擋下機器源提交：{@code off}（預設）／{@code on}／{@code force}。
+     * {@code on} 在 slim 分支不生效；要在 slim 上擋一般中止單必須明寫 {@code force}。
+     * 唯一安全例外是機器源的零任務退化計畫：不受此旗標與 slim 影響，一律拒收。
      */
     private static final String gtocraftfix$REPAIR_BLOCK =
             System.getProperty("gtodiag.repairBlockOnAbort", "off").trim().toLowerCase(java.util.Locale.ROOT);
@@ -296,9 +302,9 @@ public abstract class CraftingServiceSyncMixin {
      * [3.11.1／B6，3.11.2／M1 改預設 off] 外圈 4 輪跑滿仍有未解缺口時視為「修補沒做完」＝中止（整組還原）。
      * <p>⚠ **預設 false**，理由（實證推導，勿再改回 true）：外圈 {@code while} 只有兩種出口
      * ——(a) 缺口清空，(b) guard／runCap／時間預算耗盡，而 (b) 一定會設 {@code abortReason} 並 break。
-     * 因此「{@code abortReason == null} 且佇列非空」**只可能**發生在第 4 輪（{@code round == 3}）末尾：
-     * {@code findBootstrapDeficits} 又回報缺口、for 因 {@code round < 4} 結束。而自舉缺口一律是 soft
-     * （{@code Boolean.FALSE}），也就是說觸發集合 100% 是「所有硬缺口都已修好、只剩近似模擬的猜測」。
+     * 因此正常路徑中「{@code abortReason == null} 且佇列非空」只會發生在第 4 輪末尾：
+     * {@code findBootstrapDeficits} 又回報 soft 自舉缺口。防禦上仍逐筆驗證：只要混入任何 hard 缺口
+     * 就無條件中止；此旗標只控制「確定全為 soft」時是否採嚴格中止。
      * 這種計畫被整組還原成**未修補的原計畫** → 幻影 usedItems 沒補 → IgnoreMissing 掛出永遠等不到的
      * waitingFor → CPU 必凍，比不修更糟。而且 {@code findBootstrapDeficits} 只用 {@code poss[0]} 主變體
      * 判斷，靠替代輸入滿足的樣板會被誤判成卡死、每輪回報同一筆 → 這是**確定性重現**，不是偶發。
@@ -339,6 +345,52 @@ public abstract class CraftingServiceSyncMixin {
     private static final Set<String> gtocraftfix$bootstrapCapLogged =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    // ---------------------------------------------------------------- [3.13.2] 機器源降量重算保險
+
+    /**
+     * 降量重算會把原本誠實的 CRAFT_LESS 硬開成短命單；預設關閉，只有明確 A/B 時才啟用。
+     */
+    private static final boolean gtocraftfix$MACHINE_DOWNSCALE =
+            Boolean.getBoolean("gtodiag.machineDownscale");
+
+    /** 一次降量工作共用的總預算；0 代表不設時間上限。 */
+    private static final long gtocraftfix$DOWNSCALE_BUDGET_MS =
+            Long.getLong("gtodiag.machineDownscaleBudgetMs", 50L);
+    private static final long gtocraftfix$DOWNSCALE_BUDGET_NS =
+            CraftingHotfixSupport.budgetNanos(gtocraftfix$DOWNSCALE_BUDGET_MS);
+
+    /** 同一 grid（本 mixin 實例）／requester／key 的重試冷卻。 */
+    private static final long gtocraftfix$DOWNSCALE_COOLDOWN_SEC =
+            Long.getLong("gtodiag.machineDownscaleCooldownSec", 600L);
+    private static final long gtocraftfix$DOWNSCALE_COOLDOWN_NS =
+            CraftingHotfixSupport.cooldownNanos(gtocraftfix$DOWNSCALE_COOLDOWN_SEC);
+
+    private static final class DownscaleKey {
+        private final ICraftingSimulationRequester requester;
+        private final AEKey key;
+        private final int hash;
+
+        private DownscaleKey(ICraftingSimulationRequester requester, AEKey key) {
+            this.requester = requester;
+            this.key = key;
+            this.hash = 31 * System.identityHashCode(requester) + key.hashCode();
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            return obj instanceof DownscaleKey other
+                    && requester == other.requester
+                    && key.equals(other.key);
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
+    }
+
+    private final Map<DownscaleKey, Long> gtocraftfix$downscaleLastAttempt = new HashMap<>();
+
     /** [3.10.0] 修補中止已通知過的成品（聊天室去重）。 */
     private final Set<String> gtocraftfix$abortNotified = new HashSet<>();
 
@@ -355,7 +407,8 @@ public abstract class CraftingServiceSyncMixin {
             !"false".equalsIgnoreCase(System.getProperty("gtodiag.sitterFeed", "true"));
 
     /**
-     * [3.13.0] 餵料只針對**幻影 key**：沒有任何剩餘任務會產它，且沒有樣板正押在供應器上。
+     * [3.13.0/3.13.2] 餵料只針對**幻影 key**：沒有剩餘任務會產它，且整張 job 的
+     * {@code pendingRequests} 已確定為空；final key 另有無條件禁餵守衛。
      * <p>舊版（2.x）是無差別餵：任何 waitingFor 都從網路抓。那會把「機器 2 秒後就會送回來」的正常
      * 在途料也搶先餵掉，機器回貨時 {@code insert} 已無額度可銷 → 貨彈回網路，帳雖不會少但整網空轉，
      * 且會跟其他單搶料。加上這道指紋後，餵料只會發生在**證明不會有人送貨**的 key 上。
@@ -416,6 +469,7 @@ public abstract class CraftingServiceSyncMixin {
 
     private static volatile java.lang.reflect.Field gtocraftfix$fRemaining;
     private static volatile java.lang.reflect.Field gtocraftfix$fPaused;
+    private static volatile java.lang.reflect.Field gtocraftfix$fPendingRequests;
     private static volatile Method gtocraftfix$mPending;
     private static volatile Method gtocraftfix$mPaused;
 
@@ -437,11 +491,142 @@ public abstract class CraftingServiceSyncMixin {
                 // [3.13.0]
                 + " runFactor=" + gtocraftfix$REPAIR_RUN_FACTOR
                 + " runHardCap=" + gtocraftfix$REPAIR_RUN_HARD_CAP
+                + " machineDownscale=" + gtocraftfix$MACHINE_DOWNSCALE
+                + "(" + gtocraftfix$DOWNSCALE_BUDGET_MS + "ms,cd="
+                + gtocraftfix$DOWNSCALE_COOLDOWN_SEC + "s)"
                 + " feed=" + gtocraftfix$FEED + "(phantomOnly=" + gtocraftfix$FEED_PHANTOM_ONLY + ")"
                 + " topUp=" + gtocraftfix$SITTER_TOPUP
                 + " stallCancel=" + gtocraftfix$STALL_CANCEL
                 + "(" + gtocraftfix$STALL_SEC + "s,cd=" + gtocraftfix$STALL_COOLDOWN_SEC
                 + "s,broadcast=" + gtocraftfix$STALL_BROADCAST + ")";
+    }
+
+    /** 本 mixin 實例即一張 grid；再以 requester identity＋key 分流，避免另一張網路被一起冷卻。 */
+    private boolean gtocraftfix$startDownscale(ICraftingSimulationRequester requester, AEKey key, long now) {
+        var throttleKey = new DownscaleKey(requester, key);
+        Long last = gtocraftfix$downscaleLastAttempt.get(throttleKey);
+        if (last != null && !CraftingHotfixSupport.budgetExpired(last,
+                gtocraftfix$DOWNSCALE_COOLDOWN_NS, now)) {
+            return false;
+        }
+        gtocraftfix$downscaleLastAttempt.put(throttleKey, now);
+        if (gtocraftfix$downscaleLastAttempt.size() > 512) {
+            gtocraftfix$downscaleLastAttempt.entrySet().removeIf(e ->
+                    CraftingHotfixSupport.budgetExpired(e.getValue(),
+                            gtocraftfix$DOWNSCALE_COOLDOWN_NS, now));
+            // 冷卻設得極長時仍給容器硬上限；本次 key 已寫入，清空後補回它。
+            if (gtocraftfix$downscaleLastAttempt.size() > 512) {
+                gtocraftfix$downscaleLastAttempt.clear();
+                gtocraftfix$downscaleLastAttempt.put(throttleKey, now);
+            }
+        }
+        return true;
+    }
+
+    private static boolean gtocraftfix$isMachineSource(IActionSource src) {
+        if (src == null) {
+            return true;
+        }
+        try {
+            var player = src.player();
+            return player == null || player.isEmpty();
+        } catch (Throwable ignored) {
+            return true; // 來源身分未知：提交／搬料安全守衛一律按機器側處理
+        }
+    }
+
+    /** patternTimes 非空但全為 null／0／負值仍等於零可執行任務；任何 accessor 例外都 fail-closed。 */
+    private static boolean gtocraftfix$hasPositiveTask(ICraftingPlan job) {
+        try {
+            return job != null && job.patternTimes() != null
+                    && CraftingHotfixSupport.hasPositiveTask(job.patternTimes().values());
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** 收到的提交形狀只要是機器源零任務（含匿名誠實 sim）就拒收；尾端另留 defense-in-depth。 */
+    private static boolean gtocraftfix$isDegenerateMachinePlan(ICraftingPlan job, IActionSource src) {
+        if (!gtocraftfix$isMachineSource(src)) {
+            return false;
+        }
+        return !gtocraftfix$hasPositiveTask(job);
+    }
+
+    private record FinalDeliveryCheck(boolean known, long supply, long demand) {
+        private boolean insufficient() {
+            return known && supply < demand;
+        }
+    }
+
+    /**
+     * 對「此刻實際要提交的 plan」重算最終交付量；呼叫點必須在修補／配平／rollback 全部完成後。
+     * used(final) 刻意不列入。任何欄位／樣板讀取例外都回 UNKNOWN，不能據此誤擋。
+     */
+    private static FinalDeliveryCheck gtocraftfix$finalDeliveryCheck(CraftingPlan plan) {
+        try {
+            if (plan == null || plan.finalOutput() == null || plan.finalOutput().what() == null
+                    || plan.patternTimes() == null || plan.emittedItems() == null) {
+                return new FinalDeliveryCheck(false, 0, 0);
+            }
+            var finalKey = plan.finalOutput().what();
+            long patternProduced = 0;
+            for (var entry : plan.patternTimes().entrySet()) {
+                Long runs = entry.getValue();
+                if (runs == null || runs <= 0) {
+                    continue;
+                }
+                for (var output : entry.getKey().getOutputs()) {
+                    if (finalKey.equals(output.what())) {
+                        patternProduced = CraftingHotfixSupport.saturatingAdd(patternProduced,
+                                CraftingHotfixSupport.saturatingMultiply(output.amount(), runs));
+                    }
+                }
+            }
+            long supply = CraftingHotfixSupport.finalDeliverable(
+                    plan.emittedItems().get(finalKey), patternProduced);
+            return new FinalDeliveryCheck(true, supply, plan.finalOutput().amount());
+        } catch (Throwable ignored) {
+            return new FinalDeliveryCheck(false, 0, 0);
+        }
+    }
+
+    /** 回傳 true 表示已把機器提交設成 INCOMPLETE_PLAN；玩家只保留診斷、不改原行為。 */
+    private static boolean gtocraftfix$rejectProvenFinalShortfall(CraftingPlan plan, IActionSource src,
+            CallbackInfoReturnable<ICraftingSubmitResult> cir) {
+        var check = gtocraftfix$finalDeliveryCheck(plan);
+        if (!check.known()) {
+            if (gtocraftfix$finalCheckLog.incrementAndGet() <= 5) {
+                // UNKNOWN 可能正是 finalOutput() accessor 拋例外；log 不可再次呼叫同一 accessor。
+                LOG.warn("[craftfix] 最終產出驗證失敗（UNKNOWN，不據此擋單）planType={}",
+                        plan == null ? "null" : plan.getClass().getName());
+            }
+            return false;
+        }
+        if (!check.insufficient()) {
+            return false;
+        }
+        boolean machine = gtocraftfix$isMachineSource(src);
+        if (gtocraftfix$finalCheckLog.incrementAndGet() <= gtocraftfix$FINAL_CHECK_LOG_MAX) {
+            LOG.warn("[craftfix] 最終交付量可證明不足：供給{}/需求{}{}",
+                    check.supply(), check.demand(),
+                    machine ? "（機器源 → 拒收）" : "（玩家維持原行為）");
+        }
+        if (machine) {
+            cir.setReturnValue(appeng.crafting.execution.CraftingSubmitResult.INCOMPLETE_PLAN);
+            return true;
+        }
+        return false;
+    }
+
+    private static void gtocraftfix$addCounterSaturated(appeng.api.stacks.KeyCounter counter,
+                                                        AEKey key, long delta) {
+        long current = counter.get(key);
+        long target = CraftingHotfixSupport.saturatingAdd(current, delta);
+        long applied = CraftingHotfixSupport.saturatingSubtract(target, current);
+        if (applied != 0) {
+            counter.add(key, applied);
+        }
     }
 
     /** [3.8.0] 把 KeyCounter 倒回快照值（以差額回沖，KeyCounter.add 吃負數）。 */
@@ -451,9 +636,9 @@ public abstract class CraftingServiceSyncMixin {
             keys.add(e.getKey());
         }
         for (var k : keys) {
-            long delta = snap.getOrDefault(k, 0L) - kc.get(k);
+            long delta = CraftingHotfixSupport.saturatingSubtract(snap.getOrDefault(k, 0L), kc.get(k));
             if (delta != 0) {
-                kc.add(k, delta);
+                gtocraftfix$addCounterSaturated(kc, k, delta);
             }
         }
         kc.removeZeros();
@@ -465,11 +650,11 @@ public abstract class CraftingServiceSyncMixin {
      * ——半套計畫（輪次加了、輸入沒補）＝必凍，比不修更糟。快照為 null（還沒留底就出事）時不動。
      */
     private static void gtocraftfix$restorePlan(Map<IPatternDetails, Long> pt,
-                                                appeng.api.stacks.KeyCounter used,
-                                                appeng.api.stacks.KeyCounter missing,
-                                                Map<IPatternDetails, Long> snapPt,
-                                                Map<AEKey, Long> snapUsed,
-                                                Map<AEKey, Long> snapMissing) {
+                                                 appeng.api.stacks.KeyCounter used,
+                                                 appeng.api.stacks.KeyCounter missing,
+                                                 Map<IPatternDetails, Long> snapPt,
+                                                 Map<AEKey, Long> snapUsed,
+                                                 Map<AEKey, Long> snapMissing) {
         if (pt != null && snapPt != null) {
             pt.keySet().removeIf(k -> !snapPt.containsKey(k));
             for (var e : snapPt.entrySet()) {
@@ -483,6 +668,12 @@ public abstract class CraftingServiceSyncMixin {
             gtocraftfix$restoreCounter(missing, snapMissing);
         }
     }
+
+    // [3.13.2] 這裡曾經有一段「修補後清掉 GTO 過時 allocations」的反射（getGtocore$allocations／
+    // setGtocore$allocations）。實際反編譯 gtocore-0.5.6-beta 證實**沒有這組 accessor**：
+    // allocations 是 com.gtocore.api.ae2.crafting.ExecutingCraftingJob 的欄位，在**執行期**由 job
+    // 自己建立，CraftingPlan 上根本沒有可清的東西。那段程式碼因此恆為 no-op（getter 永遠找不到），
+    // 屬於未經驗證的臆測 API，已整段移除；別再依「GTO 可能有」的假設重新加回來。
 
     /** [3.6.0] 逐輪記帳快照：cluster → {job, 樣板→剩餘輪數, key→CPU庫存, key→在途}。 */
     private final Map<CraftingCPUCluster, Object[]> gtocraftfix$pushSnap = new java.util.WeakHashMap<>();
@@ -544,7 +735,7 @@ public abstract class CraftingServiceSyncMixin {
             long delta = 0;
             for (var e : pTimes.entrySet()) {
                 long now = curTimes.getOrDefault(e.getKey(), 0L);
-                long d = e.getValue() - now;
+                long d = CraftingHotfixSupport.saturatingSubtract(e.getValue(), now);
                 if (d > 0) {
                     if (moved != null) {
                         return; // 同一取樣有多個樣板推送 → 無法歸屬，跳過
@@ -566,21 +757,24 @@ public abstract class CraftingServiceSyncMixin {
                 var used = ps[0];
                 long usedDrop = Long.MIN_VALUE;
                 for (var v : ps) {
-                    long drop = pInv.getOrDefault(v.what(), 0L) - curInv.getOrDefault(v.what(), 0L);
+                    long drop = CraftingHotfixSupport.saturatingSubtract(
+                            pInv.getOrDefault(v.what(), 0L), curInv.getOrDefault(v.what(), 0L));
                     if (drop > usedDrop) {
                         usedDrop = drop;
                         used = v;
                     }
                 }
-                long expect = used.amount() * in.getMultiplier() * delta;
+                long expect = CraftingHotfixSupport.saturatingMultiply(
+                        CraftingHotfixSupport.saturatingMultiply(used.amount(), in.getMultiplier()), delta);
                 if (usedDrop != expect) {
                     sb.append(used.what()).append(" 預期吃").append(expect)
                             .append("/實吃").append(usedDrop).append("; ");
                 }
             }
             for (var o : moved.getOutputs()) {
-                long expect = o.amount() * delta;
-                long got = curWait.getOrDefault(o.what(), 0L) - pWait.getOrDefault(o.what(), 0L);
+                long expect = CraftingHotfixSupport.saturatingMultiply(o.amount(), delta);
+                long got = CraftingHotfixSupport.saturatingSubtract(
+                        curWait.getOrDefault(o.what(), 0L), pWait.getOrDefault(o.what(), 0L));
                 if (got != expect) {
                     sb.append(o.what()).append(" 預期在途+").append(expect)
                             .append("/實際+").append(got).append("; ");
@@ -606,10 +800,10 @@ public abstract class CraftingServiceSyncMixin {
             }
             var supply = new HashMap<AEKey, Long>();
             for (var e : plan.usedItems()) {
-                supply.merge(e.getKey(), e.getLongValue(), Long::sum);
+                supply.merge(e.getKey(), e.getLongValue(), CraftingHotfixSupport::saturatingAdd);
             }
             for (var e : plan.emittedItems()) {
-                supply.merge(e.getKey(), e.getLongValue(), Long::sum);
+                supply.merge(e.getKey(), e.getLongValue(), CraftingHotfixSupport::saturatingAdd);
             }
             for (var pe : pt.entrySet()) {
                 long runs = pe.getValue();
@@ -618,7 +812,8 @@ public abstract class CraftingServiceSyncMixin {
                 }
                 for (var o : pe.getKey().getOutputs()) {
                     if (o.amount() > 0) {
-                        supply.merge(o.what(), o.amount() * runs, Long::sum);
+                        supply.merge(o.what(), CraftingHotfixSupport.saturatingMultiply(o.amount(), runs),
+                                CraftingHotfixSupport::saturatingAdd);
                     }
                 }
             }
@@ -643,9 +838,10 @@ public abstract class CraftingServiceSyncMixin {
                             best = v;
                         }
                     }
-                    long per = best.amount() * in.getMultiplier();
+                    long per = CraftingHotfixSupport.saturatingMultiply(best.amount(), in.getMultiplier());
                     if (per > 0) {
-                        demand.merge(best.what(), per * runs, Long::sum);
+                        demand.merge(best.what(), CraftingHotfixSupport.saturatingMultiply(per, runs),
+                                CraftingHotfixSupport::saturatingAdd);
                     }
                 }
             }
@@ -653,7 +849,7 @@ public abstract class CraftingServiceSyncMixin {
             int n = 0;
             for (var e : demand.entrySet()) {
                 long have = supply.getOrDefault(e.getKey(), 0L);
-                long shortAmt = e.getValue() - have;
+                long shortAmt = CraftingHotfixSupport.positiveDeficit(e.getValue(), have);
                 if (shortAmt > 0 && n++ < 6) {
                     sb.append(e.getKey()).append(" 需").append(e.getValue())
                             .append("/計畫供").append(have).append("(缺").append(shortAmt).append("); ");
@@ -700,7 +896,8 @@ public abstract class CraftingServiceSyncMixin {
                 }
                 for (var o : ((IPatternDetails) en.getKey()).getOutputs()) {
                     if (o.amount() > 0) {
-                        supply.merge(o.what(), o.amount() * times, Long::sum);
+                        supply.merge(o.what(), CraftingHotfixSupport.saturatingMultiply(o.amount(), times),
+                                CraftingHotfixSupport::saturatingAdd);
                     }
                 }
             }
@@ -725,9 +922,10 @@ public abstract class CraftingServiceSyncMixin {
                             best = v;
                         }
                     }
-                    long per = best.amount() * in.getMultiplier();
+                    long per = CraftingHotfixSupport.saturatingMultiply(best.amount(), in.getMultiplier());
                     if (per > 0) {
-                        demand.merge(best.what(), per * times, Long::sum);
+                        demand.merge(best.what(), CraftingHotfixSupport.saturatingMultiply(per, times),
+                                CraftingHotfixSupport::saturatingAdd);
                     }
                 }
             }
@@ -737,7 +935,7 @@ public abstract class CraftingServiceSyncMixin {
                 var k = e.getKey();
                 long have = inv.list.get(k) + Math.max(0, logic.getWaitingFor(k))
                         + supply.getOrDefault(k, 0L);
-                long shortAmt = e.getValue() - have;
+                long shortAmt = CraftingHotfixSupport.positiveDeficit(e.getValue(), have);
                 if (shortAmt > 0 && n++ < 6) {
                     sb.append(k).append(" 需").append(e.getValue()).append("/可得").append(have)
                             .append("(缺").append(shortAmt).append(supply.containsKey(k) ? "" : "、無人產")
@@ -794,9 +992,17 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
-    /** [3.2.1 純診斷] 該 key 最近被推送到哪些供應器（GTO 的 {@code getPendingRequests(AEKey)} 公開 API，
-     *  反射呼叫）：印前 2 個座標。語意＝「樣板送去過這裡」，貨沒回來時的第一現場。讀不到回 null。 */
-    private static String gtocraftfix$pendingAt(Object logic, AEKey key) {
+    private record PendingResult(CraftingHotfixSupport.PendingKnowledge state, String locations) {
+    }
+
+    private static final PendingResult gtocraftfix$PENDING_UNKNOWN =
+            new PendingResult(CraftingHotfixSupport.PendingKnowledge.UNKNOWN, null);
+    private static final PendingResult gtocraftfix$PENDING_NONE =
+            new PendingResult(CraftingHotfixSupport.PendingKnowledge.NONE, null);
+
+    /** [3.2.1/3.13.2] 該 key 最近被推送到哪些供應器。NONE 與反射失效的 UNKNOWN 必須分開：
+     *  餵料／取消只有在**確定 NONE**時才可搬料或動刀，UNKNOWN 一律 fail-closed。 */
+    private static PendingResult gtocraftfix$pendingAt(Object logic, AEKey key) {
         try {
             // [3.13.0] Method 快取：3.13.0 起這條從「每 400 tick 診斷用」變成餵料的判斷條件之一，
             // 未快取的 getMethod（會複製整個 Method 陣列）會變成每秒數千次的主緒成本。
@@ -806,8 +1012,11 @@ public abstract class CraftingServiceSyncMixin {
                 gtocraftfix$mPending = m;
             }
             Object r = m.invoke(logic, key);
-            if (!(r instanceof java.util.Collection<?> col) || col.isEmpty()) {
-                return null;
+            if (!(r instanceof java.util.Collection<?> col)) {
+                return gtocraftfix$PENDING_UNKNOWN;
+            }
+            if (col.isEmpty()) {
+                return gtocraftfix$PENDING_NONE;
             }
             var sb = new StringBuilder();
             int n = 0;
@@ -823,9 +1032,45 @@ public abstract class CraftingServiceSyncMixin {
                     sb.append(o).append(' ');
                 }
             }
-            return sb.toString().trim();
+            return new PendingResult(CraftingHotfixSupport.PendingKnowledge.PRESENT, sb.toString().trim());
         } catch (Throwable ignored) {
-            return null;
+            return gtocraftfix$PENDING_UNKNOWN;
+        }
+    }
+
+    /**
+     * GTO 26.7.4 的 pendingRequests 只用樣板主產物當 key，waitingFor 卻含全部副產物，而且成功 push
+     * 後 task 可先被移除；掃「目前 key／waiting keys／active tasks」都可能漏。直接讀整個 multimap
+     * 是否為空才是可證明的全單 gate；欄位或 isEmpty 語意讀不到一律 UNKNOWN。
+     */
+    private static CraftingHotfixSupport.PendingKnowledge gtocraftfix$pendingAnywhere(Object logic) {
+        try {
+            var field = gtocraftfix$fPendingRequests;
+            if (field == null) {
+                Class<?> type = logic.getClass();
+                while (type != null) {
+                    try {
+                        field = type.getDeclaredField("pendingRequests");
+                        field.setAccessible(true);
+                        gtocraftfix$fPendingRequests = field;
+                        break;
+                    } catch (NoSuchFieldException ignored) {
+                        type = type.getSuperclass();
+                    }
+                }
+            }
+            if (field == null) {
+                return CraftingHotfixSupport.PendingKnowledge.UNKNOWN;
+            }
+            Object requests = field.get(logic);
+            if (!(requests instanceof com.google.common.collect.Multimap<?, ?> pending)) {
+                return CraftingHotfixSupport.PendingKnowledge.UNKNOWN;
+            }
+            return pending.isEmpty()
+                    ? CraftingHotfixSupport.PendingKnowledge.NONE
+                    : CraftingHotfixSupport.PendingKnowledge.PRESENT;
+        } catch (Throwable ignored) {
+            return CraftingHotfixSupport.PendingKnowledge.UNKNOWN;
         }
     }
 
@@ -873,6 +1118,25 @@ public abstract class CraftingServiceSyncMixin {
             }
             return (appeng.crafting.inv.ListCraftingInventory) gtocraftfix$fInv.get(logic);
         } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** GTO job 的 waitingFor 實體；餵料前必須可讀，logic.insert 例外時才有辦法恢復被先扣掉的帳。 */
+    private appeng.crafting.inv.ListCraftingInventory gtocraftfix$waitingInvOf(
+            appeng.crafting.execution.CraftingCpuLogic logic) {
+        try {
+            Object job = gtocraftfix$jobOf(logic);
+            if (job == null) {
+                return null;
+            }
+            if (gtocraftfix$fWaitingFor == null) {
+                var field = job.getClass().getDeclaredField("waitingFor");
+                field.setAccessible(true);
+                gtocraftfix$fWaitingFor = field;
+            }
+            return (appeng.crafting.inv.ListCraftingInventory) gtocraftfix$fWaitingFor.get(job);
+        } catch (Throwable ignored) {
             return null;
         }
     }
@@ -934,7 +1198,7 @@ public abstract class CraftingServiceSyncMixin {
                 }
                 long r = gtocraftfix$fHolderVal.getLong(v);
                 if (r > 0) {
-                    sum += r;
+                    sum = CraftingHotfixSupport.saturatingAdd(sum, r);
                 }
             }
             return sum;
@@ -956,13 +1220,16 @@ public abstract class CraftingServiceSyncMixin {
                 m = logic.getClass().getMethod("isPaused");
                 gtocraftfix$mPaused = m;
             }
-            return Boolean.TRUE.equals(m.invoke(logic));
+            Object value = m.invoke(logic);
+            if (value instanceof Boolean paused) {
+                return paused;
+            }
         } catch (Throwable ignored) {
         }
         try {
             Object job = gtocraftfix$jobOf(logic);
             if (job == null) {
-                return false;
+                return true; // 無法證明正在執行：所有會搬料／取消的救援一律 fail-closed
             }
             if (gtocraftfix$fPaused == null) {
                 var fp = job.getClass().getDeclaredField("paused");
@@ -971,7 +1238,7 @@ public abstract class CraftingServiceSyncMixin {
             }
             return gtocraftfix$fPaused.getBoolean(job);
         } catch (Throwable ignored) {
-            return false;
+            return true;
         }
     }
 
@@ -986,7 +1253,7 @@ public abstract class CraftingServiceSyncMixin {
             logic.getAllWaitingFor(waiting);
             long ws = 0;
             for (var k : waiting) {
-                ws += logic.getWaitingFor(k);
+                ws = CraftingHotfixSupport.saturatingAdd(ws, logic.getWaitingFor(k));
             }
             h = h * 31 + ws;
             h = h * 31 + waiting.size();
@@ -997,7 +1264,7 @@ public abstract class CraftingServiceSyncMixin {
             if (inv != null) {
                 long s = 0;
                 for (var e : inv.list) {
-                    s += e.getLongValue();
+                    s = CraftingHotfixSupport.saturatingAdd(s, e.getLongValue());
                 }
                 h = h * 31 + s;
             }
@@ -1018,6 +1285,11 @@ public abstract class CraftingServiceSyncMixin {
         if (waiting.isEmpty()) {
             return null;
         }
+        // GTO pendingRequests 只以 primary output 為 key；只查目前 waiting key 會漏掉同一張樣板
+        // 已在途的副產物。只要整張單仍有任一 pending（或反射無法判定），取消救援一律 fail-closed。
+        if (gtocraftfix$pendingAnywhere(logic) != CraftingHotfixSupport.PendingKnowledge.NONE) {
+            return null;
+        }
         var producible = gtocraftfix$taskOutputs(logic);
         if (producible == null) {
             return null;
@@ -1026,7 +1298,7 @@ public abstract class CraftingServiceSyncMixin {
             if (logic.getWaitingFor(k) <= 0 || producible.contains(k)) {
                 continue;
             }
-            if (gtocraftfix$pendingAt(logic, k) != null) {
+            if (gtocraftfix$pendingAt(logic, k).state() != CraftingHotfixSupport.PendingKnowledge.NONE) {
                 continue; // 樣板已押在供應器上＝貨在路上
             }
             if (storage.extract(k, 1, Actionable.SIMULATE, src) > 0) {
@@ -1070,11 +1342,13 @@ public abstract class CraftingServiceSyncMixin {
                     st[1] = gtocraftfix$tickCounter;
                     continue;
                 }
-                long stalledTicks = gtocraftfix$tickCounter - st[1];
-                if (stalledTicks < gtocraftfix$STALL_SEC * 20L) {
+                long stalledTicks = CraftingHotfixSupport.saturatingSubtract(
+                        gtocraftfix$tickCounter, st[1]);
+                if (stalledTicks < CraftingHotfixSupport.saturatingMultiply(gtocraftfix$STALL_SEC, 20L)) {
                     continue;
                 }
-                if (gtocraftfix$tickCounter - st[2] < gtocraftfix$STALL_COOLDOWN_SEC * 20L) {
+                if (CraftingHotfixSupport.saturatingSubtract(gtocraftfix$tickCounter, st[2])
+                        < CraftingHotfixSupport.saturatingMultiply(gtocraftfix$STALL_COOLDOWN_SEC, 20L)) {
                     continue; // 冷卻中：同一顆 CPU 不連續開刀
                 }
                 var frozen = gtocraftfix$frozenKey(logic, storage, cluster.getSrc());
@@ -1147,8 +1421,9 @@ public abstract class CraftingServiceSyncMixin {
                     } else {
                         if (gtocraftfix$SLIM) {
                             LOG.info("[craftfix] 已啟用 slim：同步算料(ctrl+左鍵)＋機器源 IgnoreMissing(請求器)"
-                                    + "＋並行死角解鎖＋降量重算＋計畫修補(只修不擋單)；"
-                                    + "無樣板守衛/lpcalc/保母 停用（僅印 log）。");
+                                    + "＋並行死角解鎖＋計畫修補＋機器退化計畫拒收；"
+                                    + "lpcalc 停用；降量重算={}、幻影中間料餵料={}。",
+                                    gtocraftfix$MACHINE_DOWNSCALE, gtocraftfix$FEED);
                             LOG.info("[craftfix] 修補旗標 {}", gtocraftfix$flagLine()); // [3.11.0]
                         } else {
                             LOG.info("[craftfix] 已啟用完整版：同步算料＋機器源 IgnoreMissing＋保母；lpcalc={}。",
@@ -1168,7 +1443,7 @@ public abstract class CraftingServiceSyncMixin {
             // 無樣板物品硬生「從網路拿 N 顆」的退化計畫 → 無謂的算料/修補/拒單循環。
             // 機器源請求前先查索引，查無 → 直接回誠實 sim 計畫（缺 N、零任務），不進 executeV2。
             var actionSrc0 = simRequester.getActionSource();
-            boolean machineSrc0 = actionSrc0 == null || actionSrc0.player().isEmpty();
+            boolean machineSrc0 = gtocraftfix$isMachineSource(actionSrc0);
             if (machineSrc0 && ((ICraftingService) (Object) this).getCraftingFor(what).isEmpty()) {
                 if (gtocraftfix$noPatternLogged.add(what)) {
                     LOG.warn("[craftfix] 無樣板，擋下機器源請求：{} x{}（原版語意：不可合成）", what, amount);
@@ -1186,9 +1461,6 @@ public abstract class CraftingServiceSyncMixin {
                 }
                 final AEKey fWhat = what;
                 final long fAmount = amount;
-                if (gtocraftfix$SLIM) {
-                    return; // [slim] 不擋單，交回 GTO 原生流程（上方 WARN 仍留紀錄）
-                }
                 cir.setReturnValue(CompletableFuture.completedFuture(new ICraftingPlan() {
 
                     @Override
@@ -1249,30 +1521,62 @@ public abstract class CraftingServiceSyncMixin {
             var inventory = grid.getStorageService().getCachedInventory().copy();
             var plan = (ICraftingPlan) m.invoke(null, grid, inventory, simRequester, what, amount, strategy);
 
-            // 機器源降量重算：executeV2 的 CRAFT_LESS 對大量會直接回 amount=0＋sim（實測 10000 鈦錠
-            // 因鎂循環記帳差 2 而整張歸 0，1000 卻可以）。正常 CRAFT_LESS 語意應回「最多可做的量」——
-            // 外部重現：砍半重算直到可執行；做多少先交多少，追蹤器下輪自然補餘量。玩家不降（要看缺料畫面）。
+            // [3.13.2] 機器源降量重算預設關閉：它會把誠實的 CRAFT_LESS 硬開成短命單，與請求器
+            // 「網存 0 就重下整批」組成吸料空轉。A/B 明確開啟時，一次工作共用 deadline，且同一
+            // CraftingService(grid)／requester identity／key 有冷卻；全失敗只在冷卻週期首筆留一行 WARN。
             var actionSrc = simRequester.getActionSource();
-            boolean machineSrc = actionSrc == null || actionSrc.player().isEmpty();
-            // [slim 3.1.0] 降量重算啟用：lpcalc 停用後，本段是機器源 CRAFT_LESS 的唯一處理者
-            if (machineSrc && plan != null && amount > 1
-                    && (plan.simulation() || plan.finalOutput() == null || plan.finalOutput().amount() <= 0)) {
+            boolean machineSrc = gtocraftfix$isMachineSource(actionSrc);
+            long downscaleStartedAt = System.nanoTime();
+            if (gtocraftfix$MACHINE_DOWNSCALE && machineSrc && plan != null && amount > 1
+                    && (plan.simulation() || plan.finalOutput() == null || plan.finalOutput().amount() <= 0)
+                    && gtocraftfix$startDownscale(simRequester, what, downscaleStartedAt)) {
                 long tryAmount = amount;
+                long startedAt = downscaleStartedAt;
+                int attempts = 0;
+                boolean succeeded = false;
+                boolean timedOut = false;
+                Throwable retryFailure = null;
                 for (int i = 0; i < 12 && tryAmount > 1; i++) {
+                    if (CraftingHotfixSupport.budgetExpired(startedAt,
+                            gtocraftfix$DOWNSCALE_BUDGET_NS, System.nanoTime())) {
+                        timedOut = true;
+                        break;
+                    }
                     tryAmount /= 2;
-                    var inv2 = grid.getStorageService().getCachedInventory().copy();
-                    var p2 = (ICraftingPlan) m.invoke(null, grid, inv2, simRequester, what, tryAmount, strategy);
+                    ICraftingPlan p2;
+                    try {
+                        var inv2 = grid.getStorageService().getCachedInventory().copy();
+                        p2 = (ICraftingPlan) m.invoke(null, grid, inv2, simRequester, what, tryAmount, strategy);
+                        attempts++;
+                    } catch (Throwable retryError) {
+                        retryFailure = retryError;
+                        break;
+                    }
+                    if (CraftingHotfixSupport.budgetExpired(startedAt,
+                            gtocraftfix$DOWNSCALE_BUDGET_NS, System.nanoTime())) {
+                        timedOut = true;
+                        break;
+                    }
                     // 拒收「退化計畫」（usedItems 吃現貨、patternTimes 空＝啥都不合成）：GTO 沒有
                     // 「把開局吸入的成品交給 link」的步驟，這種 job 會抱著現貨永凍（實測 NAND 625）。
                     if (p2 != null && !p2.simulation() && p2.finalOutput() != null && p2.finalOutput().amount() > 0
-                            && !p2.patternTimes().isEmpty()) {
+                            && gtocraftfix$hasPositiveTask(p2)) {
                         int c = gtocraftfix$sitterLog.incrementAndGet();
                         if (c <= 200) {
                             LOG.info("[craftfix] 機器源降量重算 {}：{} → {}", what, amount, tryAmount);
                         }
                         plan = p2;
+                        succeeded = true;
                         break;
                     }
+                }
+                if (!succeeded) {
+                    LOG.warn("[craftfix] 機器源降量重算全失敗 {} x{}（試 {} 次{}{}）→ 保留原 CRAFT_LESS；"
+                                    + "同 grid/requester/key {} 秒內不再重算",
+                            what, amount, attempts,
+                            timedOut ? "、共用時間預算 " + gtocraftfix$DOWNSCALE_BUDGET_MS + "ms 已耗盡" : "",
+                            retryFailure == null ? "" : "、例外=" + retryFailure,
+                            gtocraftfix$DOWNSCALE_COOLDOWN_SEC);
                 }
             }
             cir.setReturnValue(CompletableFuture.completedFuture(plan));
@@ -1286,20 +1590,33 @@ public abstract class CraftingServiceSyncMixin {
     // 且不排樣板 → job 等一個沒人會做的料 → 永久凍結。
     // 修補：提交前重算帳——usedItems 超出網路實際可取的缺口，直接把該料的樣板 runs 補進
     // 「同一張計畫」（不生新任務、不佔額外 CPU）；新增 runs 的輸入遞迴同法補平：
-    // 網路夠 → 記進 usedItems；不夠 → 繼續補樣板。有界迴圈，任何失敗放行原計畫。
+    // 網路夠 → 記進 usedItems；不夠 → 繼續補樣板。有界迴圈，中途失敗整組還原；是否拒收由守衛決定。
     @Inject(method = "submitJob", at = @At("HEAD"), cancellable = true, remap = false)
     private void gtocraftfix$repairPlan(ICraftingPlan job, ICraftingRequester requestingMachine, ICraftingCPU target,
                                         boolean prioritizePower, IActionSource src,
                                         CallbackInfoReturnable<ICraftingSubmitResult> cir) {
+        // [3.13.2] 看的是「提交時收到的形狀」：機器源零 tasks 不先嘗試修成另一張單，一律誠實拒收。
+        // 玩家來源不套此守衛；方法尾仍再驗一次，防修補／還原意外產生退化形狀。
+        if (gtocraftfix$isDegenerateMachinePlan(job, src)) {
+            cir.setReturnValue(appeng.crafting.execution.CraftingSubmitResult.INCOMPLETE_PLAN);
+            if (gtocraftfix$sitterLog.incrementAndGet() <= 200) {
+                LOG.warn("[craftfix] 退化／不可判定計畫（機器源、無合成任務快照）→ 拒收");
+            }
+            return;
+        }
+        if (!(job instanceof CraftingPlan plan)) {
+            // [3.7.0] 非 GTO CraftingPlan 仍保留提交診斷；安全守衛必須先跑，避免診斷例外繞過拒收。
+            com.gtocraftfix.diag.CraftDiag.onSubmit(gtocraftfix$tickCounter, job, src, requestingMachine,
+                    craftingCPUClusters);
+            return;
+        }
         // [3.7.0] 提交入口記錄（來源／計畫概要／重下單次數），並記下「誰已經在跑單」供 RETURN 對帳
         com.gtocraftfix.diag.CraftDiag.onSubmit(gtocraftfix$tickCounter, job, src, requestingMachine,
                 craftingCPUClusters);
-        if (!(job instanceof CraftingPlan plan)) {
-            return;
-        }
         com.gtocraftfix.diag.CraftDiag.dumpPlan(plan); // [3.7.0] 計畫出生留底（任務／used／missing）
         if (gtocraftfix$SLIM) {
-            // [slim 3.3.0] 計畫修補**已啟用**（下方照跑）；只有兩個拒單守衛仍停用（見方法末尾）。
+            // [slim 3.3.0] 計畫修補**已啟用**（下方照跑）；一般真缺料擋單仍停用，但機器源零任務
+            // 退化計畫是安全例外，任何分支都拒收。
             // [3.2.3] 修補前先把「幻影缺口」點出來：usedItems 要的量網路實際取不到、且計畫沒排任何
             // 樣板產它 → 不修就必然變成永遠等不到的 waitingFor（凍結源自計畫本身，與機器/認領無關）。
             try {
@@ -1364,6 +1681,7 @@ public abstract class CraftingServiceSyncMixin {
         boolean repairDone = false;
         boolean snapReady = false; // [3.11.2／X5] 三份快照都填完才可以拿去還原
         try {
+            long repairStartedAt = System.nanoTime();
             var storage = grid.getStorageService().getInventory();
             used = plan.usedItems();
             missing = plan.missingItems();
@@ -1375,6 +1693,7 @@ public abstract class CraftingServiceSyncMixin {
             // [3.11.1／B1] 缺口元組＝{AEKey, Long 短缺量, Boolean hard, String 來源}；
             // 第 4 欄的來源決定「這筆缺口可以沖銷哪一本帳」（只有 SRC_USED 能降 usedItems）。
             var deficits = new ArrayDeque<Object[]>();
+            var finalKey = plan.finalOutput() == null ? null : plan.finalOutput().what();
 
             // ① missingItems：算料器標「缺」的量——有樣板就能補排（sim 計畫的病灶）。
             //    機器源的 sim 計畫會被 submitJob 守衛靜默拒單（玩家反而放行），全補完就把 sim 翻回 false。
@@ -1391,17 +1710,21 @@ public abstract class CraftingServiceSyncMixin {
                 long want = e.getLongValue();
                 long a = avail.computeIfAbsent(key,
                         k -> storage.extract(k, Long.MAX_VALUE / 2, Actionable.SIMULATE, src));
-                long take = Math.min(want, a - reserved.getOrDefault(key, 0L));
+                long take = Math.min(want, Math.max(0,
+                        CraftingHotfixSupport.saturatingSubtract(a, reserved.getOrDefault(key, 0L))));
                 if (take < want) {
-                    deficits.add(new Object[] { key, want - take, Boolean.TRUE, gtocraftfix$SRC_USED });
+                    deficits.add(new Object[] { key,
+                            CraftingHotfixSupport.positiveDeficit(want, take),
+                            Boolean.TRUE, gtocraftfix$SRC_USED });
                 }
-                reserved.merge(key, Math.max(0, take), Long::sum);
+                reserved.merge(key, Math.max(0, take), CraftingHotfixSupport::saturatingAdd);
             }
             // ③ 最終產出量檢查：整條鏈 runs 取整後總產出可能 < 需求（實測 flake 差 19 →
-            //    所有任務做完仍交不齊、永凍）。產出＋現貨＋放射 < 需求 → 差額列缺口補樣板。
+            //    所有任務做完仍交不齊、永凍）。樣板產出＋放射 < 需求 → 差額列缺口補樣板；
+            //    used(final) 現貨不算，因為執行器不會把開局吸入 CPU 的 final 交給 link。
             if (plan.finalOutput() != null) {
-                var outKey = plan.finalOutput().what();
-                long supply = used.get(outKey) + plan.emittedItems().get(outKey);
+                var outKey = finalKey;
+                long patternProduced = 0;
                 for (var en : pt.entrySet()) {
                     Long r = en.getValue();
                     if (r == null || r <= 0) {
@@ -1409,11 +1732,15 @@ public abstract class CraftingServiceSyncMixin {
                     }
                     for (var o : en.getKey().getOutputs()) {
                         if (outKey.equals(o.what())) {
-                            supply += o.amount() * r;
+                            patternProduced = CraftingHotfixSupport.saturatingAdd(patternProduced,
+                                    CraftingHotfixSupport.saturatingMultiply(o.amount(), r));
                         }
                     }
                 }
-                long needOut = plan.finalOutput().amount() - supply;
+                // GTO 不會把開局吸入 CPU 的 used(final) 交給 link；最終可交付量只能算 emitted＋樣板產出。
+                long supply = CraftingHotfixSupport.finalDeliverable(
+                        plan.emittedItems().get(outKey), patternProduced);
+                long needOut = CraftingHotfixSupport.positiveDeficit(plan.finalOutput().amount(), supply);
                 if (needOut > 0) {
                     // [3.11.1／B2] 標 SRC_FINAL：這筆缺口從沒加進 usedItems，沖銷它等於「加了輪次
                     // 又從 usedItems 扣掉等量」＝供給原地踏步（自我抵銷），下方沖銷段一律不碰。
@@ -1423,10 +1750,6 @@ public abstract class CraftingServiceSyncMixin {
                     }
                 }
             }
-            if (deficits.isEmpty()) {
-                return; // 帳是平的，不動
-            }
-
             int guard = 0;
             int repaired = 0;
             long addedRuns = 0;
@@ -1449,13 +1772,12 @@ public abstract class CraftingServiceSyncMixin {
             snapUsed = snapUsed0;
             snapMissing = snapMissing0;
             snapReady = true;
-            var finalKey = plan.finalOutput() == null ? null : plan.finalOutput().what();
             // [3.13.0] 本次修補的新增輪數上限：跟著原計畫規模縮放（見 REPAIR_RUN_FACTOR 的 javadoc）。
             // 固定 200 萬對 112 萬輪的計畫來說，正常修補量就會撞牆 → 整組還原 → 必凍。
             long planRounds = 0;
             for (var v : snapPt.values()) {
                 if (v != null && v > 0) {
-                    planRounds += v;
+                    planRounds = CraftingHotfixSupport.saturatingAdd(planRounds, v);
                 }
             }
             long runCap = gtocraftfix$REPAIR_RUN_CAP;
@@ -1472,11 +1794,10 @@ public abstract class CraftingServiceSyncMixin {
                 runCap = Math.min(runCap, gtocraftfix$REPAIR_RUN_HARD_CAP);
             }
             // 外圈：解缺口 → 可執行性模擬（抓循環自舉缺口）→ 再解，最多 4 輪
-            long t0 = System.nanoTime();
             for (int round = 0; round < 4; round++) {
             while (!deficits.isEmpty() && guard++ < gtocraftfix$REPAIR_GUARD) {
-                if (gtocraftfix$REPAIR_BUDGET_NS != Long.MAX_VALUE && (guard & 255) == 0
-                        && System.nanoTime() - t0 > gtocraftfix$REPAIR_BUDGET_NS) {
+                if ((guard & 63) == 0 && CraftingHotfixSupport.budgetExpired(
+                        repairStartedAt, gtocraftfix$REPAIR_BUDGET_NS, System.nanoTime())) {
                     abortReason = "超過時間預算 " + (gtocraftfix$REPAIR_BUDGET_NS / 1_000_000)
                             + "ms（已處理 " + guard + " 項、仍剩 " + deficits.size() + " 項）";
                     break;
@@ -1509,16 +1830,17 @@ public abstract class CraftingServiceSyncMixin {
                 if (gtocraftfix$REPAIR_NET_SPOT && shortAmt > 0 && !key.equals(finalKey)) {
                     long a0 = avail.computeIfAbsent(key,
                             k -> storage.extract(k, Long.MAX_VALUE / 2, Actionable.SIMULATE, src));
-                    long free0 = Math.max(0, a0 - reserved.getOrDefault(key, 0L));
+                    long free0 = Math.max(0, CraftingHotfixSupport.saturatingSubtract(
+                            a0, reserved.getOrDefault(key, 0L)));
                     long fromNet0 = Math.min(shortAmt, free0);
                     if (fromNet0 > 0) {
-                        used.add(key, fromNet0);
-                        reserved.merge(key, fromNet0, Long::sum);
+                        gtocraftfix$addCounterSaturated(used, key, fromNet0);
+                        reserved.merge(key, fromNet0, CraftingHotfixSupport::saturatingAdd);
                         long fm0 = Math.min(fromNet0, Math.max(0, missing.get(key)));
                         if (fm0 > 0) {
-                            missing.add(key, -fm0);
+                            gtocraftfix$addCounterSaturated(missing, key, -fm0);
                         }
-                        shortAmt -= fromNet0;
+                        shortAmt = CraftingHotfixSupport.positiveDeficit(shortAmt, fromNet0);
                         repaired++;
                         if (repaired <= 8) {
                             note.append(key).append(" +").append(fromNet0).append("(網路現貨); ");
@@ -1590,8 +1912,8 @@ public abstract class CraftingServiceSyncMixin {
                     continue;
                 }
                 long batch = Math.max(1, batchOut);
-                long runs = (shortAmt + batch - 1) / batch; // ceil
-                addedRuns += runs;
+                long runs = CraftingHotfixSupport.ceilDivPositive(shortAmt, batch);
+                addedRuns = CraftingHotfixSupport.saturatingAdd(addedRuns, runs);
                 if (addedRuns > runCap) {
                     abortReason = "新增輪數 " + addedRuns + " 超過上限 " + runCap
                             + "（原計畫 " + planRounds + " 輪 × 係數 " + gtocraftfix$REPAIR_RUN_FACTOR
@@ -1599,7 +1921,7 @@ public abstract class CraftingServiceSyncMixin {
                             + "、天花板 " + gtocraftfix$REPAIR_RUN_HARD_CAP + "）";
                     break;
                 }
-                pt.merge(pat, runs, Long::sum);
+                pt.merge(pat, runs, CraftingHotfixSupport::saturatingAdd);
                 // [3.11.1／B1+B2] 缺口沖銷：**只有 SRC_USED（usedItems 幻影）才可以降 usedItems**——
                 // 那筆 usedItems 是網路給不出的謊報，降下來才對得上帳；其他來源（SRC_FINAL 最終產出短缺、
                 // SRC_INPUT 新增 runs 的輸入、SRC_BOOTSTRAP 循環自舉）從來沒把量加進 usedItems，
@@ -1616,14 +1938,14 @@ public abstract class CraftingServiceSyncMixin {
                 if (!srcUnknown && (!srcOn || gtocraftfix$SRC_MISSING.equals(srcTag))) {
                     long fromMissing = Math.min(rest, Math.max(0, missing.get(key)));
                     if (fromMissing > 0) {
-                        missing.add(key, -fromMissing);
-                        rest -= fromMissing;
+                        gtocraftfix$addCounterSaturated(missing, key, -fromMissing);
+                        rest = CraftingHotfixSupport.positiveDeficit(rest, fromMissing);
                     }
                 }
                 if (rest > 0 && !srcUnknown && (!srcOn || gtocraftfix$SRC_USED.equals(srcTag))) {
                     long fromUsed = srcOff ? rest : Math.min(rest, Math.max(0, used.get(key)));
                     if (fromUsed > 0) {
-                        used.add(key, -fromUsed);
+                        gtocraftfix$addCounterSaturated(used, key, -fromUsed);
                     }
                 }
                 repaired++;
@@ -1639,18 +1961,22 @@ public abstract class CraftingServiceSyncMixin {
                     }
                     var prim = possible[0];
                     var inKey = prim.what();
-                    long need = prim.amount() * input.getMultiplier() * runs;
+                    long perInput = CraftingHotfixSupport.saturatingMultiply(
+                            prim.amount(), input.getMultiplier());
+                    long need = CraftingHotfixSupport.saturatingMultiply(perInput, runs);
                     long a = avail.computeIfAbsent(inKey,
                             k -> storage.extract(k, Long.MAX_VALUE / 2, Actionable.SIMULATE, src));
-                    long free = Math.max(0, a - reserved.getOrDefault(inKey, 0L));
+                    long free = Math.max(0, CraftingHotfixSupport.saturatingSubtract(
+                            a, reserved.getOrDefault(inKey, 0L)));
                     long fromNet = Math.min(need, free);
                     if (fromNet > 0) {
-                        used.add(inKey, fromNet);
-                        reserved.merge(inKey, fromNet, Long::sum);
+                        gtocraftfix$addCounterSaturated(used, inKey, fromNet);
+                        reserved.merge(inKey, fromNet, CraftingHotfixSupport::saturatingAdd);
                     }
-                    if (need - fromNet > 0) {
+                    long remainingNeed = CraftingHotfixSupport.positiveDeficit(need, fromNet);
+                    if (remainingNeed > 0) {
                         // [3.11.1／B1] SRC_INPUT：新增 runs 的輸入需求，從未加進 usedItems → 不可沖銷
-                        deficits.add(new Object[] { inKey, need - fromNet, Boolean.TRUE,
+                        deficits.add(new Object[] { inKey, remainingNeed, Boolean.TRUE,
                                 gtocraftfix$SRC_INPUT });
                     }
                 }
@@ -1666,7 +1992,13 @@ public abstract class CraftingServiceSyncMixin {
             // 可執行性模擬：紙上執行整張計畫（usedItems 當起始庫存、逐輪跑可跑的樣板）。
             // 跑不完＝有樣板被「0 庫存的輸入」卡死＝循環自舉缺口（如 H₂O₂ 蒽醌工作液：
             // 帳面淨消耗 0 → 不在 usedItems/missing → 但執行要有第一桶才轉得起來）→ 補進缺口再解。
-            var bootstrap = gtocraftfix$findBootstrapDeficits(plan);
+            var bootstrap = gtocraftfix$findBootstrapDeficits(
+                    plan, repairStartedAt, gtocraftfix$REPAIR_BUDGET_NS);
+            if (bootstrap == null) {
+                abortReason = "循環自舉模擬超過共用時間預算 "
+                        + (gtocraftfix$REPAIR_BUDGET_NS / 1_000_000) + "ms";
+                break;
+            }
             for (var b : bootstrap) {
                 deficits.add(b);
                 if (gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
@@ -1680,11 +2012,11 @@ public abstract class CraftingServiceSyncMixin {
             // [3.11.1／B6，3.11.2／M1 改成預設只記錄] 外圈 4 輪跑滿仍有缺口。
             // 推導（見 REPAIR_STRICT_ROUNDS 的 javadoc）：內圈 while 只有「缺口清空」與「guard／runCap／
             // 時間預算耗盡（已設 abortReason 並 break）」兩種出口，所以走到這裡且 abortReason==null
-            // ⇒ 必然是第 4 輪末尾 findBootstrapDeficits 又回報缺口 ⇒ **殘留的一定是 soft 自舉猜測**、
-            // 所有硬缺口都已修好。把這種計畫整組還原成未修補的原計畫＝幻影 usedItems 沒補 →
+            // ⇒ 正常情況是第 4 輪末尾 findBootstrapDeficits 又回報 soft 自舉猜測；防禦上仍驗證每筆，
+            // 任何 hard 殘留都必須中止。全 soft 時若整組還原成未修補的原計畫＝幻影 usedItems 沒補 →
             // IgnoreMissing 掛出永遠等不到的 waitingFor → 必凍；而 findBootstrapDeficits 只看
             // poss[0] 主變體，靠替代輸入滿足的樣板會被誤判、每輪回報同一筆 → 確定性重現。
-            // 故預設**只印一行 WARN**（不設 abortReason、不還原）；要嚴格中止請自己開旗標 A/B。
+            // 故「確定全 soft」時預設只印 WARN；只要含 hard 就無條件中止，strict 旗標僅控制全 soft。
             if (abortReason == null && !deficits.isEmpty()) {
                 boolean allSoft = true;
                 for (var d : deficits) {
@@ -1693,55 +2025,20 @@ public abstract class CraftingServiceSyncMixin {
                         break;
                     }
                 }
-                if (gtocraftfix$REPAIR_STRICT_ROUNDS) {
+                if (!allSoft || gtocraftfix$REPAIR_STRICT_ROUNDS) {
                     abortReason = "外圈 4 輪仍有未解缺口（剩 " + deficits.size() + " 項"
                             + (allSoft ? "、全為 soft" : "、含 hard") + "）";
                 } else if (gtocraftfix$repairNoteLog.incrementAndGet() <= gtocraftfix$NOTE_LOG_MAX) {
                     LOG.warn("[craftfix] 外圈 4 輪後仍有殘留缺口：剩 {} 項（{}）→ 照送已修好的計畫"
                             + "（預設不還原：還原成原計畫才是必凍）out={}",
                             deficits.size(),
-                            allSoft ? "全為 soft＝近似模擬的自舉猜測" : "含 hard 缺口，請查 log 上文",
+                            "全為 soft＝近似模擬的自舉猜測",
                             plan.finalOutput());
                 }
             }
-            // [3.11.2／X1] **repairDone 必須在這裡設**，不能等到 try 的最後一行——
-            // 那樣 catch 內恆為 false，整個「例外時不要倒掉修好的計畫」機制就是死碼。
-            // 走到這裡代表：外圈已收斂、abortReason 為 null ＝ pt/used/missing 已是修好的狀態。
-            // 之後的每一段（B2 驗證、配平觀測、removeZeros、log、sim 翻轉）都不改變修補結論，
-            // 任何一段拋例外都不該讓計畫被倒回幻影狀態。
-            if (abortReason == null) {
-                repairDone = true;
-            }
-            // [3.11.1／B2] 最終產出驗證：排定產出 ＋ usedItems ＋ emittedItems 必須 ≥ 需求量。
-            // 只印 WARN、**不自動再補**（再補會回到「加輪次 → 新輸入缺口 → 再補」的遞迴發散）。
-            // [3.11.2／M3] 自己包一層 try/catch：這段是**純觀測**，卻位在「修補已成功」之後、
-            // 外層 catch 的還原範圍之內——任何一句拋例外都會把修好的計畫倒回幻影計畫。
-            // [3.11.2／M5] 額度改用獨立的 finalCheckLog，不再吃 balLog（避免燒掉 3.8.0 就有的診斷）。
-            if (abortReason == null && finalKey != null && plan.finalOutput() != null) {
-                try {
-                    long outSupply = used.get(finalKey) + plan.emittedItems().get(finalKey);
-                    for (var en : pt.entrySet()) {
-                        Long r2 = en.getValue();
-                        if (r2 == null || r2 <= 0) {
-                            continue;
-                        }
-                        for (var o : en.getKey().getOutputs()) {
-                            if (finalKey.equals(o.what())) {
-                                outSupply += o.amount() * r2;
-                            }
-                        }
-                    }
-                    if (outSupply < plan.finalOutput().amount()
-                            && gtocraftfix$finalCheckLog.incrementAndGet() <= gtocraftfix$FINAL_CHECK_LOG_MAX) {
-                        LOG.warn("[craftfix] 修補後最終產出仍不足：{} 供給{}/需求{}（不自動再補，避免遞迴）out={}",
-                                finalKey, outSupply, plan.finalOutput().amount(), plan.finalOutput());
-                    }
-                } catch (Throwable t2) {
-                    if (gtocraftfix$finalCheckLog.incrementAndGet() <= 5) {
-                        LOG.warn("[craftfix] 最終產出驗證失敗（純觀測，不影響計畫）：{}", t2.toString());
-                    }
-                }
-            }
+            // repairDone 要等可選配平原子完成；配平若半途例外，仍須整組倒回快照，
+            // 不能留下「輪次已改＋只補一半 usedItems」的計畫。最終交付守衛刻意不在
+            // 這裡觀測：必須等本段可能的配平例外／rollback 結束，再直接檢查最後實際要提交的 plan。
             // [3.9.1] 第五維：內部配平**只做網路現貨補齊**，一趟做完、不排樣板、不遞迴。
             // 3.9.0 曾把配平缺口丟回缺口佇列（＝補樣板輪次），結果遞迴發散：實測 LUV 電路的缺口
             // 6 輪後從 glowstone 147456 膨脹到 3833856，計畫被灌大且仍不平，交付量從 466/500 掉到 8/500。
@@ -1763,51 +2060,68 @@ public abstract class CraftingServiceSyncMixin {
             boolean balApply = gtocraftfix$REPAIR_BALANCE
                     && (abortReason == null || gtocraftfix$REPAIR_BALANCE_ON_ABORT);
             if (balApply || gtocraftfix$REPAIR_BALANCE_LOG) {
-                if (balApply) {
-                    // 還原後 reserved 必須用「現在的 usedItems」重建，否則會誤以為現貨已被佔走
-                    reserved.clear();
-                    for (var e : used) {
-                        if (e.getLongValue() > 0) {
-                            reserved.merge(e.getKey(), e.getLongValue(), Long::sum);
-                        }
-                    }
-                }
                 var bal = gtocraftfix$internalBalanceDeficits(plan);
-                long filled = 0;
-                var miss = new StringBuilder();
-                int mn = 0;
-                for (var b : bal) {
-                    var bk = (AEKey) b[0];
-                    long need = (Long) b[1];
-                    if (bk.equals(finalKey)) {
-                        continue; // 成品不吸現貨（GTO 沒有把開局現貨交給 link 的步驟）
+                if (bal == null) {
+                    if (gtocraftfix$balanceLog.incrementAndGet() <= gtocraftfix$BALANCE_LOG_MAX) {
+                        LOG.warn("[craftfix] 內部配平 out={} 無法判定（掃描例外）；未採用任何部分結果{}",
+                                plan.finalOutput(), balApply ? "，整組計畫將還原" : "（只觀測）");
                     }
-                    long take1 = 0;
                     if (balApply) {
-                        long a1 = avail.computeIfAbsent(bk,
-                                k -> storage.extract(k, Long.MAX_VALUE / 2, Actionable.SIMULATE, src));
-                        long free1 = Math.max(0, a1 - reserved.getOrDefault(bk, 0L));
-                        take1 = Math.min(need, free1);
-                        if (take1 > 0) {
-                            used.add(bk, take1);
-                            reserved.merge(bk, take1, Long::sum);
-                            filled += take1;
-                            repaired++;
+                        // repairDone 尚未設成 true；交給共用 catch 還原 patternTimes／used／missing／allocations。
+                        throw new IllegalStateException("內部配平掃描失敗");
+                    }
+                } else {
+                    if (balApply) {
+                        // 先確認完整掃描成功，才重建 reserved／開始碰 used；失敗不可能套用部分列表。
+                        reserved.clear();
+                        for (var e : used) {
+                            if (e.getLongValue() > 0) {
+                                reserved.merge(e.getKey(), e.getLongValue(),
+                                        CraftingHotfixSupport::saturatingAdd);
+                            }
                         }
                     }
-                    if (need - take1 > 0 && mn++ < 5) {
-                        miss.append(bk).append(" x").append(need - take1).append("; ");
+                    long filled = 0;
+                    var miss = new StringBuilder();
+                    int mn = 0;
+                    for (var b : bal) {
+                        var bk = (AEKey) b[0];
+                        long need = (Long) b[1];
+                        if (bk.equals(finalKey)) {
+                            continue; // 成品不吸現貨（GTO 沒有把開局現貨交給 link 的步驟）
+                        }
+                        long take1 = 0;
+                        if (balApply) {
+                            long a1 = avail.computeIfAbsent(bk,
+                                    k -> storage.extract(k, Long.MAX_VALUE / 2, Actionable.SIMULATE, src));
+                            long free1 = Math.max(0, CraftingHotfixSupport.saturatingSubtract(
+                                    a1, reserved.getOrDefault(bk, 0L)));
+                            take1 = Math.min(need, free1);
+                            if (take1 > 0) {
+                                gtocraftfix$addCounterSaturated(used, bk, take1);
+                                reserved.merge(bk, take1, CraftingHotfixSupport::saturatingAdd);
+                                filled = CraftingHotfixSupport.saturatingAdd(filled, take1);
+                                repaired++;
+                            }
+                        }
+                        long stillNeed = CraftingHotfixSupport.positiveDeficit(need, take1);
+                        if (stillNeed > 0 && mn++ < 5) {
+                            miss.append(bk).append(" x").append(stillNeed).append("; ");
+                        }
+                    }
+                    // [3.11.2／M5] 配平觀測是每次提交都可能印的新訊息，額度改走獨立的 balanceLog：
+                    // 原本共用 balLog 會把「開單即缺／最終產出短缺／循環自舉缺口／計畫修補」這些
+                    // 3.8.0 時代就有的診斷提前燒到靜音。
+                    if ((filled > 0 || mn > 0)
+                            && gtocraftfix$balanceLog.incrementAndGet() <= gtocraftfix$BALANCE_LOG_MAX) {
+                        LOG.info("[craftfix] 內部配平 out={} {}{}", plan.finalOutput(),
+                                balApply ? "網路補齊" + filled + "單位" : "（只觀測，未補齊）",
+                                mn == 0 ? "（帳已平）" : "；仍缺：" + miss);
                     }
                 }
-                // [3.11.2／M5] 配平觀測是每次提交都可能印的新訊息，額度改走獨立的 balanceLog：
-                // 原本共用 balLog 會把「開單即缺／最終產出短缺／循環自舉缺口／計畫修補」這些
-                // 3.8.0 時代就有的診斷提前燒到靜音。
-                if ((filled > 0 || mn > 0)
-                        && gtocraftfix$balanceLog.incrementAndGet() <= gtocraftfix$BALANCE_LOG_MAX) {
-                    LOG.info("[craftfix] 內部配平 out={} {}{}", plan.finalOutput(),
-                            balApply ? "網路補齊" + filled + "單位" : "（只觀測，未補齊）",
-                            mn == 0 ? "（帳已平）" : "；仍缺：" + miss);
-                }
+            }
+            if (abortReason == null) {
+                repairDone = true;
             }
             if (abortReason != null) {
                 var left = new StringBuilder();
@@ -1828,7 +2142,7 @@ public abstract class CraftingServiceSyncMixin {
                 // [3.11.0] 擋單改成旗標：off（預設，＝3.8.0 的「還原後照原樣送出」）／on／force。
                 // on 在 slim 分支自動不生效——另外兩個擋單點（下方 blockSubmit、退化計畫）都有 SLIM 例外，
                 // 只有這裡沒有，等於 3.10.0 起 slim 版違反了自己「只修計畫、不擋單」的約束。
-                boolean machineSrc2 = src == null || src.player().isEmpty();
+                boolean machineSrc2 = gtocraftfix$isMachineSource(src);
                 boolean doBlock = "force".equals(gtocraftfix$REPAIR_BLOCK)
                         || ("on".equals(gtocraftfix$REPAIR_BLOCK) && !gtocraftfix$SLIM);
                 boolean willFreeze = false;
@@ -1900,7 +2214,8 @@ public abstract class CraftingServiceSyncMixin {
                         || "force".equals(gtocraftfix$REPAIR_BLOCK);
                 // [3.11.2／X4] 再加一道 machineSrc2：force ＋ 玩家源時，上面的 WARN 印「玩家路徑照原樣送出」
                 // 卻 fall-through 到尾端拒單（SLIM=false 建置），log 與實際行為相反。玩家源一律 return。
-                if (!blockCfg || !machineSrc2) {
+                boolean degenerateMachinePlan = gtocraftfix$isDegenerateMachinePlan(plan, src);
+                if ((!blockCfg && !degenerateMachinePlan) || !machineSrc2) {
                     // 不吞掉「真缺料」這件事：本次若曾判定過硬缺口無樣板可補，明說守衛被略過的理由。
                     if (blockSubmit
                             && gtocraftfix$repairNoteLog.incrementAndGet() <= gtocraftfix$NOTE_LOG_MAX) {
@@ -1908,6 +2223,9 @@ public abstract class CraftingServiceSyncMixin {
                                 + "要在中止後擋單請設 -Dgtodiag.repairBlockOnAbort=on/force）out={}",
                                 plan.finalOutput());
                     }
+                    // 中止路徑預設會在這裡提前離開；先針對已還原後的實際 plan 重算 final，避免
+                    // used(final) 不可交付的必凍形狀繞過方法尾守衛。
+                    gtocraftfix$rejectProvenFinalShortfall(plan, src, cir);
                     return;
                 }
                 aborted = true;
@@ -1940,13 +2258,13 @@ public abstract class CraftingServiceSyncMixin {
                         long baseRuns = 0;
                         for (var v : snapPt.values()) {
                             if (v != null && v > 0) {
-                                baseRuns += v;
+                                baseRuns = CraftingHotfixSupport.saturatingAdd(baseRuns, v);
                             }
                         }
                         long nowRuns = 0;
                         for (var v : pt.values()) {
                             if (v != null && v > 0) {
-                                nowRuns += v;
+                                nowRuns = CraftingHotfixSupport.saturatingAdd(nowRuns, v);
                             }
                         }
                         long oldBytes = plan.bytes();
@@ -1989,8 +2307,8 @@ public abstract class CraftingServiceSyncMixin {
                         }
                     }
                 }
-                // [3.11.2／X1] repairDone 已在外圈收斂處（abortReason==null 當下）設好，這裡不再重設——
-                // 設在這裡等於是 try 的最後一行，catch 內永遠讀到 false，機制形同死碼。
+                // [3.13.2] repairDone 已在 allocations 清理與可選配平都成功後設好；後續只有
+                // removeZeros／診斷與各自 fail-soft 的 bytes、simulation 反射，不再碰修補的原子狀態。
             }
         } catch (Throwable t) {
             // [3.11.1／B3] 例外也要整組還原：原本只記 log 就放行，等於把「輪次加了、輸入沒補」的
@@ -2014,6 +2332,23 @@ public abstract class CraftingServiceSyncMixin {
                         repairDone ? "修補已完成，保留修好的計畫、不還原" : "放行原計畫", t);
             }
         }
+        // 所有修補、配平、例外還原都結束後才看當下 plan；不沿用任何修補前／修補中的快照判定。
+        if (gtocraftfix$rejectProvenFinalShortfall(plan, src, cir)) {
+            return;
+        }
+        // [3.13.2] 機器源退化計畫永遠拒收（slim 也一樣）。GTO 沒有把開局吸入的 final 現貨交給
+        // link 的步驟；used-only／零任務計畫一旦上機只會抱貨永凍。玩家來源維持原行為。
+        if (gtocraftfix$isDegenerateMachinePlan(plan, src)) {
+            int c = gtocraftfix$sitterLog.incrementAndGet();
+            if (c <= 200) {
+                LOG.warn("[craftfix] 退化計畫（機器源、無合成任務）out={} → 拒收", plan.finalOutput());
+            }
+            if (!resultSet) {
+                cir.setReturnValue(appeng.crafting.execution.CraftingSubmitResult.INCOMPLETE_PLAN);
+                resultSet = true;
+            }
+            return;
+        }
         // 真缺料（無樣板可補的硬缺口）→ 擋下提交：提交了必凍。機器每 2 秒重試（聊天室/log 已去重）；
         // 玩家按確認會沒反應，但聊天室已說明缺什麼。
         // [3.11.1／B5 → 3.11.2／M2] 中止路徑**只有在 repairBlockOnAbort=on/force 時**才 fall-through
@@ -2030,22 +2365,6 @@ public abstract class CraftingServiceSyncMixin {
                 resultSet = true;
             }
             return;
-        }
-        // 機器源退化計畫（修補後仍無任何合成任務）→ 拒單。GTO 沒有「開局吸入的現貨交給 link」
-        // 的步驟，這種 job 會抱著現貨永凍（實測 NAND 625）。拒掉後接口下一輪 acquireFromNetwork
-        // 會自己拉現貨，自然收斂。
-        // [3.11.1／B5] src 補 null 判斷：中止路徑改成 fall-through 後這行才會在「中止」時被走到，
-        // 而上方必凍探針早就寫著 src 可能為 null（原本 return 掉所以碰不到）。
-        if (src != null && src.player().isEmpty() && plan.patternTimes().isEmpty()) {
-            int c = gtocraftfix$sitterLog.incrementAndGet();
-            if (c <= 200) {
-                LOG.warn("[craftfix] 退化計畫（無合成任務）out={}{}", plan.finalOutput(),
-                        gtocraftfix$SLIM ? "（slim：不拒單，僅紀錄）" : "→ 拒收");
-            }
-            if (!gtocraftfix$SLIM && !resultSet) { // [slim 3.3.0] 只修計畫不擋單
-                cir.setReturnValue(appeng.crafting.execution.CraftingSubmitResult.INCOMPLETE_PLAN);
-                resultSet = true;
-            }
         }
     }
 
@@ -2065,7 +2384,7 @@ public abstract class CraftingServiceSyncMixin {
     private void gtocraftfix$diagMachineFail(ICraftingPlan job, ICraftingRequester requestingMachine,
                                              ICraftingCPU target, boolean prioritizePower, IActionSource src,
                                              CallbackInfoReturnable<ICraftingSubmitResult> cir) {
-        if (src.player().isPresent()) {
+        if (!gtocraftfix$isMachineSource(src)) {
             return;
         }
         var r = cir.getReturnValue();
@@ -2073,13 +2392,15 @@ public abstract class CraftingServiceSyncMixin {
             return;
         }
         // 同 key+錯誤 只記一次（機器追蹤器會每 2 秒重試，避免洗版）
-        String sig = job.finalOutput().what() + "|" + r.errorCode();
+        var finalOutput = job == null ? null : job.finalOutput();
+        String sig = (finalOutput == null ? "?" : String.valueOf(finalOutput.what())) + "|" + r.errorCode();
         if (gtocraftfix$failLogged.add(sig)) {
             if (gtocraftfix$failLogged.size() > 128) {
                 gtocraftfix$failLogged.clear();
             }
             LOG.warn("[craftfix] 機器源提交失敗 err={} sim={} missing={} out={}",
-                    r.errorCode(), job.simulation(), job.missingItems().size(), job.finalOutput());
+                    r.errorCode(), job != null && job.simulation(),
+                    job == null || job.missingItems() == null ? -1 : job.missingItems().size(), finalOutput);
         }
     }
 
@@ -2090,7 +2411,8 @@ public abstract class CraftingServiceSyncMixin {
               remap = false)
     private ICraftingSubmitResult gtocraftfix$machineAsPlayer(CraftingCPUCluster cluster, IGrid g, ICraftingPlan plan,
                                                               IActionSource src, ICraftingRequester requester) {
-        if (src.player().isEmpty() && AEConfig.instance().isAllowMissingCraftingJobs()) {
+        if (src != null && gtocraftfix$isMachineSource(src)
+                && AEConfig.instance().isAllowMissingCraftingJobs()) {
             IActionSource wrapped = gtocraftfix$wrapPresentOnce(src, g);
             if (wrapped != null) {
                 return cluster.submitJob(g, plan, wrapped, requester);
@@ -2198,7 +2520,345 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
-    // ---- 修正 3：保母（[2.4.0] 每 tick 掃孤兒 waitingFor）＋ 診斷探針（每 20 秒）----
+    private static void gtocraftfix$feedError(String message, Throwable error) {
+        int n = gtocraftfix$feedErrorLog.incrementAndGet();
+        if (n <= 20) {
+            if (error == null) {
+                LOG.error("[craftfix] {}", message);
+            } else {
+                LOG.error("[craftfix] {}", message, error);
+            }
+        } else if (n == 21) {
+            LOG.error("[craftfix] 餵料回補 ERROR 已達 20 行，後續同類錯誤停止輸出（回補佇列仍會重試）");
+        }
+    }
+
+    private record NetworkSnapshot(Long amount, Throwable error) {
+    }
+
+    /** 以同一 IActionSource 量出目前可抽總量；SIMULATE 自身失敗只代表證據未知，不會改 storage。 */
+    private static NetworkSnapshot gtocraftfix$networkSnapshot(appeng.api.storage.MEStorage storage,
+            AEKey key, IActionSource src) {
+        try {
+            long amount = storage.extract(key, Long.MAX_VALUE, Actionable.SIMULATE, src);
+            if (amount < 0) {
+                return new NetworkSnapshot(null,
+                        new IllegalStateException("SIMULATE extract 回傳負數 " + amount));
+            }
+            return new NetworkSnapshot(amount, null);
+        } catch (Throwable error) {
+            return new NetworkSnapshot(null, error);
+        }
+    }
+
+    /**
+     * 任一 storage mutation／CPU waiting 帳無法證明時永久封鎖本 CraftingService 的自動搬料。
+     * attempted 只是人工盤點的上界，絕不放回自動回補佇列；首次訊息不受一般 ERROR 額度影響。
+     */
+    private void gtocraftfix$quarantineTransfers(AEKey key, long attempted, String reason, Throwable error) {
+        long attention = Math.max(0, attempted);
+        if (key != null && attention > 0) {
+            gtocraftfix$manualTransferAttention.merge(
+                    key, attention, CraftingHotfixSupport::saturatingAdd);
+        }
+        boolean first = !gtocraftfix$transferQuarantined;
+        gtocraftfix$transferQuarantined = true;
+        String message = "自動搬料帳目無法證明（" + reason + "）：" + key + " 嘗試量上界 " + attention
+                + "。本 grid 的 waiting feed／top-up／parallel rescue／refund replay 已全部停止；"
+                + "不會猜 0 或自動重播，請人工核對 storage、CPU inventory、waitingFor。"
+                + "此人工介入帳只存在目前 CraftingService 實例生命週期。";
+        if (first) {
+            if (error == null) {
+                LOG.error("[craftfix] **人工介入必要** {}", message);
+            } else {
+                LOG.error("[craftfix] **人工介入必要** {}", message, error);
+            }
+        } else {
+            gtocraftfix$feedError(message, error);
+        }
+    }
+
+    private boolean gtocraftfix$automaticTransfersAllowed() {
+        return !gtocraftfix$transferQuarantined;
+    }
+
+    /**
+     * NetworkStorage MODULATE extract 的唯一入口。
+     * <p>[3.13.2] 正常 return 以 <b>AE2 契約的回傳值</b>為準（{@code MEStorage.extract} 回傳「實際抽走多少」）。
+     * 不再拿 before/after 的 SIMULATE 差額去否決它：那等於替 AE2 的核心契約再發明一套裁決，而且每次搬料
+     * 都要多付一趟全網 SIMULATE。before 快照只留給「mutation 拋例外」這條真正無法從回傳值得知搬走多少
+     * 的路徑；回傳值落在 {@code [0, requested]} 之外才算契約破裂而 quarantine。
+     */
+    private CraftingHotfixSupport.TransferDelta gtocraftfix$measuredNetworkExtract(
+            appeng.api.storage.MEStorage storage, AEKey key, long requested, IActionSource src, String reason) {
+        if (requested <= 0) {
+            return new CraftingHotfixSupport.TransferDelta(true, 0);
+        }
+        if (!gtocraftfix$automaticTransfersAllowed()) {
+            return new CraftingHotfixSupport.TransferDelta(false, 0);
+        }
+        var before = gtocraftfix$networkSnapshot(storage, key, src);
+        if (before.amount() == null) {
+            gtocraftfix$feedError("MODULATE extract 前無法取得 SIMULATE 快照，未搬料："
+                    + key + " x" + requested + "（" + reason + "）", before.error());
+            return new CraftingHotfixSupport.TransferDelta(true, 0);
+        }
+
+        long reported;
+        try {
+            reported = storage.extract(key, requested, Actionable.MODULATE, src);
+        } catch (Throwable mutationError) {
+            // 沒有回傳值可用，只能靠 before/after 推；推不出來就整組隔離，不猜 0（猜 0 會遺失已抽走的貨）。
+            var after = gtocraftfix$networkSnapshot(storage, key, src);
+            var delta = CraftingHotfixSupport.extractedDelta(requested, before.amount(), after.amount());
+            if (!delta.known()) {
+                gtocraftfix$quarantineTransfers(key, requested,
+                        "NetworkStorage extract 例外且差額 UNKNOWN；before=" + before.amount()
+                                + " after=" + after.amount() + " reason=" + reason,
+                        after.error() != null ? after.error() : mutationError);
+                return delta;
+            }
+            gtocraftfix$feedError("NetworkStorage extract 例外但差額可證：" + key + " 實抽 "
+                    + delta.amount() + "/" + requested + "（" + reason + "）", mutationError);
+            return delta;
+        }
+        if (reported < 0 || reported > requested) {
+            gtocraftfix$quarantineTransfers(key, requested,
+                    "NetworkStorage extract 回傳量違反契約；reported=" + reported
+                            + " requested=" + requested + " reason=" + reason,
+                    null);
+            return new CraftingHotfixSupport.TransferDelta(false, 0);
+        }
+        return new CraftingHotfixSupport.TransferDelta(true, reported);
+    }
+
+    /**
+     * MODULATE insert 的唯一入口；以 AE2 契約的回傳值為準。
+     * <p>[3.13.2] <b>insert 這一側不能用 before/after 的可用量差額對帳</b>：AE2 的
+     * {@code CraftingServiceStorage} 以 {@code Integer.MAX_VALUE} 最高優先權掛在網路上，插進來的貨
+     * 只要有 CPU 的 {@code waitingFor} 在等就會被當場認領，<b>不會出現在可查詢庫存裡</b>（本 mod 的
+     * 「認領」診斷整節講的就是這件事）。此時 after==before → 差額 0 ≠ 回傳量 → 舊寫法會把完全正常的
+     * 回補判成帳目衝突並永久隔離整張 grid；而回補的觸發時機恰好就是「有 CPU 在等這個 key」，等於保證
+     * 誤觸。改為只驗回傳值是否落在 {@code [0, requested]}。
+     */
+    private CraftingHotfixSupport.TransferDelta gtocraftfix$measuredNetworkInsert(
+            appeng.api.storage.MEStorage storage, AEKey key, long requested, IActionSource src, String reason) {
+        if (requested <= 0) {
+            return new CraftingHotfixSupport.TransferDelta(true, 0);
+        }
+        if (!gtocraftfix$automaticTransfersAllowed()) {
+            return new CraftingHotfixSupport.TransferDelta(false, 0);
+        }
+        long reported;
+        try {
+            reported = storage.insert(key, requested, Actionable.MODULATE, src);
+        } catch (Throwable mutationError) {
+            // 接受量無法從外部觀測（見上方認領說明），例外＝真的不知道回進去多少 → 隔離。
+            gtocraftfix$quarantineTransfers(key, requested,
+                    "NetworkStorage insert 例外，實際接受量無法證明；reason=" + reason,
+                    mutationError);
+            return new CraftingHotfixSupport.TransferDelta(false, 0);
+        }
+        if (reported < 0 || reported > requested) {
+            gtocraftfix$quarantineTransfers(key, requested,
+                    "NetworkStorage insert 回傳量違反契約；reported=" + reported
+                            + " requested=" + requested + " reason=" + reason,
+                    null);
+            return new CraftingHotfixSupport.TransferDelta(false, 0);
+        }
+        return new CraftingHotfixSupport.TransferDelta(true, reported);
+    }
+
+    private void gtocraftfix$queueFeedRefund(AEKey key, long amount) {
+        if (amount > 0 && gtocraftfix$automaticTransfersAllowed()) {
+            gtocraftfix$feedRefunds.merge(key, amount, CraftingHotfixSupport::saturatingAdd);
+        } else if (amount > 0) {
+            gtocraftfix$manualTransferAttention.merge(
+                    key, amount, CraftingHotfixSupport::saturatingAdd);
+            gtocraftfix$feedError("自動搬料已隔離，已知待回補量不再自動重播："
+                    + key + " x" + amount + "（需人工介入）", null);
+        }
+    }
+
+    private static Long gtocraftfix$cpuAmount(
+            appeng.crafting.inv.ListCraftingInventory inventory, AEKey key) {
+        if (inventory == null) {
+            return null;
+        }
+        try {
+            return inventory.list.get(key);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * CPU insert 可能「先改庫存、後拋例外」；不能盲目把 extracted 全額回網路而複製已入 CPU 的部分。
+     * 同一伺服器緒上以 CPU 庫存 before/after 作實體持有證據，只回補可證明未入庫的差額。若反射
+     * 讀不到或差額方向／範圍不可能，不能猜 0 後全額回補；改進人工隔離並停止所有後續自動搬料。
+     */
+    private void gtocraftfix$restituteCpuInsertFailure(appeng.api.storage.MEStorage storage,
+            appeng.crafting.inv.ListCraftingInventory inventory, AEKey key, Long before,
+            long extracted, IActionSource src, String reason) {
+        Long after = gtocraftfix$cpuAmount(inventory, key);
+        var retainedProof = CraftingHotfixSupport.insertedDelta(extracted, before, after);
+        if (!retainedProof.known()) {
+            gtocraftfix$quarantineTransfers(key, extracted,
+                    "CPU inventory insert 後差額 UNKNOWN；before=" + before + " after=" + after
+                            + " reason=" + reason,
+                    null);
+            return;
+        }
+        long retained = retainedProof.amount();
+        long refund = CraftingHotfixSupport.positiveDeficit(extracted, retained);
+        gtocraftfix$returnExtracted(storage, key, refund, src,
+                reason + "；CPU 已入 " + retained);
+        if (retained > 0) {
+            gtocraftfix$feedError("CPU insert 例外前已有部分入庫：" + key + " CPU 留 " + retained
+                    + "、回補 " + refund + "/" + extracted + "（" + reason + "）", null);
+        }
+    }
+
+    /**
+     * GTO logic.insert 的順序是 waitingFor.extract → 計時帳 → CPU inventory.insert；中途拋例外時，
+     * 只看 CPU 差額會把「waiting 已扣、CPU 未留」的貨退回網路，卻留下不再等待的壞帳。這裡同時量
+     * 兩本帳：CPU 已留的視為接受，其餘先補回 waitingFor，再把實體差額退回 storage。
+     */
+    private void gtocraftfix$restituteLogicInsertFailure(appeng.api.storage.MEStorage storage,
+            appeng.crafting.inv.ListCraftingInventory cpuInventory,
+            appeng.crafting.inv.ListCraftingInventory waitingInventory,
+            AEKey key, long cpuBefore, long waitingBefore, long extracted,
+            IActionSource src, String reason) {
+        Long cpuAfter = gtocraftfix$cpuAmount(cpuInventory, key);
+        Long waitingAfter = gtocraftfix$cpuAmount(waitingInventory, key);
+        var retainedProof = CraftingHotfixSupport.insertedDelta(extracted, cpuBefore, cpuAfter);
+        var waitingProof = CraftingHotfixSupport.extractedDelta(extracted, waitingBefore, waitingAfter);
+        if (!retainedProof.known() || !waitingProof.known()) {
+            gtocraftfix$quarantineTransfers(key, extracted,
+                    "logic.insert 後 CPU/waitingFor 差額 UNKNOWN；cpu=" + cpuBefore + "→" + cpuAfter
+                            + " waiting=" + waitingBefore + "→" + waitingAfter,
+                    null);
+            return;
+        }
+
+        var compensation = CraftingHotfixSupport.logicInsertCompensation(
+                extracted, cpuBefore, cpuAfter, waitingBefore, waitingAfter);
+        long retained = compensation.retained();
+        long consumedWaiting = compensation.consumedWaiting();
+        long restoreWaiting = compensation.restoreWaiting();
+        long restoredWaiting = 0;
+        Throwable restoreError = null;
+        boolean restoreProofUnknown = false;
+        if (restoreWaiting > 0) {
+            long restoreBase = waitingAfter;
+            try {
+                // 直接回沖 KeyCounter，刻意不走 ListCraftingInventory listener；原例外可能正是 listener
+                // 在「KeyCounter 已改」後拋出，再呼 listener 只會重演例外並使交易無法復原。
+                gtocraftfix$addCounterSaturated(waitingInventory.list, key, restoreWaiting);
+            } catch (Throwable t) {
+                restoreError = t;
+            }
+            Long afterRestore = gtocraftfix$cpuAmount(waitingInventory, key);
+            var restoreProof = CraftingHotfixSupport.insertedDelta(
+                    restoreWaiting, restoreBase, afterRestore);
+            if (restoreProof.known()) {
+                restoredWaiting = restoreProof.amount();
+            } else {
+                restoreProofUnknown = true;
+            }
+        }
+
+        long unresolvedWaiting = CraftingHotfixSupport.positiveDeficit(restoreWaiting, restoredWaiting);
+        if (unresolvedWaiting > 0) {
+            gtocraftfix$feedError("logic.insert 例外後 waitingFor 回滾不完整：" + key
+                    + " 尚差 " + unresolvedWaiting + "/" + restoreWaiting
+                    + "（已保守把未入 CPU 的實體退回 storage）", restoreError);
+        }
+        long refund = compensation.physicalRefund();
+        gtocraftfix$returnExtracted(storage, key, refund, src,
+                reason + "；CPU 實留 " + retained + "、waitingFor 補回 " + restoredWaiting);
+        if (retained > consumedWaiting) {
+            gtocraftfix$feedError("logic.insert 例外後 CPU 留存大於 waitingFor 扣帳：" + key
+                    + " CPU 留 " + retained + "、waiting 扣 " + consumedWaiting
+                    + "；實體僅回補 " + refund + "，避免複製", restoreError);
+        }
+        if (retained != consumedWaiting || restoreWaiting > 0) {
+            gtocraftfix$feedError("logic.insert 例外交易已對帳：" + key + " 抽 " + extracted
+                    + "、CPU 實留 " + retained + "、waiting 扣 " + consumedWaiting
+                    + "、waitingFor 補回 " + restoredWaiting
+                    + "、storage 回 " + refund, restoreError);
+        }
+        if (restoreProofUnknown || unresolvedWaiting > 0 || retained > consumedWaiting) {
+            gtocraftfix$quarantineTransfers(key, extracted,
+                    "logic.insert 帳目回滾未完整證明；CPU 留=" + retained
+                            + " waiting扣=" + consumedWaiting + " waiting補=" + restoredWaiting
+                            + "/" + restoreWaiting,
+                    restoreError);
+        }
+    }
+
+    /** 把尚未被 CPU 接受的抽取量完整退回；storage 暫時拒收時保留帳並於後續 tick 優先重試。 */
+    private boolean gtocraftfix$returnExtracted(appeng.api.storage.MEStorage storage, AEKey key, long amount,
+                                                 IActionSource src, String reason) {
+        if (amount <= 0) {
+            return true;
+        }
+        if (!gtocraftfix$automaticTransfersAllowed()) {
+            gtocraftfix$manualTransferAttention.merge(
+                    key, amount, CraftingHotfixSupport::saturatingAdd);
+            gtocraftfix$feedError("隔離後不再嘗試已知回補量：" + key + " x" + amount
+                    + "（" + reason + "；需人工介入）", null);
+            return false;
+        }
+        var insertion = gtocraftfix$measuredNetworkInsert(storage, key, amount, src, reason);
+        if (!insertion.known()) {
+            // attempted 已由 quarantine 記進人工介入帳；絕不可把全額再排入自動 replay。
+            return false;
+        }
+        long restored = insertion.amount();
+        long remaining = CraftingHotfixSupport.positiveDeficit(amount, restored);
+        if (remaining > 0) {
+            gtocraftfix$queueFeedRefund(key, remaining);
+            gtocraftfix$feedError("餵料未能完整回存：" + key + " 已回 " + restored + "/" + amount
+                    + "、暫存待重試 " + remaining + "（" + reason + "）", null);
+            return false;
+        }
+        return true;
+    }
+
+    /** 回補債未清以前不再抽新的 sitter 餵料，避免 storage 故障時持續擴大暫存量。 */
+    private boolean gtocraftfix$flushFeedRefunds(appeng.api.storage.MEStorage storage, IActionSource src) {
+        if (!gtocraftfix$automaticTransfersAllowed()) {
+            return false;
+        }
+        if (gtocraftfix$feedRefunds.isEmpty()) {
+            return true;
+        }
+        for (var it = gtocraftfix$feedRefunds.entrySet().iterator(); it.hasNext();) {
+            var entry = it.next();
+            long owed = entry.getValue();
+            if (owed <= 0) {
+                it.remove();
+                continue;
+            }
+            var insertion = gtocraftfix$measuredNetworkInsert(
+                    storage, entry.getKey(), owed, src, "回補佇列重試");
+            if (!insertion.known()) {
+                // 此筆實際已回多少未知，移出自動佇列；quarantine map 只留人工盤點上界。
+                it.remove();
+                break;
+            }
+            long remaining = CraftingHotfixSupport.positiveDeficit(owed, insertion.amount());
+            if (remaining == 0) {
+                it.remove();
+            } else {
+                entry.setValue(remaining);
+            }
+        }
+        return gtocraftfix$automaticTransfersAllowed() && gtocraftfix$feedRefunds.isEmpty();
+    }
+
+    // ---- 修正 3：保母（phantom-only 每秒；明確關閉時每 tick；final 永不餵）＋診斷探針（每 20 秒）----
     // [2.4.0] 掛 HEAD 不掛 TAIL：GTOCore 在偶數 tick 提前 ci.cancel() 本方法，掛 TAIL 整段實跑半速
     // （原「5 秒」實為 10 秒、探針 20 秒實為 40 秒——log 探針間隔 40 秒實證）。
     @Inject(method = "onServerEndTick", at = @At("HEAD"), remap = false)
@@ -2252,9 +2912,11 @@ public abstract class CraftingServiceSyncMixin {
                                 wb.append("/另").append(others).append("顆也等");
                             }
                             // [3.2.1] 樣板推去哪台機器：貨沒回來時直接指出現場（GTO 公開 API，反射呼叫）
-                            String pend = gtocraftfix$pendingAt(logic, wk);
-                            if (pend != null) {
-                                wb.append("/推給").append(pend);
+                            var pend = gtocraftfix$pendingAt(logic, wk);
+                            if (pend.state() == CraftingHotfixSupport.PendingKnowledge.PRESENT) {
+                                wb.append("/推給").append(pend.locations());
+                            } else if (pend.state() == CraftingHotfixSupport.PendingKnowledge.UNKNOWN) {
+                                wb.append("/樣板在途未知");
                             }
                             // [3.2.2] 幻影缺口指紋：沒有剩餘任務產它＝開單當下就缺、沒人會做（等到天荒地老）
                             if (producible != null && !producible.contains(wk)) {
@@ -2373,7 +3035,8 @@ public abstract class CraftingServiceSyncMixin {
                                             if (ps.length == 0) {
                                                 continue;
                                             }
-                                            long need1 = ps[0].amount() * in1.getMultiplier();
+                                            long need1 = CraftingHotfixSupport.saturatingMultiply(
+                                                    ps[0].amount(), in1.getMultiplier());
                                             if (need1 <= 0) {
                                                 continue;
                                             }
@@ -2422,15 +3085,19 @@ public abstract class CraftingServiceSyncMixin {
                 }
             }
         }
-        // [2.4.0] 保母改每 tick（原 %100 在半頻下實為 10 秒一輪，兩單搶料時只能一點一點給）
+        // [2.4.0/3.13.2] 鉤子每 tick 進入；phantom-only 判斷較昂貴，feedTick 另降到 1Hz。
         var storage = grid.getStorageService().getInventory();
         int handled = 0;
+        boolean feedRefundsClear = gtocraftfix$feedRefunds.isEmpty();
         for (var cluster : craftingCPUClusters) {
             if (handled >= 8) {
                 break;
             }
             try {
                 var logic = cluster.craftingLogic;
+                if (!feedRefundsClear) {
+                    feedRefundsClear = gtocraftfix$flushFeedRefunds(storage, cluster.getSrc());
+                }
                 var finalOut = logic.getFinalJobOutput();
                 if (finalOut == null) {
                     continue;
@@ -2438,61 +3105,85 @@ public abstract class CraftingServiceSyncMixin {
                 Set<AEKey> waiting = new HashSet<>();
                 logic.getAllWaitingFor(waiting);
                 int handledBefore = handled;
-                // [3.13.0] 幻影模式的判斷本身有成本（taskOutputs 要走完整張 tasks 圖、pendingAt 要反射
-                // 呼叫），而「補一筆永遠不會來的料」不是每 tick 都得做的事 → 降到 1Hz。
+                // [3.13.0/3.13.2] 幻影模式判斷要走完整 tasks 圖並反射 pendingRequests，成本較高；
+                // 「補一筆永遠不會來的料」不必每 tick 做 → 降到 1Hz。
                 // 無差別模式維持每 tick（那是 2.x 兩單搶料時的原始節奏）。
-                boolean feedTick = gtocraftfix$FEED
+                boolean feedTick = gtocraftfix$FEED && feedRefundsClear
                         && (!gtocraftfix$FEED_PHANTOM_ONLY || gtocraftfix$tickCounter % 20 == 0);
+                // pendingRequests 只按樣板主產物建索引，且成功 push 後 task 可先移除；直接看整個
+                // pendingRequests 是否為空。任一在途／反射未知就整單不餵，封住最後一輪副產物誤餵。
+                var pendingSnapshot = feedTick
+                        ? gtocraftfix$pendingAnywhere(logic)
+                        : CraftingHotfixSupport.PendingKnowledge.UNKNOWN;
                 // 本單剩餘任務會產出的 key；讀不到 job（反射失效）回 null → 幻影模式下一律不餵（保守）。
                 // 惰性求值：真的有 key 要判時才算。
                 java.util.Set<AEKey> producible = null;
                 boolean producibleReady = false;
                 for (var key : waiting) {
-                    if (!feedTick) {
+                    if (!feedTick || !feedRefundsClear) {
                         break; // 餵料停用（-Dgtodiag.sitterFeed=false）或本 tick 不是幻影掃描週期
                     }
                     if (handled >= 8) {
                         break;
                     }
-                    // [3.13.0] 只餵幻影：沒有剩餘任務會產它，也沒有樣板正押在供應器上
-                    // ＝證明「不會有機器送貨來銷這筆 waitingFor」，這時從網路直接補才是對的。
+                    boolean isFinal = key.equals(finalOut.what());
+                    // [3.13.2] final 絕不 sitter feed：GTO insert 會用完整 got 扣 remainingAmount，
+                    // link 即使只收部分／0 也可能提前 finish，差額回網路無法回滾帳目。
+                    if (isFinal) {
+                        continue;
+                    }
                     if (gtocraftfix$FEED_PHANTOM_ONLY) {
                         if (!producibleReady) {
                             producible = gtocraftfix$taskOutputs(logic);
                             producibleReady = true;
                         }
-                        if (producible == null || producible.contains(key)
-                                || gtocraftfix$pendingAt(logic, key) != null) {
+                        if (!CraftingHotfixSupport.shouldFeedWaiting(isFinal,
+                                producible != null,
+                                producible != null && producible.contains(key),
+                                pendingSnapshot)) {
                             continue;
                         }
-                    }
-                    boolean isFinal = key.equals(finalOut.what());
-                    if (isFinal) {
-                        // 成品也要餵（成品回流網路但 CPU 沒攔到認領時，唯一救援路徑）；
-                        // 但 link 被拒（訂單型死 link 回 0）會 x0 空轉 → 拒收記憶 10 分鐘。
-                        Integer ru = gtocraftfix$feedRefused.get(key);
-                        if (ru != null && gtocraftfix$tickCounter - ru < 12000) {
-                            continue;
-                        }
+                    } else if (pendingSnapshot != CraftingHotfixSupport.PendingKnowledge.NONE) {
+                        continue; // 無差別模式仍不能在「已在途／反射未知」時搶先餵
                     }
                     long want = logic.getWaitingFor(key);
                     if (want <= 0) {
                         continue;
                     }
+                    var cpuInventory = gtocraftfix$invOf(logic);
+                    Long cpuBefore = gtocraftfix$cpuAmount(cpuInventory, key);
+                    var waitingInventory = gtocraftfix$waitingInvOf(logic);
+                    Long waitingBefore = gtocraftfix$cpuAmount(waitingInventory, key);
+                    if (cpuBefore == null || waitingBefore == null || waitingBefore != want) {
+                        gtocraftfix$feedError("保母無法取得一致的 CPU/waitingFor 入庫前快照，"
+                                + "為避免例外後無法完整回滾而跳過："
+                                + key + " x" + want, null);
+                        continue;
+                    }
                     // 只餵料：網路有貨 → 直餵 CPU（補認領缺口）。不代下巢狀單——那會生一堆小任務佔 CPU。
                     long got = storage.extract(key, want, Actionable.MODULATE, cluster.getSrc());
                     if (got > 0) {
-                        long accepted = logic.insert(key, got, Actionable.MODULATE);
+                        long accepted;
+                        try {
+                            accepted = logic.insert(key, got, Actionable.MODULATE);
+                            if (accepted < 0 || accepted > got) {
+                                throw new IllegalStateException("logic.insert 回傳非法數量 " + accepted
+                                        + "（抽出 " + got + "）");
+                            }
+                        } catch (Throwable insertError) {
+                            gtocraftfix$restituteLogicInsertFailure(storage, cpuInventory, waitingInventory,
+                                    key, cpuBefore, waitingBefore, got, cluster.getSrc(), "logic.insert 例外");
+                            gtocraftfix$feedError("保母 logic.insert 例外，已回滾 waitingFor 並依 CPU 差額回補："
+                                    + key + " x" + got, insertError);
+                            feedRefundsClear = gtocraftfix$feedRefunds.isEmpty();
+                            continue;
+                        }
                         if (accepted < got) {
-                            storage.insert(key, got - accepted, Actionable.MODULATE, cluster.getSrc());
+                            gtocraftfix$returnExtracted(storage, key, got - accepted, cluster.getSrc(),
+                                    "CPU 僅接受 " + accepted + "/" + got);
+                            feedRefundsClear = gtocraftfix$feedRefunds.isEmpty();
                         }
                         if (accepted <= 0) {
-                            if (isFinal) {
-                                gtocraftfix$feedRefused.put(key, gtocraftfix$tickCounter);
-                                if (gtocraftfix$feedRefused.size() > 128) {
-                                    gtocraftfix$feedRefused.clear();
-                                }
-                            }
                             continue;
                         }
                         handled++;
@@ -2508,12 +3199,16 @@ public abstract class CraftingServiceSyncMixin {
                 // [2.4.0] 閘門放寬：原本只在 waiting 空時跑，但「有在途＋另一任務缺料」（兩單搶料實錄：
                 // 在途 qbit 晶圓擋住整個補給）同樣要補；本輪沒餵到料時一律跑。
                 // [3.13.0] slim 仍預設停用（沒有 waitingFor 當額度、會吸乾單料）；要開用 -Dgtodiag.sitterTopUp=true
-                if ((!gtocraftfix$SLIM || gtocraftfix$SITTER_TOPUP)
+                if (feedRefundsClear && (!gtocraftfix$SLIM || gtocraftfix$SITTER_TOPUP)
                         && (waiting.isEmpty() || handled == handledBefore) && handled < 8) {
                     gtocraftfix$topUpInputs(logic, storage, cluster.getSrc());
+                    feedRefundsClear = gtocraftfix$feedRefunds.isEmpty();
                 }
                 // [2.1.0] 並行死角解鎖：上游 executeCrafting 對 parallel==1 永久無聲跳過（見方法 javadoc）
-                gtocraftfix$unjamParallelOne(logic, storage, cluster.getSrc());
+                if (feedRefundsClear) {
+                    gtocraftfix$unjamParallelOne(logic, storage, cluster.getSrc());
+                    feedRefundsClear = gtocraftfix$feedRefunds.isEmpty();
+                }
             } catch (Throwable t) {
                 int c = gtocraftfix$sitterLog.incrementAndGet();
                 if (c <= 5) {
@@ -2542,6 +3237,9 @@ public abstract class CraftingServiceSyncMixin {
     private void gtocraftfix$topUpInputs(appeng.crafting.execution.CraftingCpuLogic logic,
                                          appeng.api.storage.MEStorage storage, IActionSource src) {
         try {
+            if (gtocraftfix$isPaused(logic)) {
+                return;
+            }
             if (gtocraftfix$fJob == null) {
                 var fj = logic.getClass().getDeclaredField("job");
                 fj.setAccessible(true);
@@ -2587,26 +3285,24 @@ public abstract class CraftingServiceSyncMixin {
                         continue;
                     }
                     var ik = poss[0].what();
-                    long per = poss[0].amount() * input.getMultiplier();
+                    long per = CraftingHotfixSupport.saturatingMultiply(
+                            poss[0].amount(), input.getMultiplier());
                     if (per <= 0) {
                         continue;
                     }
-                    long need;
-                    try {
-                        need = Math.multiplyExact(per, rounds);
-                    } catch (ArithmeticException e) {
-                        need = per; // 溢位保底一輪
-                    }
+                    long need = CraftingHotfixSupport.saturatingMultiply(per, rounds);
                     long have = inv.list.get(ik);
                     if (have >= need) {
                         continue;
                     }
-                    long got = storage.extract(ik, need - have, Actionable.MODULATE, src);
+                    long got = storage.extract(ik,
+                            CraftingHotfixSupport.positiveDeficit(need, have), Actionable.MODULATE, src);
                     if (got > 0) {
                         try {
                             inv.insert(ik, got, Actionable.MODULATE);
                         } catch (Throwable t) {
-                            storage.insert(ik, got, Actionable.MODULATE, src); // 插不進退回網路，防蒸發
+                            gtocraftfix$restituteCpuInsertFailure(storage, inv, ik, have,
+                                    got, src, "保母補輸入插入 CPU 例外");
                             throw t;
                         }
                         com.gtocraftfix.diag.CraftDiag.noteExternalInsert(logic, ik, got); // [3.7.0] 帳本登記
@@ -2624,7 +3320,7 @@ public abstract class CraftingServiceSyncMixin {
         }
     }
 
-    /** [2.1.0] gtolib 並行樣板介面反射解析（一次）；解析失敗保守視為並行（多補 1 輪料無害）。 */
+    /** [2.1.0/3.13.2] gtolib 並行樣板介面反射解析（一次）；解析失敗一律視為未知、不搬料。 */
     private static volatile Class<?> gtocraftfix$parallelIface;
     private static volatile boolean gtocraftfix$parallelIfaceTried;
 
@@ -2637,7 +3333,7 @@ public abstract class CraftingServiceSyncMixin {
             gtocraftfix$parallelIfaceTried = true;
         }
         var c = gtocraftfix$parallelIface;
-        return c == null || c.isInstance(pat);
+        return c != null && c.isInstance(pat);
     }
 
     /** [2.1.0] 並行死角解鎖：上游 OptimizedCraftingCpuLogic.executeCrafting 的並行分支漏了
@@ -2648,6 +3344,9 @@ public abstract class CraftingServiceSyncMixin {
     private void gtocraftfix$unjamParallelOne(appeng.crafting.execution.CraftingCpuLogic logic,
                                               appeng.api.storage.MEStorage storage, IActionSource src) {
         try {
+            if (gtocraftfix$isPaused(logic)) {
+                return; // 暫停或暫停狀態讀不到：救援層不得搬料
+            }
             if (gtocraftfix$fJob == null) {
                 var fj = logic.getClass().getDeclaredField("job");
                 fj.setAccessible(true);
@@ -2696,7 +3395,8 @@ public abstract class CraftingServiceSyncMixin {
                     var seen = new HashSet<AEKey>();
                     for (var ps : poss) {
                         if (ps.amount() > 0 && seen.add(ps.what())) {
-                            units += inv.list.get(ps.what()) / ps.amount();
+                            units = CraftingHotfixSupport.saturatingAdd(units,
+                                    Math.max(0, inv.list.get(ps.what())) / ps.amount());
                         }
                     }
                     if (input.getMultiplier() > 0) {
@@ -2715,22 +3415,25 @@ public abstract class CraftingServiceSyncMixin {
                         continue;
                     }
                     var ik = poss[0].what();
-                    long per = poss[0].amount() * input.getMultiplier();
+                    long per = CraftingHotfixSupport.saturatingMultiply(
+                            poss[0].amount(), input.getMultiplier());
                     if (per <= 0) {
                         continue;
                     }
                     long have = inv.list.get(ik);
-                    long target = 2 * per;
+                    long target = CraftingHotfixSupport.saturatingMultiply(2, per);
                     if (have >= target) {
                         continue;
                     }
-                    long got = storage.extract(ik, target - have, Actionable.MODULATE, src);
+                    long need = CraftingHotfixSupport.positiveDeficit(target, have);
+                    long got = storage.extract(ik, need, Actionable.MODULATE, src);
                     if (got > 0) {
                         try {
                             inv.insert(ik, got, Actionable.MODULATE);
                         } catch (Throwable t) {
-                            // 例外補償：插不進就退回網路再拋，防半套蒸發
-                            storage.insert(ik, got, Actionable.MODULATE, src);
+                            // 例外補償以庫存差額為準，避免「先入庫、後拋例外」時全額回補造成複製。
+                            gtocraftfix$restituteCpuInsertFailure(storage, inv, ik, have,
+                                    got, src, "並行死角解鎖插入 CPU 例外");
                             throw t;
                         }
                         // [3.7.0] 登記「本 mod 自己塞的料」，帳本才不會把它算成帳外流入
@@ -2755,6 +3458,7 @@ public abstract class CraftingServiceSyncMixin {
      * ——實錄：LUV 通用電路修補完仍差 lubricant 132／copper_block 4／platinum_single_wire 6／naquadah_boule 2，
      * 做到剩最後 34 個成品時全鏈餓死，而網路各有 115209／6／13／3。
      * 替代輸入取「計畫供給最多」的變體（與 {@code planBirthBalance} 同一模型），避免誤報。
+     * 回傳 {@code null} 表示掃描失敗；絕不把 catch 前累積的部分列表交給套用端。
      */
     private static java.util.List<Object[]> gtocraftfix$internalBalanceDeficits(CraftingPlan plan) {
         var out = new java.util.ArrayList<Object[]>();
@@ -2765,10 +3469,10 @@ public abstract class CraftingServiceSyncMixin {
             }
             var supply = new HashMap<AEKey, Long>();
             for (var e : plan.usedItems()) {
-                supply.merge(e.getKey(), e.getLongValue(), Long::sum);
+                supply.merge(e.getKey(), e.getLongValue(), CraftingHotfixSupport::saturatingAdd);
             }
             for (var e : plan.emittedItems()) {
-                supply.merge(e.getKey(), e.getLongValue(), Long::sum);
+                supply.merge(e.getKey(), e.getLongValue(), CraftingHotfixSupport::saturatingAdd);
             }
             for (var pe : pt.entrySet()) {
                 long runs = pe.getValue() == null ? 0 : pe.getValue();
@@ -2777,7 +3481,8 @@ public abstract class CraftingServiceSyncMixin {
                 }
                 for (var o : pe.getKey().getOutputs()) {
                     if (o.amount() > 0) {
-                        supply.merge(o.what(), o.amount() * runs, Long::sum);
+                        supply.merge(o.what(), CraftingHotfixSupport.saturatingMultiply(o.amount(), runs),
+                                CraftingHotfixSupport::saturatingAdd);
                     }
                 }
             }
@@ -2798,24 +3503,30 @@ public abstract class CraftingServiceSyncMixin {
                     }
                     long roundsLeft = runs;
                     for (var v : ps) {
-                        long per = v.amount() * in.getMultiplier();
+                        long per = CraftingHotfixSupport.saturatingMultiply(
+                                v.amount(), in.getMultiplier());
                         if (per <= 0) {
                             continue;
                         }
                         long can = Math.max(0, left.getOrDefault(v.what(), 0L)) / per;
                         long take = Math.min(roundsLeft, can);
                         if (take > 0) {
-                            left.merge(v.what(), -take * per, Long::sum);
-                            roundsLeft -= take;
+                            long consumed = CraftingHotfixSupport.saturatingMultiply(take, per);
+                            left.put(v.what(), Math.max(0, CraftingHotfixSupport.saturatingSubtract(
+                                    left.getOrDefault(v.what(), 0L), consumed)));
+                            roundsLeft = CraftingHotfixSupport.positiveDeficit(roundsLeft, take);
                         }
                         if (roundsLeft <= 0) {
                             break;
                         }
                     }
                     if (roundsLeft > 0) {
-                        long per0 = ps[0].amount() * in.getMultiplier();
+                        long per0 = CraftingHotfixSupport.saturatingMultiply(
+                                ps[0].amount(), in.getMultiplier());
                         if (per0 > 0) {
-                            deficit.merge(ps[0].what(), per0 * roundsLeft, Long::sum);
+                            deficit.merge(ps[0].what(),
+                                    CraftingHotfixSupport.saturatingMultiply(per0, roundsLeft),
+                                    CraftingHotfixSupport::saturatingAdd);
                         }
                     }
                 }
@@ -2826,21 +3537,61 @@ public abstract class CraftingServiceSyncMixin {
                 }
             }
         } catch (Throwable ignored) {
+            return null;
         }
         return out;
     }
 
     /**
+     * 依現行「主替代品」近似，先把同一 key 的多個輸入槽聚合成每輪需求。null 表示乘法／聚合溢位，
+     * 呼叫端必須把整次 bootstrap 視為 UNKNOWN；飽和 MAX 不是可拿來證明可執行的精確需求。
+     */
+    private static Map<AEKey, Long> gtocraftfix$primaryInputRequirements(IPatternDetails pattern) {
+        var requirements = new HashMap<AEKey, Long>();
+        for (var input : pattern.getInputs()) {
+            var possible = input.getPossibleInputs();
+            if (possible.length == 0) {
+                continue;
+            }
+            long amount = possible[0].amount();
+            long multiplier = input.getMultiplier();
+            if (amount <= 0 || multiplier <= 0) {
+                continue;
+            }
+            Long per = CraftingHotfixSupport.checkedNonNegativeMultiply(amount, multiplier);
+            if (per == null) {
+                return null;
+            }
+            var key = possible[0].what();
+            Long total = CraftingHotfixSupport.checkedNonNegativeAdd(
+                    requirements.getOrDefault(key, 0L), per);
+            if (total == null) {
+                return null;
+            }
+            requirements.put(key, total);
+        }
+        return requirements;
+    }
+
+    /**
      * 可執行性模擬：以 usedItems 為起始庫存、逐輪執行可滿足輸入的樣板（主替代品近似）。
      * 回傳「卡死樣板中、庫存為 0 的輸入」各一輪 run 的量＝循環自舉缺口；可全部跑完則回空。
-     * <p>[3.11.1／B9] 加 pass 數上限（{@code -Dgtodiag.bootstrapMaxPass}，預設 20 萬）：本方法跑在
-     * **伺服器主緒**且不受修補的時間預算約束，而回饋型配方會退化成每 pass 只前進 1 輪、計畫又合法可有
-     * 數百萬輪 → 單次提交就能把主緒卡住數秒。超過上限＝視為無法判定，回空清單（不補自舉缺口）。
+     * <p>[3.13.2] 除 pass 上限外也接收整次修補共用的 startedAt/budget；逾時回 null，呼叫端中止並
+     * 整組還原，不能在進入這個昂貴步驟時偷偷重設一份新預算。
      */
-    private static java.util.List<Object[]> gtocraftfix$findBootstrapDeficits(CraftingPlan plan) {
+    private static java.util.List<Object[]> gtocraftfix$findBootstrapDeficits(
+            CraftingPlan plan, long startedAt, long budgetNanos) {
+        if (CraftingHotfixSupport.budgetExpired(startedAt, budgetNanos, System.nanoTime())) {
+            return null;
+        }
         var inv = new HashMap<AEKey, Long>();
         for (var e : plan.usedItems()) {
-            inv.merge(e.getKey(), e.getLongValue(), Long::sum);
+            Long total = CraftingHotfixSupport.checkedNonNegativeAdd(
+                    inv.getOrDefault(e.getKey(), 0L), e.getLongValue());
+            if (total == null) {
+                return null;
+            }
+            inv.put(e.getKey(), total);
         }
         var remaining = new HashMap<IPatternDetails, Long>();
         plan.patternTimes().forEach((p, r) -> {
@@ -2851,6 +3602,9 @@ public abstract class CraftingServiceSyncMixin {
         boolean progress = true;
         int pass = 0; // [3.11.1／B9]
         while (progress && !remaining.isEmpty()) {
+            if (CraftingHotfixSupport.budgetExpired(startedAt, budgetNanos, System.nanoTime())) {
+                return null;
+            }
             if (++pass > gtocraftfix$BOOTSTRAP_MAX_PASS) {
                 // [3.11.2／M7] 回空清單＝把「無法判定」當成「沒有缺口」，這是刻意的：改成中止會讓
                 // 整組還原（＝退回幻影計畫、必凍）更糟。但既然是會影響正確性的靜默跳過，log 就不能
@@ -2869,36 +3623,54 @@ public abstract class CraftingServiceSyncMixin {
                 return new java.util.ArrayList<>();
             }
             progress = false;
+            int scanned = 0;
             for (var it = remaining.entrySet().iterator(); it.hasNext();) {
+                if ((++scanned & 63) == 0
+                        && CraftingHotfixSupport.budgetExpired(startedAt, budgetNanos, System.nanoTime())) {
+                    return null;
+                }
                 var en = it.next();
                 var p = en.getKey();
                 long runs = en.getValue();
                 long can = runs;
-                for (var input : p.getInputs()) {
-                    var poss = input.getPossibleInputs();
-                    if (poss.length == 0) {
-                        continue;
-                    }
-                    long per = poss[0].amount() * input.getMultiplier();
-                    if (per <= 0) {
-                        continue;
-                    }
-                    can = Math.min(can, inv.getOrDefault(poss[0].what(), 0L) / per);
+                var requirements = gtocraftfix$primaryInputRequirements(p);
+                if (requirements == null) {
+                    return null;
+                }
+                for (var requirement : requirements.entrySet()) {
+                    can = Math.min(can, Math.max(0, inv.getOrDefault(requirement.getKey(), 0L))
+                            / requirement.getValue());
                     if (can == 0) {
                         break;
                     }
                 }
                 if (can > 0) {
-                    for (var input : p.getInputs()) {
-                        var poss = input.getPossibleInputs();
-                        if (poss.length == 0) {
-                            continue;
+                    for (var requirement : requirements.entrySet()) {
+                        Long consumed = CraftingHotfixSupport.checkedNonNegativeMultiply(
+                                requirement.getValue(), can);
+                        if (consumed == null) {
+                            return null;
                         }
-                        long per = poss[0].amount() * input.getMultiplier();
-                        inv.merge(poss[0].what(), -per * can, Long::sum);
+                        long have = inv.getOrDefault(requirement.getKey(), 0L);
+                        if (consumed > have) {
+                            return null;
+                        }
+                        inv.put(requirement.getKey(), have - consumed);
                     }
                     for (var out : p.getOutputs()) {
-                        inv.merge(out.what(), out.amount() * can, Long::sum);
+                        if (out.amount() < 0) {
+                            return null;
+                        }
+                        Long produced = CraftingHotfixSupport.checkedNonNegativeMultiply(out.amount(), can);
+                        if (produced == null) {
+                            return null;
+                        }
+                        Long total = CraftingHotfixSupport.checkedNonNegativeAdd(
+                                inv.getOrDefault(out.what(), 0L), produced);
+                        if (total == null) {
+                            return null;
+                        }
+                        inv.put(out.what(), total);
                     }
                     if (can >= runs) {
                         it.remove();
@@ -2913,21 +3685,31 @@ public abstract class CraftingServiceSyncMixin {
         if (remaining.isEmpty()) {
             return res;
         }
-        var added = new HashSet<AEKey>();
+        var bootstrapNeed = new HashMap<AEKey, Long>();
+        int finalScan = 0;
         for (var en : remaining.entrySet()) {
-            for (var input : en.getKey().getInputs()) {
-                var poss = input.getPossibleInputs();
-                if (poss.length == 0) {
-                    continue;
-                }
-                var k = poss[0].what();
-                long per = poss[0].amount() * input.getMultiplier();
-                if (per > 0 && inv.getOrDefault(k, 0L) <= 0 && added.add(k)) {
-                    // 補一輪 run 的量當自舉；[3.11.1／B1] 第 3 欄 soft（近似模擬猜的量，語意同舊格式的
-                    // 「長度 2＝非 hard」）、第 4 欄 SRC_BOOTSTRAP（從未加進 usedItems → 不可沖銷）
-                    res.add(new Object[] { k, per, Boolean.FALSE, gtocraftfix$SRC_BOOTSTRAP });
+            if ((++finalScan & 63) == 0
+                    && CraftingHotfixSupport.budgetExpired(startedAt, budgetNanos, System.nanoTime())) {
+                return null;
+            }
+            var requirements = gtocraftfix$primaryInputRequirements(en.getKey());
+            if (requirements == null) {
+                return null;
+            }
+            for (var requirement : requirements.entrySet()) {
+                long missingOneRun = CraftingHotfixSupport.positiveDeficit(
+                        requirement.getValue(), inv.getOrDefault(requirement.getKey(), 0L));
+                if (missingOneRun > 0) {
+                    // 同一 key 卡住多個樣板時取「至少讓其中一輪可跑」所需的最大缺口，避免 map 迭代
+                    // 順序讓較小需求先佔位，卻仍無法啟動較大的一輪。
+                    bootstrapNeed.merge(requirement.getKey(), missingOneRun, Math::max);
                 }
             }
+        }
+        for (var need : bootstrapNeed.entrySet()) {
+            // 補一輪 run 的量當自舉；[3.11.1／B1] 第 3 欄 soft（近似模擬猜的量，語意同舊格式的
+            // 「長度 2＝非 hard」）、第 4 欄 SRC_BOOTSTRAP（從未加進 usedItems → 不可沖銷）
+            res.add(new Object[] { need.getKey(), need.getValue(), Boolean.FALSE, gtocraftfix$SRC_BOOTSTRAP });
         }
         return res;
     }
