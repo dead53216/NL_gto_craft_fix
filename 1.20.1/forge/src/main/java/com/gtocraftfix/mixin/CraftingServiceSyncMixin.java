@@ -1,5 +1,6 @@
 package com.gtocraftfix.mixin;
 
+import com.gtocraftfix.support.CraftingHotfixSupport;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.player.Player;

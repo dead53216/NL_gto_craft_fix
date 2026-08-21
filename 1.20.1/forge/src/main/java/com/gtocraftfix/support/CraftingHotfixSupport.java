@@ -1,12 +1,15 @@
-package com.gtocraftfix.mixin;
+package com.gtocraftfix.support;
 
 /**
  * 不依賴 Minecraft／AE2 的 hotfix 基礎規則，集中處理 long 邊界與單次工作的共用時間預算。
- * package-private API 刻意保留給同 package 單元測試直接驗證。
+ * <p>⚠ <b>這個類不能放在 {@code com.gtocraftfix.mixin}</b>：那是 {@code gto_craft_fix.mixins.json}
+ * 宣告的 mixin package，Mixin 禁止直接參照該 package 下的任何類別（3.13.2 實測：
+ * {@code IllegalClassLoadError: … is in a defined mixin package … and cannot be referenced directly}，
+ * 在 {@code CraftingService.<clinit>} 就炸，世界完全載不進去）。放在獨立 package 並開放為 public。
  */
-final class CraftingHotfixSupport {
+public final class CraftingHotfixSupport {
 
-    enum PendingKnowledge {
+    public enum PendingKnowledge {
         UNKNOWN,
         NONE,
         PRESENT
@@ -17,12 +20,12 @@ final class CraftingHotfixSupport {
      * <p>{@code physicalRefund} 只看 CPU 實際留住多少，不能以 waiting 帳認列量代替，否則
      * retained 大於 consumedWaiting 的異常路徑會把 CPU 已留住的實物再退回網路而複製。
      */
-    record LogicInsertCompensation(long retained, long consumedWaiting,
+    public record LogicInsertCompensation(long retained, long consumedWaiting,
             long restoreWaiting, long physicalRefund) {
     }
 
     /** NetworkStorage mutation 前後的可用量差額；UNKNOWN 時 amount 固定為 0，不得拿來猜測搬料量。 */
-    record TransferDelta(boolean known, long amount) {
+    public record TransferDelta(boolean known, long amount) {
         private static final TransferDelta UNKNOWN = new TransferDelta(false, 0);
 
         private static TransferDelta unknown() {
@@ -37,7 +40,7 @@ final class CraftingHotfixSupport {
     private CraftingHotfixSupport() {
     }
 
-    static long saturatingAdd(long left, long right) {
+    public static long saturatingAdd(long left, long right) {
         try {
             return Math.addExact(left, right);
         } catch (ArithmeticException overflow) {
@@ -45,7 +48,7 @@ final class CraftingHotfixSupport {
         }
     }
 
-    static long saturatingSubtract(long left, long right) {
+    public static long saturatingSubtract(long left, long right) {
         try {
             return Math.subtractExact(left, right);
         } catch (ArithmeticException overflow) {
@@ -53,7 +56,7 @@ final class CraftingHotfixSupport {
         }
     }
 
-    static long saturatingMultiply(long left, long right) {
+    public static long saturatingMultiply(long left, long right) {
         try {
             return Math.multiplyExact(left, right);
         } catch (ArithmeticException overflow) {
@@ -62,7 +65,7 @@ final class CraftingHotfixSupport {
     }
 
     /** 可執行性證明用的精確非負加法；溢位／負輸入回 null，不能拿飽和值冒充精確需求。 */
-    static Long checkedNonNegativeAdd(long left, long right) {
+    public static Long checkedNonNegativeAdd(long left, long right) {
         if (left < 0 || right < 0) {
             return null;
         }
@@ -74,7 +77,7 @@ final class CraftingHotfixSupport {
     }
 
     /** 可執行性證明用的精確非負乘法；語意同 {@link #checkedNonNegativeAdd(long, long)}。 */
-    static Long checkedNonNegativeMultiply(long left, long right) {
+    public static Long checkedNonNegativeMultiply(long left, long right) {
         if (left < 0 || right < 0) {
             return null;
         }
@@ -86,7 +89,7 @@ final class CraftingHotfixSupport {
     }
 
     /** 正整數的向上取整除法；不使用 {@code value + divisor - 1}，避免加法溢位。 */
-    static long ceilDivPositive(long value, long divisor) {
+    public static long ceilDivPositive(long value, long divisor) {
         if (value <= 0) {
             return 0;
         }
@@ -97,7 +100,7 @@ final class CraftingHotfixSupport {
     }
 
     /** 只回傳正缺口；輸入預期非負，負的可用量一律當 0。 */
-    static long positiveDeficit(long required, long available) {
+    public static long positiveDeficit(long required, long available) {
         if (required <= 0) {
             return 0;
         }
@@ -106,12 +109,12 @@ final class CraftingHotfixSupport {
     }
 
     /** 最終可交付量刻意不收 used(final)：GTO 不會把開局吸入的成品送進 link。 */
-    static long finalDeliverable(long emitted, long patternProduced) {
+    public static long finalDeliverable(long emitted, long patternProduced) {
         return saturatingAdd(Math.max(0, emitted), Math.max(0, patternProduced));
     }
 
     /** final 永不餵；task／pending 任一證據未知也 fail-closed。 */
-    static boolean shouldFeedWaiting(boolean finalKey, boolean taskSnapshotKnown,
+    public static boolean shouldFeedWaiting(boolean finalKey, boolean taskSnapshotKnown,
             boolean producedByTask, PendingKnowledge pending) {
         return !finalKey
                 && taskSnapshotKnown
@@ -120,7 +123,7 @@ final class CraftingHotfixSupport {
     }
 
     /** null／空／全零或負輪數都不是可執行 task；讀取 Iterable 拋例外同樣 fail-closed。 */
-    static boolean hasPositiveTask(Iterable<Long> patternRuns) {
+    public static boolean hasPositiveTask(Iterable<Long> patternRuns) {
         if (patternRuns == null) {
             return false;
         }
@@ -137,7 +140,7 @@ final class CraftingHotfixSupport {
     }
 
     /** 四本帳 rollback 無法證明完整時，未知來源按機器側傳入並拒收；玩家維持原提交行為。 */
-    static boolean shouldRejectUnknownPlanIntegrity(boolean machineSource, boolean integrityUnknown) {
+    public static boolean shouldRejectUnknownPlanIntegrity(boolean machineSource, boolean integrityUnknown) {
         return machineSource && integrityUnknown;
     }
 
@@ -146,7 +149,7 @@ final class CraftingHotfixSupport {
      * waiting 只補回「已扣但沒有對應 CPU 留存」的量，實體回存則永遠是
      * {@code extracted - retained}，兩個維度不可混用。
      */
-    static LogicInsertCompensation logicInsertCompensation(long extracted,
+    public static LogicInsertCompensation logicInsertCompensation(long extracted,
             long cpuBefore, long cpuAfter, long waitingBefore, long waitingAfter) {
         long safeExtracted = Math.max(0, extracted);
         long retained = Math.min(safeExtracted, Math.max(0,
@@ -165,7 +168,7 @@ final class CraftingHotfixSupport {
      * MODULATE extract 的可證實差額。before/after 是同一 key 以 SIMULATE extract(Long.MAX_VALUE)
      * 量到的可用量；方向相反、差額超過本次請求或任一證據未知，都不能猜成 0。
      */
-    static TransferDelta extractedDelta(long requested, Long before, Long after) {
+    public static TransferDelta extractedDelta(long requested, Long before, Long after) {
         if (requested < 0 || before == null || after == null || before < 0 || after < 0
                 || after > before) {
             return TransferDelta.unknown();
@@ -175,7 +178,7 @@ final class CraftingHotfixSupport {
     }
 
     /** MODULATE insert 的可證實差額；其餘規則同 {@link #extractedDelta(long, Long, Long)}。 */
-    static TransferDelta insertedDelta(long requested, Long before, Long after) {
+    public static TransferDelta insertedDelta(long requested, Long before, Long after) {
         if (requested < 0 || before == null || after == null || before < 0 || after < 0
                 || after < before) {
             return TransferDelta.unknown();
@@ -185,7 +188,7 @@ final class CraftingHotfixSupport {
     }
 
     /** 毫秒轉奈秒；0／負數代表停用，極大值飽和為「無上限」。 */
-    static long budgetNanos(long milliseconds) {
+    public static long budgetNanos(long milliseconds) {
         if (milliseconds <= 0) {
             return Long.MAX_VALUE;
         }
@@ -193,7 +196,7 @@ final class CraftingHotfixSupport {
     }
 
     /** 秒轉奈秒；0／負數代表無冷卻。 */
-    static long cooldownNanos(long seconds) {
+    public static long cooldownNanos(long seconds) {
         if (seconds <= 0) {
             return 0;
         }
@@ -203,7 +206,7 @@ final class CraftingHotfixSupport {
     /**
      * 所有子步驟共用同一個 {@code startedAt}，不在每次迭代重設時間；nanoTime 回繞也可由差值正確處理。
      */
-    static boolean budgetExpired(long startedAt, long budgetNanos, long now) {
+    public static boolean budgetExpired(long startedAt, long budgetNanos, long now) {
         return budgetNanos != Long.MAX_VALUE && now - startedAt >= budgetNanos;
     }
 }

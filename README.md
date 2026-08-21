@@ -29,7 +29,7 @@
 其餘假說都有反證：跨 CPU 誤認領（認領日誌 0 筆）、產物回流未認領（在途料一律 `網0`＝貨根本不存在）、
 機器忙碌（全 `忙:0`）、並行死角（缺口多為 `0/N`，不符指紋）。
 
-## 目前行為（slim，3.13.2）
+## 目前行為（slim，3.13.3）
 
 | 機制 | 狀態 | 說明 |
 |---|---|---|
@@ -139,6 +139,15 @@
 - **mixin 只准掛 AE2 類**（2.2.0 實測、2.3.0 撤除）。掛 `OptimizedCraftingCpuLogic` 無聲失效：jar 內有類、
   config 正常載入、同檔 AE2 mixin 照常運作、全程零錯誤，但欄位普查證實注入欄位不存在
   （gtocore 為簽章 jar、`com/gtocore/mixin` 標 `Sealed: true`）。
+- **`com.gtocraftfix.mixin` 底下只能放 mixin 本身，不能放工具類**（3.13.2 踩、3.13.3 修）。
+  那是 `gto_craft_fix.mixins.json` 宣告的 mixin package，Mixin 禁止直接參照裡面的類：
+  `IllegalClassLoadError: com.gtocraftfix.mixin.CraftingHotfixSupport is in a defined mixin package
+  … and cannot be referenced directly`，在 `CraftingService.<clinit>` 就炸，**世界完全載不進去**。
+  `gradlew build` 與單元測試都抓不到（編譯期一切正常，是 classload 期才炸）。工具類請放
+  `com.gtocraftfix.support` 之類的獨立 package 並開放為 public。
+  <br>反過來說，**mixin 自己的巢狀類是安全的**：Mixin 0.8.5 的 `InnerClassGenerator` 會把它們重定位到
+  目標類（`getUniqueReference` 對匿名 `^[0-9]+$` 與具名內部類走同一條 `%s$%s$%s` 路徑），本 mod 的
+  匿名 `$1`／`$2` 也已在正式環境跑了十幾個版本。
 - **兩道機器源守衛在 slim 啟用是有依據的**（3.13.2）。翻過整個 `logs/`：`無樣板，擋下機器源請求`
   全歷史 5 場觸發，近期 6 筆全是真的沒編樣板的料；唯一可疑的 `universal_circuit` 批次出現在 v1.1.0 那場，
   **該場對 universal_circuit 的提交是 0 筆**（樣板當時還沒編），之後每場都正常出 157 種任務、守衛未再誤擋。
