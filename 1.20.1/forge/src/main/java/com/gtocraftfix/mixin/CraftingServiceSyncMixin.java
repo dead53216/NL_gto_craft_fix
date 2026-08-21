@@ -389,20 +389,33 @@ public abstract class CraftingServiceSyncMixin {
     // ---------------------------------------------------------------- [3.13.2] 機器源降量重算保險
 
     /**
-     * 降量重算會把原本誠實的 CRAFT_LESS 硬開成短命單；預設關閉，只有明確 A/B 時才啟用。
+     * [3.13.5 改回預設開啟] 機器源 CRAFT_LESS 的砍半重算。lpcalc 在 slim 停用，所以這段是機器來源
+     * 大數量請求的**唯一**處理者；關掉＝那類請求什麼都做不出來。
+     * <p>⚠ 3.13.2 曾以「純空轉」為由改成預設關閉，**那個判斷是錯的**：它的依據是
+     * {@code [帳本] 單離場} 的「推送N輪／累計交付N」都是 0——而這兩個欄位正是 README
+     * 「兩個不可用的診斷欄位」點名不可拿來證明「沒交付」的東西（每 tick 差分，單在同一 tick 收單就必印 0）。
+     * 改用 3.12.0／B10 為此加的 link 三態來看，稀土金屬粉在 976／1953／3906／…／125000 這串
+     * 砍半量上共有 1507 筆 {@code 單離場（正常完成）}，是真的在出貨。
      */
     private static final boolean gtocraftfix$MACHINE_DOWNSCALE =
-            Boolean.getBoolean("gtodiag.machineDownscale");
+            !"false".equalsIgnoreCase(System.getProperty("gtodiag.machineDownscale", "true"));
 
-    /** 一次降量工作共用的總預算；0 代表不設時間上限。 */
+    /**
+     * 一次降量工作共用的總預算；`0` 代表不設時間上限（＝3.13.1 以前的行為，也是預設）。
+     * 砍半迴圈最多 12 趟 {@code executeV2}，設了預算就可能在還沒找到可行量時提早收手。
+     */
     private static final long gtocraftfix$DOWNSCALE_BUDGET_MS =
-            Long.getLong("gtodiag.machineDownscaleBudgetMs", 50L);
+            Long.getLong("gtodiag.machineDownscaleBudgetMs", 0L);
     private static final long gtocraftfix$DOWNSCALE_BUDGET_NS =
             CraftingHotfixSupport.budgetNanos(gtocraftfix$DOWNSCALE_BUDGET_MS);
 
-    /** 同一 grid（本 mixin 實例）／requester／key 的重試冷卻。 */
+    /**
+     * 同一 grid（本 mixin 實例）／requester／key 的重試冷卻；`0`＝不冷卻（預設，＝3.13.1 以前的行為）。
+     * 冷卻對「成功的降量」一樣會生效，而降量成功的單通常幾秒就做完，設 600 秒等於把產能砍到 1/100；
+     * 只有在確認某個 key 真的在空轉時才拿它來收斂。
+     */
     private static final long gtocraftfix$DOWNSCALE_COOLDOWN_SEC =
-            Long.getLong("gtodiag.machineDownscaleCooldownSec", 600L);
+            Long.getLong("gtodiag.machineDownscaleCooldownSec", 0L);
     private static final long gtocraftfix$DOWNSCALE_COOLDOWN_NS =
             CraftingHotfixSupport.cooldownNanos(gtocraftfix$DOWNSCALE_COOLDOWN_SEC);
 
