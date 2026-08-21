@@ -96,7 +96,47 @@ public abstract class CraftingServiceSyncMixin {
     /** 餵料回補異常另設 ERROR 額度，避免壞掉的 storage 每 tick 洗滿 log。 */
     private static final AtomicInteger gtocraftfix$feedErrorLog = new AtomicInteger();
     private int gtocraftfix$tickCounter;
-    private final Set<AEKey> gtocraftfix$noPatternLogged = new HashSet<>();
+
+    /**
+     * [3.13.4] 缺料通知的重播間隔（秒）。`0`／負數＝退回 3.13.3 的「每個 key 只通知一次」。
+     * 請求器每 10 秒重試一次，所以這裡不能設太小，否則同一個缺料會把聊天室洗掉。
+     */
+    private static final int gtocraftfix$NOTIFY_REPEAT_SEC =
+            Integer.getInteger("gtodiag.notifyRepeatSec", 300);
+
+    /**
+     * 同一個「無樣板可做」的 key 是否該再通知一次（log 與聊天室共用同一個節流）。
+     * 表大小有硬上限；超過就先掃掉過期項，仍過大才整表清掉。
+     */
+    private boolean gtocraftfix$shouldNotifyNoPattern(AEKey key) {
+        int now = gtocraftfix$tickCounter;
+        Integer last = gtocraftfix$noPatternNotified.get(key);
+        if (last != null) {
+            if (gtocraftfix$NOTIFY_REPEAT_SEC <= 0) {
+                return false; // 明確要求「只通知一次」
+            }
+            if (now - last < gtocraftfix$NOTIFY_REPEAT_SEC * 20) {
+                return false;
+            }
+        }
+        gtocraftfix$noPatternNotified.put(key, now);
+        if (gtocraftfix$noPatternNotified.size() > 128) {
+            int keepAfter = gtocraftfix$NOTIFY_REPEAT_SEC <= 0 ? 0 : gtocraftfix$NOTIFY_REPEAT_SEC * 20;
+            gtocraftfix$noPatternNotified.entrySet().removeIf(e -> now - e.getValue() >= keepAfter);
+            if (gtocraftfix$noPatternNotified.size() > 128) {
+                gtocraftfix$noPatternNotified.clear();
+            }
+            gtocraftfix$noPatternNotified.put(key, now);
+        }
+        return true;
+    }
+    /**
+     * [3.13.4] 「這個 key 沒樣板可做」的通知節流：key → 上次通知的 tick。
+     * <p>3.13.3 以前是一次性 {@code Set}，同一個 key 一輩子只通知一次。實測（2026-08-21）
+     * 稀土金屬粉的請求器連續 378 次提交失敗，玩家從頭到尾只在開服後第 2 秒收到過一行字，
+     * 之後完全靜音——「缺料不會通知」就是這個。改成每 {@code gtodiag.notifyRepeatSec} 秒可再通知一次。
+     */
+    private final Map<AEKey, Integer> gtocraftfix$noPatternNotified = new HashMap<>();
     /** storage 暫時拒收時由本 mod 保管、下 tick 優先回補的餵料餘額。 */
     private final Map<AEKey, Long> gtocraftfix$feedRefunds = new HashMap<>();
     /**
@@ -340,7 +380,7 @@ public abstract class CraftingServiceSyncMixin {
      * [3.11.1／B9，3.11.2／M7] 自舉模擬超上限的 WARN 去重鍵（成品 key 字串）。
      * <p>原本是「全域只印一次」——第一個踩到的成品把額度用光，之後任何成品都靜音，而超上限＝
      * 「本次跳過自舉補齊」是會影響計畫正確性的事實，必須看得到是**哪些**成品受影響。
-     * 改成每個成品 key 印一次；上限 128 筆即 clear（同 noPatternLogged 的作法，避免無限長大）。
+     * 改成每個成品 key 印一次；上限 128 筆即 clear（同 noPatternNotified 的作法，避免無限長大）。
      * 方法是 static，故容器用 ConcurrentHashMap 的 key set（提交雖在伺服器主緒，但不假設）。
      */
     private static final Set<String> gtocraftfix$bootstrapCapLogged =
@@ -1446,13 +1486,11 @@ public abstract class CraftingServiceSyncMixin {
             var actionSrc0 = simRequester.getActionSource();
             boolean machineSrc0 = gtocraftfix$isMachineSource(actionSrc0);
             if (machineSrc0 && ((ICraftingService) (Object) this).getCraftingFor(what).isEmpty()) {
-                if (gtocraftfix$noPatternLogged.add(what)) {
+                if (gtocraftfix$shouldNotifyNoPattern(what)) {
                     LOG.warn("[craftfix] 無樣板，擋下機器源請求：{} x{}（原版語意：不可合成）", what, amount);
-                    if (gtocraftfix$noPatternLogged.size() > 128) {
-                        gtocraftfix$noPatternLogged.clear();
-                    }
-                    // 同步在聊天室提示玩家（同 key 只提示一次）
-                    if (!gtocraftfix$SLIM && level instanceof ServerLevel sl) {
+                    // [3.13.4] 聊天室提示不再吃 !SLIM：3.13.2 起這道守衛在 slim 是**真的會擋**的
+                    // （回零任務誠實 sim → 提交被拒），擋了卻不出聲＝玩家只看得到「機器不動」。
+                    if (level instanceof ServerLevel sl) {
                         sl.getServer().getPlayerList().broadcastSystemMessage(
                                 net.minecraft.network.chat.Component.literal("[合成修復] 無樣板，已擋下自動合成請求：")
                                         .append(what.getDisplayName())
@@ -1890,10 +1928,7 @@ public abstract class CraftingServiceSyncMixin {
                     if (gtocraftfix$balLog.incrementAndGet() <= gtocraftfix$BAL_MAX) {
                         LOG.warn("[craftfix] 計畫修補 無樣板可補：{} x{}（out={}）", key, shortAmt, plan.finalOutput());
                     }
-                    if (gtocraftfix$noPatternLogged.add(key)) {
-                        if (gtocraftfix$noPatternLogged.size() > 128) {
-                            gtocraftfix$noPatternLogged.clear();
-                        }
+                    if (gtocraftfix$shouldNotifyNoPattern(key)) {
                         var server = grid.getPivot() != null && grid.getPivot().getLevel() != null
                                 ? grid.getPivot().getLevel().getServer()
                                 : null;
@@ -3610,7 +3645,7 @@ public abstract class CraftingServiceSyncMixin {
                 // [3.11.2／M7] 回空清單＝把「無法判定」當成「沒有缺口」，這是刻意的：改成中止會讓
                 // 整組還原（＝退回幻影計畫、必凍）更糟。但既然是會影響正確性的靜默跳過，log 就不能
                 // 「全域只印一次」——第一個踩到的成品會把之後所有成品都消音。改成**每個成品 key
-                // 印一次**（上限 128 筆即 clear，同 noPatternLogged 的作法），並在訊息裡明說跳過。
+                // 印一次**（上限 128 筆即 clear，同 noPatternNotified 的作法），並在訊息裡明說跳過。
                 String capKey = String.valueOf(plan.finalOutput() == null ? "?" : plan.finalOutput().what());
                 if (gtocraftfix$bootstrapCapLogged.add(capKey)) {
                     if (gtocraftfix$bootstrapCapLogged.size() > 128) {
