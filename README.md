@@ -243,9 +243,9 @@ shadow／budget／maxKeys 與 `[craftfix][lp]` 統計在 slim 都不可達。
 **檔案級混合授權**：原創檔案為 MIT；`com.gtocraftfix.calc` 中保留 Applied Energistics 2
 著作權／授權標頭的衍生檔案，依各檔標頭為 LGPL-3.0-or-later。
 
-- `LICENSE-MIT.txt`：原創檔案的 MIT 全文
-- `COPYING` / `COPYING.LESSER`：GNU GPLv3／LGPLv3 canonical 全文
-- `NOTICE`：AE2／AlgorithmX2／TeamAppliedEnergistics 衍生來源與檔案範圍歸屬
+- `licenses/LICENSE-MIT.txt`：原創檔案的 MIT 全文
+- `licenses/COPYING` / `licenses/COPYING.LESSER`：GNU GPLv3／LGPLv3 canonical 全文
+- `licenses/NOTICE`：AE2／AlgorithmX2／TeamAppliedEnergistics 衍生來源與檔案範圍歸屬
 
 建置會把上述檔案自動放進 JAR 的 `META-INF/`。各原始檔的既有標頭與 `NOTICE` 的逐檔規則優先，
 **不得把整個 JAR 簡化宣稱為單一 MIT 授權**。

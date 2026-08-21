@@ -72,8 +72,9 @@ tasks.named('test', Test).configure {
     useJUnitPlatform()
 }
 
-// 根目錄的正式授權／歸屬檔自動收進 JAR；沒有符合檔案時保持空集合，不阻斷建置。
-def legalFiles = file('../..').listFiles()?.findAll {
+// licenses/ 下的正式授權／歸屬檔自動收進 JAR；沒有符合檔案時保持空集合，不阻斷建置。
+// （放子目錄純粹是為了讓 repo 根目錄乾淨；JAR 內位置不變，仍是 META-INF/。）
+def legalFiles = file('../../licenses').listFiles()?.findAll {
     it.isFile() && it.name ==~ /(?i)(LICENSE|COPYING|NOTICE)([-.].+)?/
 }?.sort { it.name } ?: []
 tasks.withType(org.gradle.jvm.tasks.Jar).configureEach {
