@@ -78,7 +78,9 @@ public final class CraftLog {
             builder.withIgnoreExceptions(true);
             builder.withFileName(file.toString());
             builder.withAppend(false);
-            builder.withImmediateFlush(false); // 診斷量大，交給 log4j 緩衝；停服時會 flush
+            // [3.15.0] 預設立即 flush：3.14.0 用緩衝，最後一個 buffer 沒落地，現場查 log
+            // 永遠看不到最新那幾行。要拿回緩衝用 -Dgtodiag.logBuffered=true。
+            builder.withImmediateFlush(!Boolean.getBoolean("gtodiag.logBuffered"));
             Appender appender = builder.build();
             appender.start();
             config.addAppender(appender);

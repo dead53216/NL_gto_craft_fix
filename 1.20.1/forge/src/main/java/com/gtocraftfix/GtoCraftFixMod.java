@@ -34,11 +34,18 @@ public final class GtoCraftFixMod {
         // 停機清理：static 佇列（LP 回退佇列、算料泵佇列）強持 Level/IGrid，不清會讓整個舊
         // ServerLevel 在主選單期間無法 GC，且新世界首個 tick 會對死 grid 建構/泵發算料
         MinecraftForge.EVENT_BUS.addListener(GtoCraftFixMod::onServerStopped);
+        // /craftfix why —— 拿著物品當場問「這東西為什麼不合成」
+        MinecraftForge.EVENT_BUS.addListener(GtoCraftFixMod::onRegisterCommands);
         LogManager.getLogger("gtocraftfix").info(
                 "[craftfix] 已載入 slim：同步算料＋機器源 IgnoreMissing＋計畫修補＋中間料救援。");
     }
 
+    private static void onRegisterCommands(net.minecraftforge.event.RegisterCommandsEvent event) {
+        CraftFixCommand.register(event.getDispatcher());
+    }
+
     private static void onServerStopped(ServerStoppedEvent event) {
+        GridRegistry.clearOnServerStopped();
         com.gtocraftfix.diag.CraftDiag.clearOnServerStopped();
         com.gtocraftfix.lpcalc.LpFallbackQueue.clearOnServerStopped();
         com.gtocraftfix.calc.CalcTicker.clearOnServerStopped();

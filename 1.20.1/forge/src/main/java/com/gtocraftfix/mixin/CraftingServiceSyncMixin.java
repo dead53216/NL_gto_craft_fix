@@ -3067,6 +3067,8 @@ public abstract class CraftingServiceSyncMixin {
         com.gtocraftfix.calc.CalcTicker.tick(); // 內置原版算料器的預算泵（每 tick）
         com.gtocraftfix.lpcalc.LpFallbackQueue.drainOnServerTick(); // LP 晚期回退/影子驗證的伺服器緒建構點（鐵則5/8）
         gtocraftfix$tickCounter++;
+        // [3.15.0] 登記這張網路，讓 /craftfix why 有東西可查（WeakHashMap，網路消失自動掉）
+        com.gtocraftfix.GridRegistry.seen((ICraftingService) (Object) this, grid);
         // [3.14.0] link 稽核：每 10 秒掃一次孤兒 link（請求器不再下單的唯一可見成因）。
         if (gtocraftfix$tickCounter % 200 == 0) {
             try {
