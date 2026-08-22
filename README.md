@@ -1,232 +1,47 @@
 # NL_gto_craft_fix（GTO Craft Fix）
 
 修復 GregTech-Odyssey（GTO）整合包「合成樹超過一步就無法（正確）自動合成」的獨立 mod。
-不改 GTOCore、不動 gtolib，**所有 mixin 只掛在 AE2 類上**（掛 gtocore 的類已二度實證無聲失效，
-`com/gtocore/mixin` 是簽章＋Sealed jar，此路封死）。
+不改 GTOCore、不動 gtolib，全部修正掛在 AE2 類上。
 
-- 環境：Minecraft 1.20.1 / Forge 47.x / Java 21 / `gtocore` **0.5.6-beta**
-  （其 jarjar 內含 gtolib 26.7.4、gtceu 26.7.3、AE2-gto 15.267.4）。
-- ⚠ `mods.toml` 的 `gtocore` 範圍要對著 **`0.5.6-beta`** 寫。26.7.x 是 gtolib／gtceu 的版號，
-  寫成 `[26.7.4-alpha],[26.7.5-alpha]` 會讓 Forge 判定缺相依、整包起不來（3.13.2 途中實際踩過，
-  jar 建得出來、測試也全過，只有真的進遊戲才會炸）。現行：`gtocore [0.5.6-beta,)`、
-  `ae2 [15.267.4,)`、`minecraft [1.20.1]`、`forge [47,48)`。
-- 根因分析與上游修法建議：見 [gtocraftdiag repo 的 ISSUE.md](https://github.com/dead53216/gtocraftdiag/blob/main/ISSUE.md)（本 mod 前身，同源）。
-- 本檔以 `slim` 分支的實際行為為準。`lpcalc` 與完整版真缺料守衛的原始碼仍在 JAR 中，但
-  `CraftingServiceSyncMixin.gtocraftfix$SLIM=true` 在外層硬停用（`-Dgtodiag.lpcalc.enabled=true`
-  也繞不過）。[DESIGN-lpcalc.md](DESIGN-lpcalc.md) 是未啟用的草案，不是現行承諾。
+- 環境：Minecraft 1.20.1 / Forge 47.x / GTOCore 26.7.5-alpha / AE2-gto 15.267.4
+- 根因分析與上游修法建議：見 [gtocraftdiag repo 的 ISSUE.md](https://github.com/dead53216/gtocraftdiag/blob/main/ISSUE.md)（本 mod 前身，同源）
 
-## 凍結的四種形狀（病因互不相同）
+> **本檔說明完整版（`v2` 分支）。目前所在的 `slim` 分支保留五項會改行為的修正**：算料同步化（終端 ctrl+左鍵）、機器源 present-once IgnoreMissing（請求器／接口／合成卡）、並行死角解鎖、機器源降量重算（3.1.0）、**計畫修補（3.3.0，見下方「根因二實證」）**。仍停用：無樣板守衛、lpcalc 接管、**兩個拒單守衛**（真缺料擋單／退化計畫拒收改為只記 log——slim 原則是「只修計畫、不擋單」）、保母餵料／補輸入。停用處**程式碼保留、log 照印**；`CraftingServiceSyncMixin.gtocraftfix$SLIM` 改 false 即恢復完整行為。診斷（探針 X 光／忙碌座標／欄位普查／提交失敗）全部保留。
 
-| 形狀 | 現場特徵 | 真因 | 對應修法 |
-|---|---|---|---|
-| 算料不返回 | 終端 ctrl+左鍵毫無反應 | GTO 單執行緒 async 算料，多步時 Future 不返回 | 改伺服器執行緒同步 `executeV2` |
-| 機器源被無限拒單 | 接口／請求器／合成卡一直 `MISSING_INGREDIENT` | `usedItems` 含「執行期才回流的中間產物」，嚴格取料必失敗；GTO 只讓有 player 的來源走 IgnoreMissing | present-once 包一層：`player()` 首呼回 present（過條件判斷），其後回 empty（取料用 machine 身分） |
-| 計畫本身就不可能完成 | `waiting` 全是「等N／網0／**無任務產它**」，供應器全 `忙:0`、`results` 全 BREAK | **ISSUE.md 根因二**：算料器把「網路 0 個的批量餘數」寫進 `usedItems` 卻不排樣板 → IgnoreMissing 把它變成永遠等不到的 `waitingFor` | **計畫修補**：把缺口補成真正的樣板輪次排進同一張計畫 |
-| 料齊卻完全不動 | `results={}`、零錯誤 | ①上游 `parallel==1` 取料死角（`OptimizedCraftingCpuLogic.executeCrafting:221-238` 漏了分支）②全部供應器 `isBusy()` 時直接 `continue` | ①保母把輸入補到 2 輪份，讓 GTO 走 `parallel>1` 分支 ②探針印出忙碌機器座標 |
+## 根因二實證（2026-08-15，slim 對照實驗）
 
-根因二的定性實驗（2026-08-15）：把保母與修補全關、只留診斷跑一整晚，凍結案例全部收斂到根因二，
-且抓到提交當下的證據——`ferrite_mixture_dust 要37/網0` 這個 37 直接變成永遠等不到的 `waitingFor`。
-其餘假說都有反證：跨 CPU 誤認領（認領日誌 0 筆）、產物回流未認領（在途料一律 `網0`＝貨根本不存在）、
-機器忙碌（全 `忙:0`）、並行死角（缺口多為 `0/N`，不符指紋）。
-
-## 目前行為（slim，3.15.1）
-
-| 機制 | 狀態 | 說明 |
-|---|---|---|
-| 算料同步化 | 啟用 | 見上表 |
-| 機器源 present-once IgnoreMissing | 啟用 | 見上表 |
-| 計畫修補（五維）| 啟用 | ①`missingItems` ②`usedItems` 批量餘數幻影 ③最終產出總量短缺 ④循環自舉缺口 ⑤內部配平。缺口直接補樣板 runs 進同一張計畫，不生新任務 |
-| 並行死角解鎖 | 啟用 | 命中指紋（`min⌊庫存/每輪⌋==1` 且剩 >1 輪）時把輸入補到 2 輪份；只補料，不代推送、不碰帳 |
-| 無樣板守衛 | 啟用（3.13.2）| begin 階段查無樣板 → 機器來源收到「缺完整量、零任務」的誠實 sim；玩家不擋 |
-| 退化計畫拒收 | 啟用（3.13.2）| 機器來源且無任何正輪數任務 → `INCOMPLETE_PLAN`；玩家不拒 |
-| 可證明的 final 交付不足拒收 | 啟用（3.13.2）| `emittedItems + 樣板產出 < final 需求` 才拒（**不計 `usedItems(final)`**：GTO 不會把開局吸入的成品送進 link）；讀不到就不擋，玩家不擋 |
-| 保母餵料 | 啟用（只餵中間料）| 只補「無任務產它＋確認無樣板在途」的幻影中間料，**final key 永不餵**；預設 1 Hz |
-| 帳本／探針診斷 | 啟用 | 純唯讀，見下方「診斷 log 導覽」 |
-| 機器源降量重算 | 啟用 | lpcalc 停用時，這是機器來源大數量請求的**唯一**處理者。3.13.2 曾誤判為空轉而關掉，3.13.5 改回開啟——見「不要再走回頭路」|
-| 保母補輸入（top-up）| **預設關** | 沒有 `waitingFor` 當額度上限，實測會把單一料的全網存量吸進一顆 CPU |
-| 卡死救援（取消整張單）| **預設關** | 兩種真實卡單它一種都碰不到，見「不要再走回頭路」 |
-| 一般真缺料擋單 | **預設關** | slim 原則＝只修計畫、不擋單（上面三道機器源守衛是明確例外）|
-| lpcalc 接管 | **預設關** | 見文末 |
-
-> 不支援「只把 `gtocraftfix$SLIM` 改成 false」來做完整版；重新啟用前必須先完成 DESIGN 的單元與遊戲內驗收。
-
-## 旗標
-
-**刻意不做「一鍵全開」的總開關**——3.9.0～3.10.2 兩次退步都是多個行為綁在一起上線、出事無法定位。
-每項可單獨 A/B。啟動時 log 會印 `[craftfix] 修補旗標 …` 一覽。
-
-### 計畫修補
-
-| 系統屬性 | 預設 | 作用 |
-|---|---|---|
-| `gtodiag.repairGuard` | `20000` | 缺口數上限（耗盡＝整組還原）。3.8.0 是 4000，實測有機陽／陰液「已處理 4001 項、仍剩 9 項」就整組還原 → 幻影缺口變成永遠等不到的 `waitingFor` |
-| `gtodiag.repairBudgetMs` | `200` | 整次修補（含循環自舉）共用的時間預算，**真正的發散護欄**。`0`／負數＝停用；極大值飽和成無上限，不會因 `ms×1e6` 溢位而每次立即超時 |
-| `gtodiag.repairRunCap` | `2000000` | 可新增總輪數的**底線** |
-| `gtodiag.repairRunFactor` | `4` | 比例項：實際上限 = min(`runHardCap`, max(`runCap`, 原計畫總輪數 × 本係數))。`0`＝停用比例項 |
-| `gtodiag.repairRunHardCap` | `50000000` | 比例上限的絕對天花板 |
-| `gtodiag.repairDeficitSrc` | `on` | 缺口沖銷只准動真的來自 `usedItems` 的帳：`on`＝完整來源判定／`clamp`＝不分來源但不寫負值／`off`＝3.8.0 原樣 |
-| `gtodiag.repairStrictRounds` | `false` | 外圈 4 輪後仍含 hard 缺口一律整組還原；確定全為 soft 自舉猜測時預設只 WARN 並送出已修計畫，設 `true` 才連全 soft 也還原 |
-| `gtodiag.bootstrapMaxPass` | `200000` | 循環自舉的 pass 上限（與修補共用 deadline）。撞 pass 上限只跳過本次自舉判定、保留已完成的硬缺口修補；撞時間預算才整組中止還原 |
-| `gtodiag.repairUpdateBytes` | `false` | 依新增輪次等比例調高 `plan.bytes()`（開啟後原本擠得上小 CPU 的計畫會改吃 `CPU_TOO_SMALL`）|
-| `gtodiag.repairNetSpot` | `false` | 缺口優先吃網路現貨（否則一律排樣板）|
-| `gtodiag.repairBalance` / `…OnAbort` / `…Log` | `false` / `false` / `true` | 第五維內部配平：補齊／中止時也補齊／只觀測不補 |
-| `gtodiag.repairBlockOnAbort` | `off` | 中止後擋機器源提交：`off`／`on`（slim 不生效）／`force` |
-| `gtodiag.repairAbortBroadcast` | `false` | 擋單時聊天室廣播（**對全伺服器玩家**送出，多人會洗頻）|
-| `gtodiag.repairFreezeProbe` | `false` | 不擋單也跑「必凍」判定並留 log |
-
-> ⚠ 預設值 ≠ 3.8.0：`repairDeficitSrc=on` 與 `bootstrapMaxPass=200000` 刻意不同，都是修 3.8.0 自己的 bug。
-> 要純 3.8.0 對照組：`-Dgtodiag.repairGuard=4000 -Dgtodiag.repairBudgetMs=0 -Dgtodiag.repairDeficitSrc=off`
-> `-Dgtodiag.bootstrapMaxPass=2147483647 -Dgtodiag.repairBalanceLog=false`
-
-### 機器源降量重算
-
-CRAFT_LESS 被 `executeV2` 整張歸 0 時砍半重算，最多 12 趟，找到可執行量就送出。玩家來源不降量。
-
-| 系統屬性 | 預設 | 作用 |
-|---|---|---|
-| `gtodiag.machineDownscale` | `true` | 關掉＝機器來源的大數量請求什麼都做不出來 |
-| `gtodiag.machineDownscaleBudgetMs` | `0` | 同一次工作全部重算共用的時間預算；`0`＝不設上限。設了就可能在還沒找到可行量時提早收手 |
-| `gtodiag.machineDownscaleCooldownSec` | `0` | 同一 grid／requester／key 的重試冷卻。**對成功的降量一樣生效**，而降量成功的單通常幾秒就做完，設 600 等於把產能砍到 1/100；只在確認某個 key 真的空轉時才拿來收斂 |
-
-### 執行期救援
-
-修補只在 `submitJob` 那一瞬間跑，**下單後才長出來的缺口它看不到也補不到**。
-
-| 系統屬性 | 預設 | 作用 |
-|---|---|---|
-| `gtodiag.sitterFeed` | `true` | 把網路現貨補進 CPU 的**中間料** `waitingFor` 缺口 |
-| `gtodiag.sitterFeedPhantomOnly` | `true` | 只餵幻影中間料（無剩餘任務產它＋明確確認無樣板在途）。pending 反射未知或已有在途一律不餵；設 `false` 只是略過 task-output 條件，pending 仍須明確為無、final 仍禁餵 |
-| `gtodiag.sitterTopUp` | `false` | 保母補輸入（見上表，維持停用）|
-| `gtodiag.stallCancel` | `false` | 卡死救援（見下節）|
-| `gtodiag.stallCancelSec` / `…CooldownSec` / `…Broadcast` | `300` / `600` / `true` | 零進度秒數／同顆 CPU 冷卻／救援時廣播 |
-
-### 缺料通知
-
-| 系統屬性 | 預設 | 作用 |
-|---|---|---|
-| `gtodiag.notifyRepeatSec` | `300` | 同一個「無樣板可做」的 key 隔多久可再通知一次（log 與聊天室共用）。`0`／負數＝退回「每個 key 只通知一次」。請求器每 10 秒重試，設太小會洗頻 |
-
-## 不要再走回頭路（實證結論）
-
-每一條都有實錄，改動前先讀。
-
-- **修一半比不修更糟 → 全有全無**（3.8.0）。舊版 `guard++ < 96` 讓大電路第一輪就撞牆，17 次修補 7 次貼著 96 停：
-  輪次加了、輸入沒補＝計畫內部不平衡＝必凍（ZPM 電路實錄：epoxy／quantum_processor／lubricant／ceramics_dust
-  全標「本單無人產」，網路各有 1448／4／122903／95 卻進不去，CPU 靜止 3 分鐘）。任一上限耗盡即整組還原。
-- **固定輪數上限是錯的門檻**（3.13.0）。UHV 通用電路 112 萬輪的計畫只超上限 **0.56%** 就整組還原 → 17 種
-  「網存 0 且無任務產它」→ 靜止 600s+。改成跟著計畫規模縮放；發散護欄交給時間預算，不是輪數。
-- **「補樣板」這條路只能由算料器做，修補這層只補得起網路現貨**（3.9.0 回退）。把配平缺口丟回缺口佇列
-  會製造新輸入需求 → 新缺口 → 再補，遞迴發散：glowstone 缺口 6 輪內從 147456 膨脹到 3833856，
-  LUV 交付從 466/500 掉到 **8/500**。配平模型也必須用**供給扣除法**（逐槽分配、用掉就扣）；
-  「取供給最多的變體」會自我增強，是發散的另一半原因。
-- **「中止就擋單」會擋掉正常計畫**（3.10.0 → 3.10.1 修正）。157 任務／217 萬輪的正常 UHV 計畫被每 10 秒
-  擋一次（玩家手動做得起來、機器永遠下不了單）。擋單條件必須是「還原後的計畫必凍」——
-  `usedItems` 要的量網路給不出來 **且** 計畫裡沒有任何任務會產它。
-- **配平補齊不該被中止連坐**（3.10.2）。補齊只吸網路現貨、有界又便宜；順序必須是
-  還原 → 補齊 → 再判擋不擋（還原排在補齊之後會把補進 `usedItems` 的現貨洗掉）。
-- **成品不可由本 mod 搬進 CPU**。GTO 沒有「把開局吸入的成品交給 link」的步驟，吸進去只會抱著現貨永凍
-  （NAND 625 實錄）。所以：缺口吃網路現貨時成品例外、保母 final key 永不餵、final 交付量不計 `usedItems(final)`。
-- **「請求器沒呼叫」不等於查不下去**（3.14.0）。2026-08-22 稀土金屬粉的請求器 (78354,131,-46408)
-  從 17:45 起完全靜音——`beginCraftingCalculation` 與 `submitJob` 都 0 次，鄰居 (78354,130,-46408)
-  同區塊照常送請求，跨兩次重開世界都沒醒。這種形狀不是「不明原因」：merequester 只在手上沒有
-  未結案 `ICraftingLink` 時才重新請求，而 link 的權威登記簿就在 `CraftingService.craftingLinks`
-  （`Map<UUID, CraftingLinkNexus>`，nexus 分 `req`／`cpu` 兩側）。**這個 mod 掛在 CraftingService
-  上，本來就看得到它**。加了 `[craftfix][link]` 稽核之後，孤兒 link 會自己report 出來。
-  <br>用反射而不是 `@Shadow` 讀那個欄位：`@Shadow` 對不上是 apply 期硬失敗＝世界載不進去，
-  純診斷不值得冒那個險（3.13.2 剛用另一種方式示範過同一類代價）。
-- **fail-closed 不能做成「一票否決整張單」**（3.13.2 埋、3.13.6 修）。保母的「這個 key 有沒有樣板
-  押在供應器上」判定被寫成 `pendingAnywhere`：只要整張單的 `pendingRequests` 非空，**該單所有 key
-  一律不餵**。理由是「pendingRequests 只索引主產物、副產物查不到可能誤餵」——立意對，代價完全不成比例。
-  實測 2026-08-22：稀土金屬粉每張單都有一筆 `rare_earth_oxide_dust` 押在供應器上，於是同一張單裡
-  `salt_water(等312萬／**網 714 億**／無任務產它)` 這種純幻影缺口一次都沒被餵 → 單活 8 秒離場、
-  **5,459 張單累計交付 0、AE 庫存 0**。當天 510 筆「網路有貨且無任務產它」的缺口實際餵了 **0** 筆
-  （3.13.1 同類場景是 690 筆餵 134 筆）。改回逐 key 判定；殘留的誤餵風險有界——餵入量以
-  `getWaitingFor(key)` 為上限、final 永不餵，多餵的副產物只會留在 CPU 庫存、離場回網路，不動 link 帳。
-  取消救援那一側**刻意不跟進**，維持全單 fail-closed（餵錯一筆料 vs 取消錯一張單，代價差一個量級）。
-  <br>同時補上 `[craftfix] 保母略過 <key>：<原因>`（每場 100 行）——這次保母整天靜音卻查不出被哪道
-  閘門擋，就是因為略過完全沒有紀錄。
-- **不要拿「推送N輪／累計交付N」當證據**——這條是 3.13.2→3.13.5 自己踩出來的。3.13.2 以
-  「`[帳本] 單離場` 顯示 174 張降量單全是『存活 1s／推送 0 輪／交付 0』」為由把降量重算改成預設關閉。
-  **那個推論是錯的**：這兩個欄位正是本檔下面「兩個不可用的診斷欄位」點名不能用來證明「沒交付」的東西
-  （每 tick 差分，單在同一 tick 收單就必印 0）。改用 3.12.0／B10 為此加的 link 三態重算：
-  `rare_earth_metal_dust` 在 976／1953／3906／…／125000 這串砍半量上共有 **1507 筆
-  `單離場（正常完成）`**，`fermented_biomass` 也有 2107 筆——降量重算一直在出貨。
-  3.13.5 已把 `machineDownscale` 改回預設開啟，冷卻與時間預算也回到 `0`（3.13.1 以前的行為）；
-  3.13.2 加的例外處理與 `hasPositiveTask` 檢查是純安全強化，保留。
-  <br>順帶記著：**降量重算是 lpcalc 停用時機器來源大數量請求的唯一處理者**，關掉它＝那類請求全滅。
-- **卡死救援（取消整張單）碰不到真實卡單**（3.13.1 改預設關）。2026-08-19 實測兩種卡單：
-  控制倉三道全過卻卡在「無樣板在途」這道一票否決（那筆推送已 21 分鐘零進度，早就不是在途而是弄丟了）；
-  密銀每 4~6 秒開一張新單、每張活 2 秒，零進度計時器永遠累積不到。現階段只有誤殺風險、沒有實際效益。
-- **不做「執行期補單」**。那等於巢狀／代下合成請求，歷史上兩度觀察到它滾出巨量碎單拖垮伺服器。
-  只搬網路現貨，不代下合成請求。
-- **`getGtocore$allocations` 不存在，別再加**（3.13.2 移除）。反編譯 `gtocore-0.5.6-beta` 證實沒有這組
-  accessor；`allocations` 是 `com.gtocore.api.ae2.crafting.ExecutingCraftingJob` 的執行期欄位，
-  `CraftingPlan` 上無物可清。那段反射恆為 no-op。
-- **搬料對帳不可用 before/after 全網 SIMULATE 差額**（3.13.2 改掉）。`CraftingServiceStorage` 以
-  `Integer.MAX_VALUE` 最高優先權掛在網路上，回補的貨只要有 CPU 在等就當場被認領、不會進可查詢庫存 →
-  `after==before` → 差額 0 ≠ 回傳量 → 第一次回補就永久隔離整張 grid，而回補的觸發條件恰好就是
-  「有 CPU 在等這個 key」＝保證誤觸。改以 AE2 契約回傳值為準，順帶省掉每次搬料兩趟全網 SIMULATE。
-  只有 mutation 真的拋例外且差額也推不出來、或回傳值越出 `[0, requested]`，才進隔離。
-- **mixin 只准掛 AE2 類**（2.2.0 實測、2.3.0 撤除）。掛 `OptimizedCraftingCpuLogic` 無聲失效：jar 內有類、
-  config 正常載入、同檔 AE2 mixin 照常運作、全程零錯誤，但欄位普查證實注入欄位不存在
-  （gtocore 為簽章 jar、`com/gtocore/mixin` 標 `Sealed: true`）。
-- **`com.gtocraftfix.mixin` 底下只能放 mixin 本身，不能放工具類**（3.13.2 踩、3.13.3 修）。
-  那是 `gto_craft_fix.mixins.json` 宣告的 mixin package，Mixin 禁止直接參照裡面的類：
-  `IllegalClassLoadError: com.gtocraftfix.mixin.CraftingHotfixSupport is in a defined mixin package
-  … and cannot be referenced directly`，在 `CraftingService.<clinit>` 就炸，**世界完全載不進去**。
-  `gradlew build` 與單元測試都抓不到（編譯期一切正常，是 classload 期才炸）。工具類請放
-  `com.gtocraftfix.support` 之類的獨立 package 並開放為 public。
-  <br>反過來說，**mixin 自己的巢狀類是安全的**：Mixin 0.8.5 的 `InnerClassGenerator` 會把它們重定位到
-  目標類（`getUniqueReference` 對匿名 `^[0-9]+$` 與具名內部類走同一條 `%s$%s$%s` 路徑），本 mod 的
-  匿名 `$1`／`$2` 也已在正式環境跑了十幾個版本。
-- **擋了就要出聲，而且不能只出聲一次**（3.13.4）。兩個病灶：①begin 階段的無樣板守衛 3.13.2 起在 slim
-  是**真的會擋**的，聊天室提示卻還掛在 `!SLIM` 底下＝擋了不出聲；②缺料通知原本用一次性 `Set` 去重，
-  同一個 key 一輩子只通知一次。實測 2026-08-21：稀土金屬粉的請求器連續 **378 次**提交失敗，玩家只在
-  開服後第 2 秒收到過一行字，之後完全靜音——外觀就是「機器不動、什麼都沒說」。改成節流表
-  （`gtodiag.notifyRepeatSec`，預設 300 秒可再通知）並解掉 `!SLIM`。
-- **兩道機器源守衛在 slim 啟用是有依據的**（3.13.2）。翻過整個 `logs/`：`無樣板，擋下機器源請求`
-  全歷史 5 場觸發，近期 6 筆全是真的沒編樣板的料；唯一可疑的 `universal_circuit` 批次出現在 v1.1.0 那場，
-  **該場對 universal_circuit 的提交是 0 筆**（樣板當時還沒編），之後每場都正常出 157 種任務、守衛未再誤擋。
-  `退化計畫（無合成任務）` 那行舊版在 slim 也會印，**全歷史命中 0 次**；前移到 `submitJob` HEAD 也不吃掉
-  修補機會——零任務計畫的缺口必然無樣板可補，修補對它本來就是 no-op。
-
-## `/craftfix why`（3.15.0，3.15.1 修可用性）
-
-**手上拿著要查的物品**打 `/craftfix why`，當場回答「這東西為什麼不合成」：
+把保母與計畫修補全部關掉、只留診斷跑一整晚，凍結案例全部收斂到 **ISSUE.md 根因二**（`executeV2` 把
+「網路中數量為 0 的批量餘數」寫進 `usedItems` 且不為其安排樣板運行），且首次抓到**提交當下**的證據：
 
 ```
-[craftfix] 稀土金屬粉  AEItemKey{gtocore:rare_earth_metal_dust}
-  共 1088 張網路，略過 1080 張無關的（無 CPU／無樣板／無現貨）
-  網路#12  樣板=0  可合成=false  可發射=false  現貨=0  已請求=0  CPU=8
-           ← **精確 NBT 對不上**：樣板產出的是下面那些 key，不是你手上這顆
-      同名不同 NBT 的可合成品：AEItemKey{gtocore:rare_earth_metal_dust, tag=...}
+22:33:36 提交  [craftfix] 開單即缺（計畫未排生產）out=universal_circuit_zpm x100
+                → gtceu:ferrite_mixture_dust 要37/網0
+22:35:58 探針  gtceu:ferrite_mixture_dust(等37/網0/無任務產它)
+               gtceu:polyvinyl_chloride_foil(等2/網0/無任務產它)
+               gtocore:tungsten_tetraboride_ceramics_brick(等96/網0/無任務產它)
+               剩餘任務全部被自己的輸入餓死、供應器全 忙:0、results 全 BREAK
 ```
 
-請求器要不要下單只看三件事：**可合成性、網路現貨、已請求量**，三個都在 `ICraftingService` 上，
-本 mod 掛在 `CraftingService` 就拿得到——以前只是沒有地方可以問，才會出現「請求器沒呼叫、
-但查不出為什麼」的死角。純唯讀。
+同一個數字（37）從「計畫以為網路有」直接變成「永遠等不到的 `waitingFor`」。同場另兩張單同構
+（qbit 晶片：雙酚A 74000／表氯醇 10000／電子級矽 16000 全標「無任務產它」）。
 
-3.15.1 修掉 3.15.0 兩個讓它實際上不能用的問題：
+**排除的其他假說**（都有量測佐證，不是推測）：
 
-- **只印相關的網路**。世界裡每一段沒接起來的 AE 線材都是一張獨立 grid，實測 **1088 張**；
-  3.15.0 全部照印，真正那張被埋在上千行聊天訊息裡完全看不到。現在只印「有 CPU／有樣板／
-  有現貨／有在途」的，其餘只回報略過幾張，並限最多 8 張。
-- **找 NBT 不同的同名品**。「樣板數=0」最常見的真因不是樣板不見了，而是**手上那顆的 NBT
-  跟樣板產出的不是同一個 `AEKey`**（GTO 很多東西帶 tag）。查不到精確樣板時會掃網路的可合成
-  清單，把「同一個物品、不同 NBT」的 key 列出來——請求器設定的是哪一顆，一看就知道。
+| 假說 | 反證 |
+|---|---|
+| 跨 CPU 誤認領（`insertIntoCpus` 對 HashSet 任意序發貨）| 認領日誌（候選 ≥2 才印）**0 筆**；在途料幾乎都只有本 CPU 在等 |
+| 產物回流網路未觸發認領 | 在途料一律 `網0`——貨根本不存在，不是沒被認領 |
+| 機器忙碌／吞樣板 | 供應器全 `忙:0`，且缺的料本單**零任務會產出**（`無任務產它`）|
+| 並行死角（`parallel==1`）| 缺口多為 `0/N`，連一輪都不到，不符指紋 |
 
-## 診斷 log 導覽
+**結論**：凍結源自**計畫本身**，與執行器、認領、機器現場無關。上游正解＝gtolib 批量餘數向上取整
+（多排一次樣板）；mod 這層的等效根治＝**計畫修補**把缺口補成真正的樣板輪次排進同一張計畫——
+因此 3.3.0 在 slim 重新啟用它（保母／lpcalc 維持關閉，證明「不靠補料也能解」）。
 
-**log 寫在自己的檔案**（3.13.7）：`logs/craftfix.log`，**不再進 `latest.log`**。
-本 mod 的帳本／探針量大（實測單一場把 `latest.log` 撐到 31 MB），混在一起兩邊都難查。
-開服時上一場會改名成 `craftfix-<上一場最後寫入時間>.log` 保留，預設留 5 份。
+## 帳本診斷（3.7.0，`com.gtocraftfix.diag.CraftDiag`，純唯讀）
 
-| 系統屬性 | 預設 | 作用 |
-|---|---|---|
-| `gtodiag.logToMain` | `false` | 設 `true` 則同時寫回 `latest.log`（additivity）|
-| `gtodiag.logKeep` | `5` | 保留幾份舊的 `craftfix-*.log` |
-
-`com.gtocraftfix.diag.CraftDiag`，**純唯讀**。核心是每 tick 對每顆有單的 CPU 驗一條不變量：
+「出生收支平衡、跑一跑就短缺」的漂移要抓在**每一 tick**。帳本對每顆有單的 CPU 記
+{剩餘輪數、CPU 庫存、在途、待交付}，用一條可證的不變量比對：
 
 ```
 Δ庫存(k) + Δ在途(k) + Δ已交付(k=成品) == 產出(k) − 消耗(k) + 本 mod 自補(k)
@@ -238,68 +53,260 @@ CRAFT_LESS 被 `executeV2` 整張歸 0 時砍半重算，最多 12 趟，找到�
 
 | log 前綴 | 內容 |
 |---|---|
-| `[提交]` | 來源（玩家／機器＋座標）、sim、bytes、任務種數／總輪數、used/missing/emitted、**第幾次下單／距上次幾秒**（抓請求器反覆重下單）|
-| `[計畫]` | 計畫出生留底：任務清單（產物×輪數）、usedItems、missingItems |
-| `[開單帳本]` | 提交返回後對帳「計畫 usedItems vs CPU 實吸庫存＋掛上的在途」。差額不落在任一邊＝取料階段吞掉；落在在途＝正常 IgnoreMissing。**「開單即缺」是沒取到還是沒記帳，只有這裡分得出來** |
-| `[帳本] 新單上機／單離場` | 上機當下的完整狀態；離場印存活秒數、累計推送輪數、**訂N/交付M**、剩餘輪／在途／庫存／待交付與累計帳外差額 |
-| `[帳本] 對不上` | 不變量違反：庫存Δ／在途Δ／交付／自補／應為（產N-吃M）／差額＋本 tick 推了哪些樣板。同顆 CPU 20 tick 內只印一行 |
-| `[帳本] 任務新增／輪數倒增` | 執行中計畫被擴張（該 tick 對帳失真故跳過並重置凍結計時）；正常做完移除的任務按「剩餘輪數歸零」完整入帳 |
-| `[帳本] 交付` | 每 5 秒（有交付才印）：近 5 秒／累計交付／下單總量／待交付——分辨「慢」與「停」|
-| `[帳本] **提前收單**` | 離場時 `交付 < 下單量` 直接點名差多少 |
-| `[警報]` | 不必等 60 秒：**料齊卻不推**（料夠 ≥1 輪、供應器不忙卻 10 秒沒推）、**在途沒回**（掛在途 ≥2 分鐘且網存 0）|
-| `[一覽]` | 每 30 秒一行：每顆 CPU 的 剩輪／在途／庫存／待交付／**近 30 秒推了幾輪**／靜止幾秒 |
-| `[凍結]` | 靜止 60 秒觸發（之後每 5 分鐘重播）：逐任務全部輸入格 have/need＋網存＋在途＋誰產它＋替代數，供應器 prov/忙/座標，可跑幾輪；在途明細（等N／網M／等了Ns／另K顆也等／推給座標／無任務產它）；**饑餓鏈根源**；最後一行 **判定** |
-| `[link]` | **孤兒 link**（3.14.0）：`craftId=… req=true cpu=false done=false canceled=false 請求器=…(x,y,z)`。AE2 的 link 有兩側，請求器那半還掛著、CPU 那半沒了、又沒 done／canceled ＝ **那顆請求器不會再下單**。merequester 只在沒有未結案 link 時才重新請求，而那半 link 存在方塊 NBT，**重開世界也不會好**。每 10 秒掃一次，同一 craftId 只在狀態改變時再印 |
-| `[認領]` | `<key> x<量> 交付：N顆 CPU 同時在等 → …`，候選 ≥2 才印。AE2 的 `insertIntoCpus` 對 `craftingCPUClusters`（HashSet，順序任意）逐顆 `insert`，**不認這批貨是誰訂的**——「A 訂的貨被 B 領走」由此而生 |
+| `[craftfix][提交]` | 每次 submitJob：來源（玩家/機器＋座標）、sim、bytes、任務種數/總輪數、used/missing/emitted 種數與總量、**第幾次下單／距上次幾秒**（抓請求器反覆重下單）|
+| `[craftfix][計畫]` | 計畫出生留底：任務清單（產物×輪數）、usedItems、missingItems |
+| `[craftfix][開單帳本]` | 提交返回後對帳：**計畫 usedItems vs CPU 實吸庫存＋掛上的在途**。差額不落在任一邊＝取料階段直接吞掉；落在在途＝正常 IgnoreMissing。**「開單即缺」到底是沒取到還是沒記帳，只有這裡分得出來** |
+| `[craftfix][帳本] 新單上機／開局在途明細／開局庫存明細` | 上機當下的完整狀態（開局在途＝提交當下的 waitingFor）|
+| `[craftfix][帳本] 對不上` | 不變量違反：印該 key 的 庫存Δ／在途Δ／交付／自補／應為（產N-吃M）／差額，附本 tick 推了哪些樣板。同一顆 CPU 20 tick 內只印一行、其餘計數 |
+| `[craftfix][帳本] 任務消失／任務新增／輪數倒增` | 執行中計畫被改動（會使該 tick 的對帳失真，故跳過該 tick）|
+| `[craftfix][帳本] 交付` | 每 5 秒（有交付才印）：近 5 秒交付量／累計交付／下單總量／待交付——分辨「慢」與「停」|
+| `[craftfix][帳本] 單離場` | 存活秒數、累計推送輪數、**訂N/交付M**、剩餘輪／在途／庫存／待交付；剩餘>0 即「沒做完就離場」，並補印累計帳外差額 |
+| `[craftfix][帳本] **提前收單**` | 單離場時 `交付 < 下單量` 直接點名差多少（1.8.x 雙重銷帳型錯誤的自動檢出）|
+| `[craftfix][警報]` | 不必等 60 秒：**料齊卻不推**（某樣板料夠 ≥1 輪、供應器不忙卻 10 秒沒推＝parallel==1 死角／樣板失聯／供應器全忙，逐項判定）、**在途沒回**（某 key 掛在途 ≥2 分鐘且網存 0，附另幾顆也等／推給座標）|
+| `[craftfix][一覽]` | 每 30 秒一行：每顆 CPU 的 剩輪/在途/庫存/待交付/**近 30 秒推了幾輪**/靜止幾秒——分辨「慢」與「死」 |
+| `[craftfix][凍結]` | 靜止 60 秒觸發（之後每 5 分鐘重播）：逐任務**全部輸入格** have/need＋網存＋在途＋誰產它＋替代數，供應器 prov/忙/座標，可跑幾輪；在途明細（等N/網M/等了Ns/另K顆也等/推給座標/無任務產它）；庫存；累計帳外差額；**饑餓鏈根源**（一路往上游追到「本單無人產」或「料齊卻沒動」）；最後一行 **判定** |
 
-判定分類：CPU 被暫停／料齊卻不推（`parallel==1` 死角、供應器沉默）／樣板失聯（`prov:0`）／
-供應器全忙／缺料鏈斷在根／推出去沒回來。
+判定分類：CPU 被暫停／**料齊卻不推**（parallel==1 死角、供應器沉默）／**樣板失聯**（prov:0）／
+**供應器全忙**／**缺料鏈斷在根**／**推出去沒回來**。
 
 系統屬性：`-Dgtodiag.ledger=false` 整組關閉、`-Dgtodiag.diagLines=N` 行數上限（預設 40000）、
 `-Dgtodiag.stallTicks` / `-Dgtodiag.stallRepeat` / `-Dgtodiag.overviewTicks` 調間隔。
-另有內部微調旗標，正常不必動、要用時直接看宣告處（`CraftDiag` 與 `CraftingServiceSyncMixin` 檔頭）：
-`linkVerdict`（true）、`auditOnChange`（true）、`strictAltInputs`（false）、`stateGc`（true）、
-`gcIdleTicks`（200）、`submitCap`（256）、`topupRounds`（0＝不限，top-up 開啟時的每輪收斂上限）。
 
-**兩個不可用的欄位**（3.13.1 記錄，別再被誤導）：
+## 修補旗標（3.11.0，預設＝3.8.0 行為）
 
-- **「累計交付N」**：由每 tick 的待交付差分累加而成，加總後恆等於「首次待交付 − 離場待交付」，
-  單在同一 tick 內收單就必印 0。跟「推送N輪」是同一條差分、同一個盲點，**不能拿來證明「沒交付」**。
-- **「某訊息今天 0 筆」**：受 `diagLines` 統管，降量重算與保母另共用 200 行額度。額度燒完後靜音，
-  **沒印 ≠ 沒發生**。
+3.9.0～3.10.2 四個版本裡有兩次實測退步（3.9.0 讓 LUV 電路交付從 466/500 掉到 **8/500**；3.10.0 把
+157 任務／217 萬輪的**正常** UHV 計畫每 10 秒擋一次）。原因是多個行為綁在一起上線，出事無法定位。
+3.11.0 把三個上限退回 3.8.0 值、3.9–3.10 新增的行為**程式碼保留但預設關閉**，每項可單獨開關以便遊戲內 A/B。
+**刻意不做「一鍵全開」的總開關**——那正是釀成退步的做法。啟動時 log 會印 `[craftfix] 修補旗標 …` 一覽。
+
+| 系統屬性 | 預設 | 作用 |
+|---|---|---|
+| `gtodiag.repairGuard` | `20000`（3.11.1）| 修補迴圈可處理的缺口數上限（耗盡＝整組還原）。3.8.0 是 4000，實測有機陽液／陰液「已處理 4001 項、仍剩 9 項」就整組還原→幻影缺口變成永遠等不到的 `waitingFor` |
+| `gtodiag.repairRunCap` | `2000000` | 修補可新增的總輪數上限**底線**（3.8.0 值）|
+| `gtodiag.repairRunFactor` | `4`（3.13.0）| 上限的比例項：實際上限 = min(`runHardCap`, max(`runCap`, 原計畫總輪數 × 本係數))。設 `0` ＝停用比例項、退回純固定上限 |
+| `gtodiag.repairRunHardCap` | `50000000`（3.13.0）| 比例上限的絕對天花板 |
+| `gtodiag.repairBudgetMs` | `200`（3.11.1）| 修補時間預算——護欄從「數到 N 就放棄」改成時間制（用固定次數擋遞迴補料迴圈本身是錯的設計：96→4000→10 萬三次都設錯）。**用 0 停用，不要設超大值**（`ms×1e6` 會溢位成負數→變成每次都超時）|
+| `gtodiag.repairDeficitSrc` | `on`（3.12.0）| 缺口沖銷只准動「真的來自 usedItems」的那本帳：`on`＝完整來源判定／`clamp`＝不分來源但不寫負值／`off`＝3.8.0 原樣 |
+| `gtodiag.repairStrictRounds` | `false` | 外圈 4 輪後仍有殘留缺口就整組還原。**預設 false**：唯一能帶著殘留缺口離開外圈的路徑只剩 soft 自舉猜測，還原＝退回幻影計畫＝必凍 |
+| `gtodiag.repairUpdateBytes` | `false` | 依新增輪次等比例調高 `plan.bytes()`（開啟後原本擠得上小 CPU 的計畫會改吃 `CPU_TOO_SMALL`）|
+| `gtodiag.bootstrapMaxPass` | `200000` | 循環自舉模擬的 pass 上限，超過即跳過該次自舉補齊（3.8.0 無上限、可卡主緒數秒）|
+| `gtodiag.repairNetSpot` | `false` | 缺口優先吃網路現貨（否則一律排樣板）|
+| `gtodiag.repairBalance` | `false` | 內部配平缺口用網路現貨補齊（第五維）|
+| `gtodiag.repairBalanceOnAbort` | `false` | 配平補齊在「修補中止」時也照做（僅 `repairBalance=true` 時有意義）|
+| `gtodiag.repairBalanceLog` | `true` | 即使不補齊也照算一次配平缺口並印 log（純唯讀觀測）|
+| `gtodiag.repairBlockOnAbort` | `off` | 中止後擋下機器源提交：`off`／`on`（slim 分支自動不生效）／`force` |
+| `gtodiag.repairAbortBroadcast` | `false` | 擋單時聊天室廣播缺料（**對全伺服器玩家**送出，多人會洗頻）|
+| `gtodiag.repairFreezeProbe` | `false` | 不擋單也跑「必凍」判定並留 log |
+
+> ⚠ **3.12.0 的預設值不等於 3.8.0**：`repairDeficitSrc=on`（不再把「從沒加進 usedItems 的量」倒扣成負值）
+> 與 `bootstrapMaxPass=200000`（自舉模擬有上限）兩項刻意不同，都是修 3.8.0 自己的 bug。
+> 要做純 3.8.0 對照組請加：
+> `-Dgtodiag.repairGuard=4000 -Dgtodiag.repairBudgetMs=0 -Dgtodiag.repairDeficitSrc=off`
+> `-Dgtodiag.bootstrapMaxPass=2147483647 -Dgtodiag.repairBalanceLog=false`
+
+## 執行期救援旗標（3.13.0）
+
+修補只在 `submitJob` 那一瞬間跑，**下單後才長出來的缺口它看不到也補不到**。3.13.0 補上執行期的兩道。
+
+| 系統屬性 | 預設 | 作用 |
+|---|---|---|
+| `gtodiag.sitterFeed` | `true` | 保母餵料：把網路現貨直接補進 CPU 的 `waitingFor` 缺口（slim 自 2.x 停用，3.13.0 重開）|
+| `gtodiag.sitterFeedPhantomOnly` | `true` | 只餵**幻影 key**（無剩餘任務產它＋無樣板押在供應器上）。設 `false` 回到 2.x 的無差別餵 |
+| `gtodiag.sitterTopUp` | `false` | 保母補輸入（把剩餘任務的輸入補進 CPU 庫存）。**維持停用**：它沒有 `waitingFor` 當額度上限，實測會把單一料的全網存量吸進一顆 CPU |
+| `gtodiag.stallCancel` | **`false`**（3.13.1 改）| 卡死救援：零進度 ＋ 證明等不到貨 → 取消整張單。**預設關閉**，理由見下方「3.13.1」 |
+| `gtodiag.stallCancelSec` | `300` | 判定卡死所需的零進度秒數 |
+| `gtodiag.stallCancelCooldownSec` | `600` | 同一顆 CPU 兩次救援的最短間隔（防取消→重下→再卡的高頻空轉）|
+| `gtodiag.stallCancelBroadcast` | `true` | 救援時聊天室廣播（玩家單不會自動重下，不廣播＝無聲吞單）|
+
+## 3.13.1：卡死救援改為預設關閉
+
+3.13.0 上線隔天（2026-08-19）實測，網路上同時存在兩種真實卡單，**這道救援一種都碰不到**：
+
+| 閘門 | 並行控制倉 `uhv_parallel_hatch` | 密銀 `gtocore:mithril` |
+|---|---|---|
+| 零進度 300s | ✅ 已 21 分鐘 | ❌ **單只活 2 秒**，計時器永遠累積不到 |
+| 無任務產它 | ✅ | ✅ |
+| 網路抽不到 | ✅ 網存 0 | ✅ 網存 0 |
+| 無樣板在途 | ❌ `推給78262,140,-46471` → **一票否決** | — |
+
+- **控制倉**：三道全過，卡在第四道。`getPendingRequests` 回報樣板還押在供應器上——但那筆推送
+  已經 21 分鐘零進度，早就不是「在途」而是「弄丟了」。這道閘門本來是要保護「機器跑很慢但真的在跑」
+  的單，實作成**一票否決**是錯的；正確作法是「有在途 → 把零進度門檻拉高（例如 30 分鐘）」。
+- **密銀／索륨**：每 4~6 秒開一張新單、每張活 2 秒就離場，救援假設的「卡住＝不動」根本不成立。
+  這類是**空轉迴圈**不是凍結，成因在下面那段。
+
+也就是說它現階段**只有誤殺風險、沒有實際效益** → 預設關閉（`-Dgtodiag.stallCancel=true` 可開）。
+程式碼保留不刪，比照 3.11.0 的作法，等 pendingAt 誤判修好後可直接 A/B。
+
+### 空轉迴圈的真因（`netherite_scrap` / `mithril` / `thorium` 同型）
+
+1. merequester 請求器的滿足判定是 `網路現貨 + 在途 < 目標量` → 成立就送出**整個 batch**
+   （`StorageManager.computeAmountToCraft`）。對「產出即被下游抽乾、網存長期為 0」的物品，
+   這個判定**永遠成立**，於是每 10 秒送一次 batch。
+2. GTO 的 `executeV2` 對大量直接回 simulation（CRAFT_LESS 語意沒實作成「最多可做量」）。
+3. **本 mod 的降量重算接手**（`CraftingServiceSyncMixin` 機器源砍半迴圈）把 10000 砍成
+   1250/625/312/156 硬是開單 → 每張單全額吸走原料、把整批輪數推進樣板總成、然後在配方時長
+   （240 tick＝12 秒）都還沒到的 3 秒內收單離場。
+4. 網存回不去 → 回到 1，迴圈閉合，且每繞一圈再鎖一份原料。
+
+→ 治這個要動的是**降量重算**（加獨立開關、失敗分支留 log、同 key 抑制），不是取消單。
+
+### 兩個不可用的診斷欄位（3.13.1 記錄，避免再被誤導）
+
+- **「累計交付N」**：`delivered = max(0, 上次待交付 − 這次待交付)` 的每 tick 差分累加
+  （`CraftDiag.java:604-606`），加總後恆等於「首次待交付 − 離場待交付」。單在同一 tick 內收單就必印 0。
+  **跟「推送N輪」是同一條差分、同一個盲點**，不能拿來證明「沒交付」。
+- **「某訊息今天 0 筆」**：`[帳本]`／`[一覽]` 受 `-Dgtodiag.diagLines`（預設 40000）統管，
+  降量重算與保母共用 `sitterLog` 的 200 行額度。額度燒完後靜音，**沒印 ≠ 沒發生**。
+
+## 3.13.0：三種卡單、三種病、三種修法
+
+2026-08-18 的實錄（3.12.0 執行中）同時卡住三張單，**病因互不相同**，這是設計這三道修法的直接證據。
+
+### ① `universal_circuit_uhv x100` —— 修補撞上限後整組還原
+
+```
+提交 任務214種/總輪1,119,456 missing=0
+**計畫修補放棄**（新增輪數 2,011,267 超過上限 2,000,000）→ 已還原成原計畫，照原樣送出
+未解缺口：naquadria x1,179,648; soldering_alloy x1,179,648; naquadah_ingot x6,135; …
+→ CPU 等 17 種「網存 0 且無任務產它」的料，靜止 600s 以上
+```
+
+只超過上限 **0.56%** 就整組還原。固定常數的問題是它與計畫規模無關：小計畫的 200 萬形同無限，
+112 萬輪的計畫卻在正常修補量就撞牆。**修法＝上限跟著原計畫規模縮放**（`repairRunFactor`）；
+真正的發散護欄是時間預算（`repairBudgetMs`）與絕對天花板（`repairRunHardCap`），不是這條。
+
+「全有全無」的還原策略本身沒錯（3.8.0 實證：半套計畫比不修更糟），錯的是門檻。
+另加一行 WARN：新增輪數 > 原計畫輪數時明說，因為 3.9.0 的遞迴發散就是先出現這個形狀。
+
+### ② `helium_plasma x1000000` —— 幻影 `waitingFor`，網路也沒貨
+
+```
+剩餘輪=0 在途113 庫存0 待交付113 靜止621s
+waiting[1]=helium_plasma(等113/網0/無任務產它)  剩餘任務=[(無)]
+```
+
+計畫只有 8000 輪、`missing=0`、開單時不缺，**跟修補完全無關**。輪次全推完了，帳上卻還記著
+「在等 113」，而網路沒貨、也沒有任何任務會再產它 → 永遠等一個不會來的東西。
+網路無貨時餵料無能為力，只能走 ③ 的取消。
+
+### ③ `gtocore:order` —— 開單時不缺，跑到一半才缺
+
+```
+提交 來源=玩家 任務301種/總輪1,840,818 used=264種(2.97億) missing=0（修補完全沒觸發）
+waiting[5]= supercritical_steam 等78.5億/網2450億   ← 等一個網路裡堆滿的東西
+             wetware_processor_computer 等752/網0/無任務產它
+             enriched_naquadah_trinium_europium_duranide_single_wire 等12032/網0/無任務產它
+```
+
+`supercritical_steam` 這種「網路有貨、但沒人會送來銷帳」的幻影缺口，只有**保母餵料**解得掉。
+其餘網存 0 的，仍然只能取消。
+
+### 為什麼不做「執行期補單」
+
+那等於巢狀／代下合成請求——本 mod **兩度實證**會滾出巨量碎單拖垮伺服器（見 mod `CLAUDE.md`）。
+取消則相反：把半成品全退回網路，機器請求器 10 秒後自己重下，新計畫拿**當下**存量重算，
+剛退回的中間產物都算得到，通常小很多也就做得完。代價是玩家單要手動重下（故一律廣播）。
+
+### 取消的三道安全閘
+
+缺一不可，任何一個放寬都可能誤殺正在慢慢前進的單：
+
+1. **零進度**：進度指紋（在途總量／在途 key 數／待交付／剩餘輪數／CPU 庫存總量）連續 `stallCancelSec` 秒不變。
+   涵蓋推樣板、機器回貨、交付三種前進方式；暫停中的單一律重置計時器。
+2. **證明等不到**：至少一筆 `waitingFor` 同時滿足「無剩餘任務產它」「無樣板押在供應器上（`getPendingRequests`）」
+   「網路 SIMULATE 一滴都抽不到」。讀不到 job 就不判（寧可不救也不誤判）。
+3. **冷卻**：同一顆 CPU `stallCancelCooldownSec` 秒內不再開刀。
+
+## 3.12.0 修掉的 18 個 bug（稽核＋兩輪對抗式覆核）
+
+**修補側（7 個，其中 5 個 3.8.0 就有）**
+
+| # | 問題 | 後果 | 退路旗標 |
+|---|---|---|---|
+| B1 | 缺口沖銷對「非來自 usedItems」的缺口也照扣 → `usedItems` 寫成負值 | `KeyCounter` 不擋負數、`extract` 負量回 0、連 `waitingFor` 都不掛 → **該量無聲蒸發**，網路無貨的中間料在遞迴補料時必踩 | `repairDeficitSrc=off` |
+| B2 | ③最終產出短缺：加了輪次又從 usedItems 扣掉等量 | 供給原地踏步，修了等於沒修，還多吃一輪原料 | 同上 |
+| B3 | `catch(Throwable)` 不還原（快照宣告在 try 內，catch 看不到）| 例外時送出半套計畫＝必凍，違反「全有全無」核心不變式；含一個可達的 NPE | 無（純修復）|
+| B5 | 中止路徑 `return` 讓真缺料守衛永遠碰不到 | 非 slim 建置上真缺料守衛在「修補中止」時整個消失 | 無 |
+| B6 | 外圈 4 輪跑滿仍有缺口時靜默放行 | 不還原、不記錄，log 還印「補N項」看起來成功 | `repairStrictRounds` |
+| B8 | 修補加了輪次卻沒更新 `plan.bytes()` | CPU 大小保護從未觸發（挑 CPU 是拿 bytes 比 `getAvailableStorage()`）| `repairUpdateBytes` |
+| B9 | 自舉模擬 `while(progress)` 無上限、跑主緒且不受時間預算約束 | 回饋型配方每 pass 只前進 1 輪 → 單次提交可卡主緒數秒 | `bootstrapMaxPass` |
+
+**診斷側（11 個，全部 3.8.0 就有，不影響合成路徑）**
+
+| # | 問題 | 後果 |
+|---|---|---|
+| B10 | 「提前收單」判定：`insert()` 在 `remaining` 歸零的同一次呼叫內就 `finishJob()`＋`job=null`，每 tick 取樣永遠看不到末批 | **每張正常完成的單都誤報提前收單** → 改用 link 三態（取消／完成／未結案），standalone 與 link 讀不到一律標「無法判定」|
+| B11 | 替代輸入用「庫存掉最多的變體」回推歸戶；且 `extractPatternInputs` 實際會**跨變體混扣**（原註解寫反）| 兩個 key 同時累加等量反號的假 drift、假「對不上」→ 改成不可審計群組，drift 照記但報告分可信／不可信兩段 |
+| B12 | `Snap.job` 強引用經 `link → cpu → craftingLogic` 繞回 `WeakHashMap` 的 key | 弱鍵失效、拆 CPU 後整張 tasks 圖永久滯留 → 改弱引用＋閒置回收 |
+| B13 | 早期警報不查 `paused` | 暫停中的 CPU 被逐樣板誤判成「執行器沉默：疑 parallel==1 死角」（本 mod 最想抓的指紋）|
+| B14 | 快照回寫在方法尾端、外層 `catch` 靜默吞例外 | `ext` 沒清空 → 下一 tick 二次計入 → 假 drift；回寫改一律放 `finally` |
+| B15 | `getField("value")` 每 entry 每 tick 未快取 | 500 任務 × 30 CPU × 20tps ≈ 每秒 30 萬次反射，全在主緒 |
+| B16 | 不變量審計每 tick 無條件跑完，`changed` 卻在之後才算 | 絕大多數 tick 白建 7-8 個容器算出全 0 |
+| B17 | 額度耗盡後靜默且仍付計算成本；`SPENT` 溢位後額度自己復活 | 分不出「沒異常」與「被靜音」 |
+| B18 | `SUBMITS` 的 key 含數量、滿 256 整表 clear | 「反覆重下單」計數幾乎永遠顯示首次 |
+| B19 | 「供應器全忙」拿 `allBusy.size()` 比 `curRounds.size()`（後者含已完成任務）| 該分支實務上幾乎不成立，被誤判成「缺料鏈斷在根」或「未分類」|
+| B20 | `runnableRounds` 重複計算 | 純浪費 |
+
+## 修正內容
+
+| 修正 | 解決 |
+|---|---|
+| 算料同步化 | 終端 ctrl+左鍵多步計算卡死（單執行緒 async Future 不返回）|
+| 機器源 lpcalc 算料 | 機器來源請求優先走結構化需求傳播算料器（SCC 縮點＋反拓撲批量傳播＋SCC 內高斯），不支援的形狀自動回退內置樹狀版——見下方「lpcalc」節 |
+| 機器源 present-once 走 IgnoreMissing | 接口/請求器/合成卡多步被 `MISSING_INGREDIENT` 無限拒單 |
+| 計畫修補（五維）| ①sim 計畫的 missingItems ②usedItems 批量餘數幻影 ③最終產出總量短缺 ④循環自舉缺口（可執行性模擬）**⑤內部配平（3.9.0）**——缺口直接補樣板 runs 進同一張計畫，不生新任務 |
+| 內部配平（3.9.1，第五維）| 前四維只檢查「計畫對網路的引用」與「可執行性」，**沒人檢查修補後的計畫自己配不配得平**：對每個 key 驗 `Σ(每輪輸入×runs) ≤ usedItems＋emittedItems＋Σ(每輪產出×runs)`，負差**只用網路現貨補**（一趟做完、不排樣板、不遞迴、成品除外）。實錄：LUV 通用電路修補完仍差 lubricant 132／copper_block 4／platinum_single_wire 6／naquadah_boule 2／electronic_grade_silicon 6912，做到剩最後 34 個成品時全鏈餓死，而網路各有 115209／6／13／3／564480。<br>⚠ **3.9.0 的做法（把配平缺口丟回缺口佇列＝補樣板輪次、外圈 6 輪）已實測失敗並回退**：補樣板會製造新輸入需求 → 新缺口 → 再補，遞迴發散（glowstone 缺口 6 輪內從 147456 膨脹到 3833856），計畫被灌大且仍不平，LUV 交付量從 466/500 掉到 8/500。**補樣板這條路只能由算料器做，修補這層只補得起網路現貨。**<br>配平模型用**供給扣除法**（逐槽把輪數分配給吃得下的變體、用掉就扣）；3.9.0 的「取供給最多的變體」會自我增強（補了誰誰就繼續吸走全部需求），是發散的另一半原因 |
+| 缺口先吃網路現貨（3.9.0）| 缺口原本一律補樣板輪次；改成**先看網路有沒有現貨**（有就記進 usedItems、開局一次取進 CPU），沒有才排樣板。取量以計畫需求為界，不會像 1.8.3 那樣把全網存量吸進單顆 CPU。**成品本身例外**——GTO 沒有「把開局吸入的成品交給 link」的步驟，吸進去只會抱著現貨永凍 |
+| 配平補齊不被中止連坐（3.10.2）| 順序改成 **還原 → 網路補齊（無論有無中止都做）→ 再判要不要擋單**。原本補齊掛在 `abortReason == null` 下，UV 通用電路（修補要加 2001 萬輪、破上限而中止）整段被跳過 → 原樣送出 → 開跑後餓死在 epichlorohydrin／hot_platinum_ingot／niobium_titanium_ingot…（全標「本單無人產」，網路各有 499 萬／1920／20034）。補齊只吸網路現貨、不排樣板、有界又便宜，不該被中止連坐；還原必須排在補齊之前（否則補進 `usedItems` 的現貨會被還原洗掉），中止時 `reserved` 以還原後的 `usedItems` 重建 |
+| 擋單條件＝會不會必凍（3.10.1）| **只有還原後的計畫符合「`usedItems` 要的量網路給不出來 ＋ 計畫裡沒有任何任務會產它」才擋**（＝唯一實測會變成永久 `waitingFor` 的形狀）；大計畫只是修補沒跑完照送。3.10.0 是「中止就擋」，把 157 任務／217 萬輪的正常 UHV 計畫也每 10 秒擋一次（玩家手動做得起來、機器永遠下不了單）。同版把缺口數上限 4000→100000，改用 **200ms 時間預算**（`-Dgtodiag.repairBudgetMs`）當真正的閘門——跑在主緒該省的是時間不是次數 |
+| 中止即擋單（3.10.0）| 修補中止後擋下機器源提交（`INCOMPLETE_PLAN`＋聊天室點名缺什麼，同成品去重），玩家路徑不擋。實錄證明「還原後照樣送出」＝保證凍結：UHV 通用電路的計畫是「從網路拿 100 個 wetware_processor_mainframe」但網路只有 64，補那 36 個要排 200 萬輪 → 超上限中止 → 還原 → 送出 → IgnoreMissing 把 36 個變成永遠等不到的 `waitingFor`，CPU 就此鎖死（剩 1 個任務、`無任務產它`、靜止 60s）。擋下來則 CPU 保持空閒、請求器 10 秒後自己重試，網路補到貨自然成功。同版把輪數上限 200 萬→2000 萬（深階合成的合法修補就會破 200 萬；輪數不吃 CPU 時間，時間由缺口數上限擋，計畫太大 GTO 自己會回 `NO_SUITABLE_CPU_FOUND`）|
+| 修補全有全無（3.8.0）| **修一半比不修更糟**：舊版 `guard++ < 96` 是幻影缺口時代的值，大電路（60+ 任務）第一輪缺口就破百，實測 17 次修補 7 次貼著 96 停——已加進計畫的輪次留著、輸入沒補完＝計畫內部不平衡＝必凍（ZPM 通用電路實錄：epoxy/quantum_processor/lubricant/ceramics_dust 全標「本單無人產」，網路各有 1448/4/122903/95 卻進不去，CPU 靜止 3 分鐘）。改法：①上限拉到 4000（`-Dgtodiag.repairGuard`）②另設「新增總輪數」上限 200 萬（`-Dgtodiag.repairRunCap`）防遞迴膨脹——真正該防的用輪數擋，不用次數硬砍 ③**任一上限耗盡就整組還原**（patternTimes／usedItems／missingItems 全部倒回修補前）並印 `**計畫修補放棄**` ＋未解缺口清單，計畫原樣送出 |
+| 機器源降量重算 | 大數量請求被 CRAFT_LESS 整張歸 0 → 砍半重算取最大可執行量。**機器源已由 lpcalc 接管（CRAFT_LESS 於 lpcalc 內處理），此段僅玩家路徑殘留、實際不觸發（玩家刻意不降量）** |
+| 無樣板守衛 | 無樣板物品的機器源請求直接擋下（原版語意），聊天室提示 |
+| 真缺料擋單 | 無樣板可補的硬缺口 → 擋下提交防凍結，聊天室點名缺什麼 |
+| 保母（只餵料）| 網路既有庫存不被 waitingFor 認領（GTO 認領只在插入事件觸發）→ 每 tick 餵入 |
+| 保母全速全額（2.4.0）| 三處改動治「一點一點給」：①**掛 HEAD 不掛 TAIL**——GTOCore 偶數 tick 提前 `ci.cancel()`，掛 TAIL 整段實跑半速（原「5 秒」實為 10 秒、探針 20 秒實為 40 秒，log 探針間隔 40 秒實證）；②**保母改每 tick**（原 %100）；③**補輸入改全額**（補到剩餘輪數×每輪需求，原固定一輪）。目的：兩單搶同一批中間料時靠「先到先贏」序列化，打破「各持不足一輪、網路抽乾、互相卡死」的僵局（ZPM 電路 vs UV 線程倉搶砷化鎵/奈米晶圓實錄）。另**放寬補給閘門**：原本只在 `waiting` 空時補，現在「本輪沒餵到料」也補（在途料擋住整個補給的實錄）。⚠ 全額是舊版吸乾全網的成因，出事用 `-Dgtodiag.topupRounds=N` 收斂（N=1 即回一輪制）|
+| 並行死角解鎖（2.1.0 / 2.3.0 重啟用）| **疑似上游 bug**（`OptimizedCraftingCpuLogic.executeCrafting:221-238`）：並行分支漏了 `parallel==1` 的取料路徑——「並行樣板＋剩餘輪數>1＋庫存恰夠 1 輪」每 tick 無聲跳過。催化劑返還配方（吃 9216 還 4608 錫鐵合金的中子反射板實錄：剩 2 輪、CPU 有 13824＝1.5 輪）按淨需求備料必然踩中，小量下單 100% 重現、與算料器無關（三種算料一致、拔 mod 也卡）。修法：保母命中指紋（min⌊庫存/每輪⌋==1 且剩>1 輪）時把輸入補到 2 輪份，讓 GTO 自己的 `parallel>1` 分支正常取料——只補料，不代推送不碰帳 |
+| ~~mixin 直接根治（2.2.0）~~ **實測無效、2.3.0 撤除** | 掛 GTOCore 開源類 `OptimizedCraftingCpuLogic` 補上缺失的 else——**mixin 無聲失效**：jar 內有類、config 正常載入、同檔 AE2 mixin 照常運作、全程零錯誤，但欄位普查證實注入欄位不存在（gtocore 為簽章 jar、`com/gtocore/mixin` 標 `Sealed: true`）。**「mixin 只准掛 AE2 類」鐵則二度實證，此路封死** |
+| 供應器忙碌診斷（2.3.0，2.3.1 加座標）| 探針 X 光加印 `忙:N@類型(x,y,z)忙`——全部供應器 `isBusy()` 時 executeCrafting 直接 `continue`：**不推送、不留任何結果**，與並行死角外觀完全相同（`results={}`、零錯誤），這是「料齊卻完全不動」最常見的真因。實錄：ZPM 場發生器單的 5 個任務中 4 個 `忙:1`，泵/發射器料備足 2 輪仍不推，整鏈凍結。2.3.1 起一併印出忙碌機器座標（BlockEntity 直取，GTO 機器走 `getPos`/`gto$getPos` 反射），可直接到現場查機器 |
+
+## 認領歸屬追蹤（slim 3.2.0，純診斷）
+
+AE2 的交付認領走 `CraftingServiceStorage`（以 `Integer.MAX_VALUE` 最高優先權掛進網路儲存）→
+`CraftingService.insertIntoCpus`，而該方法對 `craftingCPUClusters`（**HashSet，順序任意**）逐顆呼叫
+`craftingLogic.insert`，**完全不認這批貨是哪張單訂的**——誰的 `waitingFor` 有這個 key 就先給誰。
+多單共用中間料時「A 訂的貨被 B 領走、A 永遠等不到」即由此而生（潤滑油／焊錫粉／環氧／鎵錠實錄）。
+
+- `[craftfix][認領] <key> x<量> 交付：N顆 CPU 同時在等 → <產物>(等X→吃下Y) …`：候選 ≥2 才印（上限 300 行）。
+- 探針 `waiting` 欄改印 `key(等N/網M/另K顆也等)`：分辨「貨沒回網路」（網M=0）與「貨被別人領走」（另K顆>0）。
+
+## lpcalc（機器源結構化算料器）
+
+機器來源的算料請求優先走 `com.gtocraftfix.lpcalc`；任何不支援/超限/驗不過的情形都回退
+`com.gtocraftfix.calc` 樹狀版（絕不輸出未經重放驗證的計畫）。設計文件：[DESIGN-lpcalc.md](DESIGN-lpcalc.md)。
+
+- **一鍵停用**：`-Dgtodiag.lpcalc.enabled=false` → 機器路徑完全走現行樹狀版（預設 true）。
+  其他系統屬性：`gtodiag.lpcalc.shadowVerifyOnMissing`（LP 判缺料時影子跑樹狀版複核，預設 true）、
+  `gtodiag.lpcalc.snapshotBudgetNanos`（快照期伺服器緒預算，預設 1ms）、
+  `gtodiag.lpcalc.solveBudgetNanos`（求解期背景緒預算，預設 100ms）、
+  `gtodiag.lpcalc.maxKeys` / `maxPatterns`（閉包規模上限，預設 4096 / 16384）。
+- **CRAFT_LESS 已知次優性（非 bug）**：回傳的可做量 R 可能比理論最大值小
+  ≤ `max(c_K/r_K)` 個單位（`c_K` = 批次取整餘數＋SCC 啟動料常數上界）——有界搜尋
+  不依賴可行集對 R 單調；每個回傳值都經完整雙序波次重放驗證可執行。
+- **純現貨／emitable 頂層請求被拒單（刻意行為，非 bug）**：計畫無任何合成任務
+  （patternTimes 空）會被提交守衛拒收——GTO 執行器沒有「把開局吸入的現貨交給 link」
+  的步驟，這種 job 會抱著現貨永凍；拒掉後接口下一輪自己從網路拉現貨，自然收斂。
+- 統計：log 搜 `[craftfix][lp]`（hit%、FallbackReason 逐項計數、shadow 分歧/跳過）。
 
 ## 建置
 
-```bat
-.\build-jar.bat
+```
+.uild-jar.bat
 ```
 
-JDK／JRE 21。產物在 `dist`（鏡射到 `..\_NL_mod\1.20.1\forge`），檔名
-`NL_gto_craft_fix-forge-1.20.1-<版本>.jar`。同一個 `mods/` 只能放一個版本，並須移除舊的
-gtocraftdiag JAR（相同 modId 或重複 mixin 會阻止啟動）。
-
-`build` 會一併跑 JUnit 5 純 Java 測試（不得啟動 Minecraft）；單獨跑：`cd 1.20.1\forge && .\gradlew.bat test`。
-
-`gto_craft_fix.mixins.json` 暫留 `JAVA_17`：Forge 47 內建的 Mixin 0.8.5 不認得 `JAVA_21` 這個
-compatibility 名稱。它是 Mixin 語言功能基線，不是執行期版本宣告——真正的 class target 與
-`mods.toml` 的 Java feature 都是 21。
-
-## lpcalc（未啟用）
-
-`com.gtocraftfix.lpcalc` 與 `com.gtocraftfix.calc` 都會編進 JAR，但 slim 讓機器來源略過 lpcalc、
-直接走同步 `executeV2`。因此 `gtodiag.lpcalc.enabled` 只是**內層** kill switch（設 true 也不會啟用），
-shadow／budget／maxKeys 與 `[craftfix][lp]` 統計在 slim 都不可達。
-[DESIGN-lpcalc.md](DESIGN-lpcalc.md) 裡的 CRAFT_LESS／SCC／純現貨計畫等敘述是**未來規格**，
-未完成其中的自動測試與遊戲內驗收前不得當成現行保證。
+JDK 21；產物在 `dist`（同步鏡射到 `.._NL_mod.20.1orge`），檔名 `NL_gto_craft_fix-forge-1.20.1-<版本>.jar`，丟進整合包 `mods/` 即可（記得移除舊的 gtocraftdiag jar，兩者 mixin 重複會衝突）。
 
 ## 授權
 
-**檔案級混合授權**：原創檔案為 MIT；`com.gtocraftfix.calc` 中保留 Applied Energistics 2
-著作權／授權標頭的衍生檔案，依各檔標頭為 LGPL-3.0-or-later。
-
-- `licenses/LICENSE-MIT.txt`：原創檔案的 MIT 全文
-- `licenses/COPYING` / `licenses/COPYING.LESSER`：GNU GPLv3／LGPLv3 canonical 全文
-- `licenses/NOTICE`：AE2／AlgorithmX2／TeamAppliedEnergistics 衍生來源與檔案範圍歸屬
-
-建置會把上述檔案自動放進 JAR 的 `META-INF/`。各原始檔的既有標頭與 `NOTICE` 的逐檔規則優先，
-**不得把整個 JAR 簡化宣稱為單一 MIT 授權**。
+MIT

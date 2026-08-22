@@ -1,42 +1,39 @@
 modLoader="javafml"
-loaderVersion="[47,48)"
-license="Mixed file-level: MIT original / LGPL-3.0-or-later com.gtocraftfix.calc; see META-INF/NOTICE"
+loaderVersion="[47,)"
+license="MIT"
 
 [[mods]]
 modId="gto_craft_fix"
 version="${mod_version}"
 displayName="GTO Craft Fix (multi-step autocraft)"
-features={java_version="[21,)"}
 description='''
-針對 GTO／AE2-gto 多步自動合成的 slim 修補：同步算料、機器源 IgnoreMissing、
-計畫缺口修補、並行死角解鎖，以及只補中間料的幻影 waitingFor 救援。
-最終成品禁止由保母餵入；實驗性 lpcalc 原始碼隨附但不在 slim 執行路徑中。
+修復：GTO 合成算料併發讀活 grid，合成樹超過一步時卡死。改成伺服器執行緒同步算料，通用修好所有自動合成路徑（合成終端 ctrl+左鍵、合成卡、請求器、等級發射器…）。
 '''
 
 [[dependencies.gto_craft_fix]]
     modId="forge"
     mandatory=true
-    versionRange="[47,48)"
+    versionRange="[47,)"
     ordering="NONE"
     side="BOTH"
 
 [[dependencies.gto_craft_fix]]
     modId="minecraft"
     mandatory=true
-    versionRange="[1.20.1]"
+    versionRange="[1.20.1,1.21)"
     ordering="NONE"
     side="BOTH"
 
 [[dependencies.gto_craft_fix]]
     modId="ae2"
     mandatory=true
-    versionRange="[15.267.4,)"
+    versionRange="*"
     ordering="AFTER"
     side="BOTH"
 
 [[dependencies.gto_craft_fix]]
     modId="gtocore"
     mandatory=true
-    versionRange="[0.5.6-beta,)"
+    versionRange="*"
     ordering="AFTER"
     side="BOTH"

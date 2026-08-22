@@ -11,12 +11,6 @@ base { archivesName = 'gto_craft_fix' }
 
 java.toolchain.languageVersion = JavaLanguageVersion.of(21)
 
-// GTO 與本 mod 的發行 JAR 均以 Java 21 執行；不要再產生宣稱 Java 17、實際 major 65 的模糊狀態。
-tasks.withType(JavaCompile).configureEach {
-    options.encoding = 'UTF-8'
-    options.release = 21
-}
-
 repositories {
     mavenCentral()
     maven { url = "https://maven.neoforged.net/releases" }
@@ -61,24 +55,8 @@ dependencies {
     modImplementation("appeng:appliedenergistics2-forge-1.20.1:15.267.4")
     // Mixin 註解處理器：產生 refmap 與 reobf 所需的 mappings tsrg。
     annotationProcessor 'org.spongepowered:mixin:0.8.7:processor'
-
-    // 純數字模型測試；不得依賴 Minecraft 啟動或遊戲測試框架。
-    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
-    // Gradle 9 不再替 Test task 隱式補 launcher；缺少時測試 JVM 會在載入平台前直接失敗。
-    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.11.4'
 }
 
-tasks.named('test', Test).configure {
-    useJUnitPlatform()
-}
-
-// licenses/ 下的正式授權／歸屬檔自動收進 JAR；沒有符合檔案時保持空集合，不阻斷建置。
-// （放子目錄純粹是為了讓 repo 根目錄乾淨；JAR 內位置不變，仍是 META-INF/。）
-def legalFiles = file('../../licenses').listFiles()?.findAll {
-    it.isFile() && it.name ==~ /(?i)(LICENSE|COPYING|NOTICE)([-.].+)?/
-}?.sort { it.name } ?: []
-tasks.withType(org.gradle.jvm.tasks.Jar).configureEach {
-    from(legalFiles) {
-        into 'META-INF'
-    }
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
 }
