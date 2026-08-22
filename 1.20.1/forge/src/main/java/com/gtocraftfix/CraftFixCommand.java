@@ -12,17 +12,32 @@ import appeng.api.networking.crafting.ICraftingService;
 import appeng.api.stacks.AEItemKey;
 import appeng.api.stacks.AEKey;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+
 /**
  * {@code /craftfix why} —— 拿著要查的物品打這行，當場回答「這東西為什麼不合成」。
  *
- * <p>起因：2026-08-22 稀土金屬粉的請求器完全不呼叫 {@code beginCraftingCalculation}，
- * 而 mod 只看得到「沒有人來請求」，查不出上游為什麼不來。請求器決定要不要下單，看的是
- * <b>可合成性、網路現貨、已請求量</b>這三件事——全部都在 {@link ICraftingService} 上，
- * 是這個 mod 本來就拿得到的資料，只是以前沒有地方可以問。
+ * <p>請求器要不要下單只看三件事：<b>可合成性、網路現貨、已請求量</b>，全部在
+ * {@link ICraftingService} 上，本 mod 掛在 {@code CraftingService} 本來就拿得到。
+ *
+ * <p><b>[3.15.1] 只印相關的網路。</b>一個世界裡每一段沒接起來的 AE 線材都是一張獨立 grid，
+ * 實測有 1088 張；3.15.0 全部照印，真正那張被埋在上千行裡完全看不到。現在只印
+ * 「有 CPU／有樣板／有現貨／有在途」的網路，其餘只回報略過幾張。
+ *
+ * <p><b>[3.15.1] 找 NBT 不同的同名品。</b>「樣板數=0」最常見的原因不是樣板不見了，而是
+ * <b>手上這顆的 NBT 跟樣板產出的不是同一個 AEKey</b>（GTO 很多東西帶 tag）。所以查不到精確
+ * 樣板時，會再掃網路的可合成清單，把「同一個物品、不同 NBT」的 key 列出來。
  *
  * <p>純唯讀：只查詢不改動任何東西。
  */
 public final class CraftFixCommand {
+
+    /** 一次最多印幾張網路，避免又洗版。 */
+    private static final int MAX_GRIDS = 8;
+    /** 同名不同 NBT 的候選最多列幾個。 */
+    private static final int MAX_VARIANTS = 5;
 
     private CraftFixCommand() {
     }
@@ -31,6 +46,18 @@ public final class CraftFixCommand {
         dispatcher.register(Commands.literal("craftfix")
                 .then(Commands.literal("why")
                         .executes(ctx -> why(ctx.getSource()))));
+    }
+
+    private record Report(int index, int patterns, boolean craftable, boolean emitable,
+            long stock, long requested, boolean requesting, int cpus, List<String> variants) {
+
+        boolean relevant() {
+            return cpus > 0 || patterns > 0 || stock > 0 || requested > 0 || !variants.isEmpty();
+        }
+
+        int rank() {
+            return patterns * 1000 + cpus;
+        }
     }
 
     private static int why(CommandSourceStack src) {
@@ -57,40 +84,98 @@ public final class CraftFixCommand {
             return 0;
         }
 
-        src.sendSuccess(() -> Component.literal("[craftfix] " + key.getDisplayName().getString()
-                + "（" + key + "）— 共 " + grids.size() + " 張網路"), false);
-        int n = 0;
+        List<Report> reports = new ArrayList<>();
+        int i = 0;
         for (var entry : grids) {
-            n++;
-            ICraftingService cs = entry.crafting();
-            String line;
+            i++;
             try {
-                int patterns = cs.getCraftingFor(key).size();
-                boolean craftable = cs.isCraftable(key);
-                boolean emitable = cs.canEmitFor(key);
-                long requested = cs.getRequestedAmount(key);
-                boolean requesting = cs.isRequesting(key);
-                long stock = entry.stock(key);
-                int cpus = cs.getCpus().size();
-                line = "  網路#" + n
-                        + "  樣板數=" + patterns
-                        + "  可合成=" + craftable
-                        + "  可發射=" + emitable
-                        + "  網路現貨=" + stock
-                        + "  已請求量=" + requested
-                        + "  isRequesting=" + requesting
-                        + "  CPU=" + cpus;
-                if (patterns == 0 && !emitable) {
-                    line += "  ← **沒有任何樣板能做它**，請求器不會下單";
-                } else if (requested > 0) {
-                    line += "  ← 已經有在途，請求器要等它結案才會再下單";
-                }
-            } catch (Throwable t) {
-                line = "  網路#" + n + "  查詢失敗：" + t;
+                reports.add(inspect(i, entry, key));
+            } catch (Throwable ignored) {
+                // 單一網路查詢失敗不影響其他網路
             }
-            final String out = line;
-            src.sendSuccess(() -> Component.literal(out), false);
+        }
+        List<Report> shown = new ArrayList<>(reports.stream().filter(Report::relevant).toList());
+        shown.sort(Comparator.comparingInt(Report::rank).reversed());
+        int skipped = reports.size() - shown.size();
+        boolean truncated = shown.size() > MAX_GRIDS;
+        if (truncated) {
+            shown = shown.subList(0, MAX_GRIDS);
+        }
+
+        src.sendSuccess(() -> Component.literal("[craftfix] " + key.getDisplayName().getString()
+                + "  " + key), false);
+        final int fSkipped = skipped;
+        final int fTotal = reports.size();
+        final boolean fTruncated = truncated;
+        src.sendSuccess(() -> Component.literal("  共 " + fTotal + " 張網路，"
+                + (fSkipped > 0 ? "略過 " + fSkipped + " 張無關的（無 CPU／無樣板／無現貨）" : "全部相關")
+                + (fTruncated ? "，只列前 " + MAX_GRIDS + " 張" : "")), false);
+
+        if (shown.isEmpty()) {
+            src.sendSuccess(() -> Component.literal("  **每一張網路都沒有 CPU、沒有樣板、也沒有現貨**"
+                    + " → 你手上這顆不是從這些網路做出來的，或網路沒接上"), false);
+            return 1;
+        }
+        for (Report r : shown) {
+            src.sendSuccess(() -> Component.literal(format(r)), false);
+            for (String v : r.variants()) {
+                src.sendSuccess(() -> Component.literal("      同名不同 NBT 的可合成品：" + v), false);
+            }
         }
         return 1;
+    }
+
+    private static Report inspect(int index, GridRegistry.Entry entry, AEKey key) {
+        ICraftingService cs = entry.crafting();
+        int patterns = cs.getCraftingFor(key).size();
+        boolean craftable = cs.isCraftable(key);
+        boolean emitable = cs.canEmitFor(key);
+        long requested = cs.getRequestedAmount(key);
+        boolean requesting = cs.isRequesting(key);
+        long stock = entry.stock(key);
+        int cpus = cs.getCpus().size();
+
+        List<String> variants = new ArrayList<>();
+        // 精確 key 查不到樣板時，才去找「同一個物品、不同 NBT」的可合成品——這是「樣板數=0」
+        // 最常見的真因（手上那顆的 tag 跟樣板產出的不一樣）。
+        if (patterns == 0 && cpus > 0) {
+            try {
+                for (AEKey c : cs.getCraftables(k -> true)) {
+                    if (c != null && !c.equals(key)
+                            && java.util.Objects.equals(c.getPrimaryKey(), key.getPrimaryKey())) {
+                        variants.add(c.toString());
+                        if (variants.size() >= MAX_VARIANTS) {
+                            break;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+                // 掃不動就算了，主要欄位已經夠判斷
+            }
+        }
+        return new Report(index, patterns, craftable, emitable, stock, requested, requesting, cpus,
+                variants);
+    }
+
+    private static String format(Report r) {
+        String line = "  網路#" + r.index()
+                + "  樣板=" + r.patterns()
+                + "  可合成=" + r.craftable()
+                + "  可發射=" + r.emitable()
+                + "  現貨=" + r.stock()
+                + "  已請求=" + r.requested()
+                + "  CPU=" + r.cpus();
+        if (r.patterns() > 0 && r.requested() > 0) {
+            line += "  ← 有樣板但已經有在途，請求器要等它結案才會再下單";
+        } else if (r.patterns() > 0) {
+            line += "  ← 有樣板，這張網路做得出來";
+        } else if (!r.variants().isEmpty()) {
+            line += "  ← **精確 NBT 對不上**：樣板產出的是下面那些 key，不是你手上這顆";
+        } else if (r.emitable()) {
+            line += "  ← 沒樣板但可發射（等級發射器）";
+        } else if (r.cpus() > 0) {
+            line += "  ← **這張有 CPU 的網路上沒有任何樣板能做它**";
+        }
+        return line;
     }
 }
