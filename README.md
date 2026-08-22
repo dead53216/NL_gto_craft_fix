@@ -29,7 +29,7 @@
 其餘假說都有反證：跨 CPU 誤認領（認領日誌 0 筆）、產物回流未認領（在途料一律 `網0`＝貨根本不存在）、
 機器忙碌（全 `忙:0`）、並行死角（缺口多為 `0/N`，不符指紋）。
 
-## 目前行為（slim，3.13.7）
+## 目前行為（slim，3.14.0）
 
 | 機制 | 狀態 | 說明 |
 |---|---|---|
@@ -126,6 +126,14 @@ CRAFT_LESS 被 `executeV2` 整張歸 0 時砍半重算，最多 12 趟，找到�
   還原 → 補齊 → 再判擋不擋（還原排在補齊之後會把補進 `usedItems` 的現貨洗掉）。
 - **成品不可由本 mod 搬進 CPU**。GTO 沒有「把開局吸入的成品交給 link」的步驟，吸進去只會抱著現貨永凍
   （NAND 625 實錄）。所以：缺口吃網路現貨時成品例外、保母 final key 永不餵、final 交付量不計 `usedItems(final)`。
+- **「請求器沒呼叫」不等於查不下去**（3.14.0）。2026-08-22 稀土金屬粉的請求器 (78354,131,-46408)
+  從 17:45 起完全靜音——`beginCraftingCalculation` 與 `submitJob` 都 0 次，鄰居 (78354,130,-46408)
+  同區塊照常送請求，跨兩次重開世界都沒醒。這種形狀不是「不明原因」：merequester 只在手上沒有
+  未結案 `ICraftingLink` 時才重新請求，而 link 的權威登記簿就在 `CraftingService.craftingLinks`
+  （`Map<UUID, CraftingLinkNexus>`，nexus 分 `req`／`cpu` 兩側）。**這個 mod 掛在 CraftingService
+  上，本來就看得到它**。加了 `[craftfix][link]` 稽核之後，孤兒 link 會自己report 出來。
+  <br>用反射而不是 `@Shadow` 讀那個欄位：`@Shadow` 對不上是 apply 期硬失敗＝世界載不進去，
+  純診斷不值得冒那個險（3.13.2 剛用另一種方式示範過同一類代價）。
 - **fail-closed 不能做成「一票否決整張單」**（3.13.2 埋、3.13.6 修）。保母的「這個 key 有沒有樣板
   押在供應器上」判定被寫成 `pendingAnywhere`：只要整張單的 `pendingRequests` 非空，**該單所有 key
   一律不餵**。理由是「pendingRequests 只索引主產物、副產物查不到可能誤餵」——立意對，代價完全不成比例。
@@ -216,6 +224,7 @@ CRAFT_LESS 被 `executeV2` 整張歸 0 時砍半重算，最多 12 趟，找到�
 | `[警報]` | 不必等 60 秒：**料齊卻不推**（料夠 ≥1 輪、供應器不忙卻 10 秒沒推）、**在途沒回**（掛在途 ≥2 分鐘且網存 0）|
 | `[一覽]` | 每 30 秒一行：每顆 CPU 的 剩輪／在途／庫存／待交付／**近 30 秒推了幾輪**／靜止幾秒 |
 | `[凍結]` | 靜止 60 秒觸發（之後每 5 分鐘重播）：逐任務全部輸入格 have/need＋網存＋在途＋誰產它＋替代數，供應器 prov/忙/座標，可跑幾輪；在途明細（等N／網M／等了Ns／另K顆也等／推給座標／無任務產它）；**饑餓鏈根源**；最後一行 **判定** |
+| `[link]` | **孤兒 link**（3.14.0）：`craftId=… req=true cpu=false done=false canceled=false 請求器=…(x,y,z)`。AE2 的 link 有兩側，請求器那半還掛著、CPU 那半沒了、又沒 done／canceled ＝ **那顆請求器不會再下單**。merequester 只在沒有未結案 link 時才重新請求，而那半 link 存在方塊 NBT，**重開世界也不會好**。每 10 秒掃一次，同一 craftId 只在狀態改變時再印 |
 | `[認領]` | `<key> x<量> 交付：N顆 CPU 同時在等 → …`，候選 ≥2 才印。AE2 的 `insertIntoCpus` 對 `craftingCPUClusters`（HashSet，順序任意）逐顆 `insert`，**不認這批貨是誰訂的**——「A 訂的貨被 B 領走」由此而生 |
 
 判定分類：CPU 被暫停／料齊卻不推（`parallel==1` 死角、供應器沉默）／樣板失聯（`prov:0`）／
