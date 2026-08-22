@@ -28,6 +28,9 @@ public final class GtoCraftFixMod {
     public static final String MODID = "gto_craft_fix";
 
     public GtoCraftFixMod() {
+        // [3.13.7] 先把 gtocraftfix 的 log 導到 logs/craftfix.log，之後所有訊息（含本方法下面那行）
+        // 都只進獨立檔。本 mod 的帳本／探針量大，混在 latest.log 裡會把它撐到數十 MB。
+        CraftLog.install();
         // 停機清理：static 佇列（LP 回退佇列、算料泵佇列）強持 Level/IGrid，不清會讓整個舊
         // ServerLevel 在主選單期間無法 GC，且新世界首個 tick 會對死 grid 建構/泵發算料
         MinecraftForge.EVENT_BUS.addListener(GtoCraftFixMod::onServerStopped);

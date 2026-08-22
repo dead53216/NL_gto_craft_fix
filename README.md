@@ -29,7 +29,7 @@
 其餘假說都有反證：跨 CPU 誤認領（認領日誌 0 筆）、產物回流未認領（在途料一律 `網0`＝貨根本不存在）、
 機器忙碌（全 `忙:0`）、並行死角（缺口多為 `0/N`，不符指紋）。
 
-## 目前行為（slim，3.13.6）
+## 目前行為（slim，3.13.7）
 
 | 機制 | 狀態 | 說明 |
 |---|---|---|
@@ -183,6 +183,15 @@ CRAFT_LESS 被 `executeV2` 整張歸 0 時砍半重算，最多 12 趟，找到�
   修補機會——零任務計畫的缺口必然無樣板可補，修補對它本來就是 no-op。
 
 ## 診斷 log 導覽
+
+**log 寫在自己的檔案**（3.13.7）：`logs/craftfix.log`，**不再進 `latest.log`**。
+本 mod 的帳本／探針量大（實測單一場把 `latest.log` 撐到 31 MB），混在一起兩邊都難查。
+開服時上一場會改名成 `craftfix-<上一場最後寫入時間>.log` 保留，預設留 5 份。
+
+| 系統屬性 | 預設 | 作用 |
+|---|---|---|
+| `gtodiag.logToMain` | `false` | 設 `true` 則同時寫回 `latest.log`（additivity）|
+| `gtodiag.logKeep` | `5` | 保留幾份舊的 `craftfix-*.log` |
 
 `com.gtocraftfix.diag.CraftDiag`，**純唯讀**。核心是每 tick 對每顆有單的 CPU 驗一條不變量：
 
