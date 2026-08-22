@@ -38,6 +38,8 @@ public final class CraftFixCommand {
     private static final int MAX_GRIDS = 8;
     /** 同名不同 NBT 的候選最多列幾個。 */
     private static final int MAX_VARIANTS = 5;
+    /** 每張網路最多列幾顆請求器座標。 */
+    private static final int MAX_REQUESTERS = 4;
 
     private CraftFixCommand() {
     }
@@ -49,7 +51,8 @@ public final class CraftFixCommand {
     }
 
     private record Report(int index, int patterns, boolean craftable, boolean emitable,
-            long stock, long requested, boolean requesting, int cpus, List<String> variants) {
+            long stock, long requested, boolean requesting, int cpus, List<String> variants,
+            int nodes, String pivot, int requesters, List<String> requesterPos) {
 
         boolean relevant() {
             return cpus > 0 || patterns > 0 || stock > 0 || requested > 0 || !variants.isEmpty();
@@ -118,9 +121,19 @@ public final class CraftFixCommand {
         }
         for (Report r : shown) {
             src.sendSuccess(() -> Component.literal(format(r)), false);
+            src.sendSuccess(() -> Component.literal("      節點=" + r.nodes()
+                    + "  樞紐=" + r.pivot()
+                    + "  請求器=" + r.requesters()
+                    + (r.requesterPos().isEmpty() ? "" : " @" + String.join(" / ", r.requesterPos()))),
+                    false);
             for (String v : r.variants()) {
                 src.sendSuccess(() -> Component.literal("      同名不同 NBT 的可合成品：" + v), false);
             }
+        }
+        if (shown.size() >= 2) {
+            src.sendSuccess(() -> Component.literal("  ⚠ 有 2 張以上都有 CPU 的網路："
+                    + "**請求器和樣板要在同一張才會下單**。比對上面的「請求器 @座標」"
+                    + "與「樣板>0」是不是同一行"), false);
         }
         return 1;
     }
@@ -153,8 +166,43 @@ public final class CraftFixCommand {
                 // 掃不動就算了，主要欄位已經夠判斷
             }
         }
+        // 網路身分：節點數＋樞紐座標＋這張網路上有幾顆合成請求器（在哪）。
+        // 「請求器不下單」最後一種可能是**請求器跟樣板根本不在同一張網路上**——網路被切開時
+        // 兩邊都還會 tick、都還有 CPU，光看合成欄位分不出來，一定要把位置印出來才看得見。
+        int nodes = 0;
+        String pivot = "?";
+        int requesters = 0;
+        List<String> requesterPos = new ArrayList<>();
+        try {
+            var grid = entry.grid();
+            nodes = grid.size();
+            pivot = describe(grid.getPivot() == null ? null : grid.getPivot().getOwner());
+            for (var node : grid.getNodes()) {
+                Object owner = node == null ? null : node.getOwner();
+                if (owner instanceof appeng.api.networking.crafting.ICraftingRequester) {
+                    requesters++;
+                    if (requesterPos.size() < MAX_REQUESTERS) {
+                        requesterPos.add(describe(owner));
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            // 網路身分只是輔助資訊，讀不到不影響主要判斷
+        }
         return new Report(index, patterns, craftable, emitable, stock, requested, requesting, cpus,
-                variants);
+                variants, nodes, pivot, requesters, requesterPos);
+    }
+
+    /** 把 grid node 的擁有者描述成「類名(x,y,z)」，方便直接走到現場。 */
+    private static String describe(Object owner) {
+        if (owner == null) {
+            return "?";
+        }
+        if (owner instanceof net.minecraft.world.level.block.entity.BlockEntity be) {
+            var pos = be.getBlockPos();
+            return pos.getX() + "," + pos.getY() + "," + pos.getZ();
+        }
+        return owner.getClass().getSimpleName();
     }
 
     private static String format(Report r) {
