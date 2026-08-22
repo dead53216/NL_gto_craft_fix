@@ -95,6 +95,8 @@ public abstract class CraftingServiceSyncMixin {
     private static final AtomicInteger gtocraftfix$sitterLog = new AtomicInteger();
     /** 餵料回補異常另設 ERROR 額度，避免壞掉的 storage 每 tick 洗滿 log。 */
     private static final AtomicInteger gtocraftfix$feedErrorLog = new AtomicInteger();
+    /** [3.13.6] 保母略過原因的 log 額度（每場 100 行）。 */
+    private static final AtomicInteger gtocraftfix$feedSkipLog = new AtomicInteger();
     private int gtocraftfix$tickCounter;
 
     /**
@@ -1093,11 +1095,18 @@ public abstract class CraftingServiceSyncMixin {
     }
 
     /**
-     * GTO 26.7.4 的 pendingRequests 只用樣板主產物當 key，waitingFor 卻含全部副產物，而且成功 push
-     * 後 task 可先被移除；掃「目前 key／waiting keys／active tasks」都可能漏。直接讀整個 multimap
-     * 是否為空才是可證明的全單 gate；欄位或 isEmpty 語意讀不到一律 UNKNOWN。
+     * GTO 26.7.4 的 pendingRequests 用樣板主產物當 key。回傳 keySet 的快照供**逐 key** 判定；
+     * 欄位或型別讀不到回 {@code null}（呼叫端一律 fail-closed 不餵）。
+     * <p>⚠ [3.13.6] 這裡曾經是 {@code pendingAnywhere}：只要 multimap 非空就**整單所有 key 都不餵**。
+     * 理由是「pendingRequests 只索引主產物，副產物查不到，可能誤餵」。實測代價遠大於收益——
+     * 2026-08-22 全天 5,459 張稀土單，每張都有一筆 {@code rare_earth_oxide_dust} 押在供應器上，
+     * 於是同一張單裡「網路有 714 億、無任務產它」的 {@code salt_water} 幻影缺口一次都沒被餵，
+     * 單活 8 秒就離場、**累計交付 0**、AE 庫存 0。當天 510 筆該餵的缺口實際只餵了 0 筆
+     * （3.13.1 同類場景是 690 筆餵 134 筆）。
+     * <p>改回逐 key 之後殘留的誤餵風險是有界的：餵入量以 {@code getWaitingFor(key)} 為上限，
+     * final key 一律不餵，多餵的副產物只會留在 CPU 庫存、離場時回網路，不會動到 link 帳。
      */
-    private static CraftingHotfixSupport.PendingKnowledge gtocraftfix$pendingAnywhere(Object logic) {
+    private static java.util.Set<AEKey> gtocraftfix$pendingKeys(Object logic) {
         try {
             var field = gtocraftfix$fPendingRequests;
             if (field == null) {
@@ -1114,17 +1123,23 @@ public abstract class CraftingServiceSyncMixin {
                 }
             }
             if (field == null) {
-                return CraftingHotfixSupport.PendingKnowledge.UNKNOWN;
+                return null;
             }
             Object requests = field.get(logic);
             if (!(requests instanceof com.google.common.collect.Multimap<?, ?> pending)) {
-                return CraftingHotfixSupport.PendingKnowledge.UNKNOWN;
+                return null;
             }
-            return pending.isEmpty()
-                    ? CraftingHotfixSupport.PendingKnowledge.NONE
-                    : CraftingHotfixSupport.PendingKnowledge.PRESENT;
+            var keys = new HashSet<AEKey>();
+            for (Object k : pending.keySet()) {
+                if (k instanceof AEKey aeKey) {
+                    keys.add(aeKey);
+                } else if (k != null) {
+                    return null; // key 型別不是 AEKey＝語意讀不懂，不能當成「沒有在途」
+                }
+            }
+            return keys;
         } catch (Throwable ignored) {
-            return CraftingHotfixSupport.PendingKnowledge.UNKNOWN;
+            return null;
         }
     }
 
@@ -1340,8 +1355,11 @@ public abstract class CraftingServiceSyncMixin {
             return null;
         }
         // GTO pendingRequests 只以 primary output 為 key；只查目前 waiting key 會漏掉同一張樣板
-        // 已在途的副產物。只要整張單仍有任一 pending（或反射無法判定），取消救援一律 fail-closed。
-        if (gtocraftfix$pendingAnywhere(logic) != CraftingHotfixSupport.PendingKnowledge.NONE) {
+        // 已在途的副產物。取消整張單是破壞性動作，這裡**維持全單 fail-closed**：只要仍有任一
+        // pending（或反射無法判定）就不救。（3.13.6 把餵料側改成逐 key，這裡刻意不跟進——
+        // 餵錯一筆料的代價是留在 CPU 庫存、離場回網路；取消錯一張單的代價是玩家半成品全退。）
+        var pendingKeys = gtocraftfix$pendingKeys(logic);
+        if (pendingKeys == null || !pendingKeys.isEmpty()) {
             return null;
         }
         var producible = gtocraftfix$taskOutputs(logic);
@@ -3159,11 +3177,9 @@ public abstract class CraftingServiceSyncMixin {
                 // 無差別模式維持每 tick（那是 2.x 兩單搶料時的原始節奏）。
                 boolean feedTick = gtocraftfix$FEED && feedRefundsClear
                         && (!gtocraftfix$FEED_PHANTOM_ONLY || gtocraftfix$tickCounter % 20 == 0);
-                // pendingRequests 只按樣板主產物建索引，且成功 push 後 task 可先移除；直接看整個
-                // pendingRequests 是否為空。任一在途／反射未知就整單不餵，封住最後一輪副產物誤餵。
-                var pendingSnapshot = feedTick
-                        ? gtocraftfix$pendingAnywhere(logic)
-                        : CraftingHotfixSupport.PendingKnowledge.UNKNOWN;
+                // [3.13.6] 逐 key 判定「這個 key 是否已有樣板押在供應器上」。
+                // pendingKeys==null＝反射讀不到 → 本單全部 fail-closed 不餵（見該方法 javadoc）。
+                java.util.Set<AEKey> pendingKeys = feedTick ? gtocraftfix$pendingKeys(logic) : null;
                 // 本單剩餘任務會產出的 key；讀不到 job（反射失效）回 null → 幻影模式下一律不餵（保守）。
                 // 惰性求值：真的有 key 要判時才算。
                 java.util.Set<AEKey> producible = null;
@@ -3181,6 +3197,11 @@ public abstract class CraftingServiceSyncMixin {
                     if (isFinal) {
                         continue;
                     }
+                    var pendingSnapshot = pendingKeys == null
+                            ? CraftingHotfixSupport.PendingKnowledge.UNKNOWN
+                            : pendingKeys.contains(key)
+                                    ? CraftingHotfixSupport.PendingKnowledge.PRESENT
+                                    : CraftingHotfixSupport.PendingKnowledge.NONE;
                     if (gtocraftfix$FEED_PHANTOM_ONLY) {
                         if (!producibleReady) {
                             producible = gtocraftfix$taskOutputs(logic);
@@ -3190,6 +3211,19 @@ public abstract class CraftingServiceSyncMixin {
                                 producible != null,
                                 producible != null && producible.contains(key),
                                 pendingSnapshot)) {
+                            // [3.13.6] 略過原因留一行（節流）：保母整天靜音卻查不出被哪道閘門擋，
+                            // 正是 3.13.2→3.13.5 那次「餵料 0 筆」拖了一整天才被發現的原因。
+                            if (gtocraftfix$feedSkipLog.incrementAndGet() <= 100) {
+                                LOG.info("[craftfix] 保母略過 {}：{}", key,
+                                        pendingSnapshot == CraftingHotfixSupport.PendingKnowledge.UNKNOWN
+                                                ? "pendingRequests 反射讀不到（fail-closed）"
+                                                : pendingSnapshot
+                                                        == CraftingHotfixSupport.PendingKnowledge.PRESENT
+                                                ? "已有樣板押在供應器上"
+                                                : producible == null
+                                                        ? "讀不到剩餘任務產出表（fail-closed）"
+                                                        : "本單剩餘任務會產它");
+                            }
                             continue;
                         }
                     } else if (pendingSnapshot != CraftingHotfixSupport.PendingKnowledge.NONE) {
