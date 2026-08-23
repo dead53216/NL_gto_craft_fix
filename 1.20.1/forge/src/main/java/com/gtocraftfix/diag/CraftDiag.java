@@ -1520,7 +1520,12 @@ public final class CraftDiag {
         try {
             if (result != null && !result.successful()) {
                 if (spend()) {
-                    LOG.warn("[craftfix][開單帳本] 提交失敗 out={} err={}", plan.finalOutput(), result.errorCode());
+                    // [3.16.0] 一併印 errorDetail：AE2 對 NO_SUITABLE_CPU_FOUND 會附上
+                    // UnsuitableCpus[offline, busy, tooSmall, excluded]（對應 submitJob 選 CPU 的四道
+                    // 過濾：isActive／!isBusy／getAvailableStorage>=bytes／canBeAutoSelectedFor）。
+                    // 只印 errorCode 等於把「為什麼沒 CPU」這個答案丟掉。
+                    LOG.warn("[craftfix][開單帳本] 提交失敗 out={} err={} detail={}",
+                            plan.finalOutput(), result.errorCode(), result.errorDetail());
                 }
                 return;
             }

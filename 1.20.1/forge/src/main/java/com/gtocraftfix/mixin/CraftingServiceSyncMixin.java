@@ -2078,8 +2078,9 @@ public abstract class CraftingServiceSyncMixin {
             if (gtocraftfix$failLogged.size() > 128) {
                 gtocraftfix$failLogged.clear();
             }
-            LOG.warn("[craftfix] 機器源提交失敗 err={} sim={} missing={} out={}",
-                    r.errorCode(), job.simulation(), job.missingItems().size(), job.finalOutput());
+            LOG.warn("[craftfix] 機器源提交失敗 err={} detail={} sim={} missing={} out={}",
+                    r.errorCode(), r.errorDetail(), job.simulation(), job.missingItems().size(),
+                    job.finalOutput());
         }
     }
 
