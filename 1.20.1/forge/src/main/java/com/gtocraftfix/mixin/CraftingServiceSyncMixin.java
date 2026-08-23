@@ -109,6 +109,13 @@ public abstract class CraftingServiceSyncMixin {
     private static volatile java.lang.reflect.Field gtocraftfix$fTasks;
     private static volatile java.lang.reflect.Field gtocraftfix$fInv;
     private static volatile java.lang.reflect.Field gtocraftfix$fHolderVal;
+    // [3.17.0] link 稽核：CraftingService.craftingLinks 與 CraftingLinkNexus 的私有欄位
+    private static volatile java.lang.reflect.Field gtocraftfix$fCraftingLinks;
+    private static volatile java.lang.reflect.Field[] gtocraftfix$fNexus;
+    private static volatile boolean gtocraftfix$nexusResolveFailed;
+    /** craftId → 上次印出的狀態字串；狀態沒變就不重印。 */
+    private final Map<java.util.UUID, String> gtocraftfix$linkSeen = new HashMap<>();
+    private static final AtomicInteger gtocraftfix$linkLog = new AtomicInteger();
     private final Set<String> gtocraftfix$failLogged = new HashSet<>();
     /** [2.0.1 純診斷] 欄位普查已做過的 cluster（每場遊戲每 cluster 只倒一次，避免洗版）。 */
     private final Set<String> gtocraftfix$censusDone = new HashSet<>();
@@ -442,6 +449,147 @@ public abstract class CraftingServiceSyncMixin {
                 + " stallCancel=" + gtocraftfix$STALL_CANCEL
                 + "(" + gtocraftfix$STALL_SEC + "s,cd=" + gtocraftfix$STALL_COOLDOWN_SEC
                 + "s,broadcast=" + gtocraftfix$STALL_BROADCAST + ")";
+    }
+
+    /**
+     * [3.17.0] 把 AE2 的 link 登記簿整份 dump 出來（純唯讀）。
+     *
+     * <p><b>為什麼是這個東西</b>：請求器什麼時候送下一張單，看的是它手上那條 {@code ICraftingLink}
+     * 有沒有結案。實測 2026-08-23 的節奏——「上一張單離場 → 2~4 秒後送下一張」——證實它是
+     * <b>結案驅動</b>而不是固定輪詢；而 tiny_gaia_dust 曾靜默 19 分鐘、直到玩家手動下單才在 5 秒內
+     * 恢復，形狀就是「在等一條不會結案的 link」。登記簿是
+     * {@code CraftingService.craftingLinks}（{@code Map<UUID, CraftingLinkNexus>}），
+     * 一條 nexus 分 {@code req}（請求器那半，寫進方塊 NBT）與 {@code cpu}（CPU 那半）。
+     *
+     * <p><b>3.14.0 的教訓：不要預設哪種形狀是壞的。</b>那版只點名
+     * 「{@code req!=null && cpu==null && !done && !canceled}」這一種，結果實測「沒有孤兒 link」，
+     * 但問題確實存在——真正的形狀可能是 {@code done=true} 卻沒被請求器清掉，那個條件抓不到。
+     * 所以這版<b>無條件把每條 nexus 的完整狀態印出來</b>，由人看，不由我猜。
+     *
+     * <p>節流：同一 craftId 只在狀態字串改變時再印一次；離場即從表中清掉；總額度 400 行。
+     */
+    private void gtocraftfix$linkAudit() {
+        if (gtocraftfix$nexusResolveFailed) {
+            return;
+        }
+        // 用反射不用 @Shadow：@Shadow 對不上是 apply 期硬失敗＝世界載不進去，純診斷不值得冒險。
+        var links = gtocraftfix$craftingLinks();
+        if (links == null) {
+            return;
+        }
+        var fields = gtocraftfix$nexusFields();
+        if (fields == null) {
+            return;
+        }
+        if (links.isEmpty()) {
+            gtocraftfix$linkSeen.clear();
+            return;
+        }
+        var alive = new HashSet<java.util.UUID>();
+        for (var e : links.entrySet()) {
+            var nexus = e.getValue();
+            if (nexus == null) {
+                continue;
+            }
+            alive.add(e.getKey());
+            try {
+                String state = "done=" + fields[1].getBoolean(nexus)
+                        + " canceled=" + fields[0].getBoolean(nexus)
+                        + " req=" + gtocraftfix$sideOf(fields[2].get(nexus))
+                        + " cpu=" + gtocraftfix$sideOf(fields[3].get(nexus))
+                        + " tickOfDeath=" + fields[4].getInt(nexus);
+                if (state.equals(gtocraftfix$linkSeen.get(e.getKey()))) {
+                    continue;
+                }
+                gtocraftfix$linkSeen.put(e.getKey(), state);
+                if (gtocraftfix$linkLog.incrementAndGet() <= 400) {
+                    LOG.info("[craftfix][link] {} {}", e.getKey(), state);
+                }
+            } catch (Throwable t) {
+                gtocraftfix$nexusResolveFailed = true;
+                LOG.warn("[craftfix][link] nexus 欄位讀取失敗，link 稽核停用：{}", t.toString());
+                return;
+            }
+        }
+        gtocraftfix$linkSeen.keySet().retainAll(alive);
+        if (gtocraftfix$linkSeen.size() > 256) {
+            gtocraftfix$linkSeen.clear();
+        }
+    }
+
+    /** 一側的 CraftingLink：印出誰持有（有座標就印座標）＋它自己的 done/canceled。 */
+    private static String gtocraftfix$sideOf(Object link) {
+        if (link == null) {
+            return "(無)";
+        }
+        try {
+            var cl = appeng.crafting.CraftingLink.class;
+            String who = "?";
+            try {
+                var m = cl.getDeclaredMethod("getRequester");
+                m.setAccessible(true);
+                Object r = m.invoke(link);
+                if (r instanceof net.minecraft.world.level.block.entity.BlockEntity be) {
+                    var pos = be.getBlockPos();
+                    who = pos.getX() + "," + pos.getY() + "," + pos.getZ();
+                } else if (r != null) {
+                    who = r.getClass().getSimpleName();
+                } else {
+                    who = "cpu側";
+                }
+            } catch (Throwable ignored) {
+                // 拿不到持有者不影響狀態本身
+            }
+            var l = (appeng.api.networking.crafting.ICraftingLink) link;
+            return who + "[done=" + l.isDone() + ",cancel=" + l.isCanceled()
+                    + ",standalone=" + l.isStandalone() + "]";
+        } catch (Throwable ignored) {
+            return "(讀不到)";
+        }
+    }
+
+    /** AE2 CraftingService 的 link 登記簿（private final Map<UUID, CraftingLinkNexus>）。 */
+    @SuppressWarnings("unchecked")
+    private Map<java.util.UUID, appeng.crafting.CraftingLinkNexus> gtocraftfix$craftingLinks() {
+        try {
+            var field = gtocraftfix$fCraftingLinks;
+            if (field == null) {
+                field = appeng.me.service.CraftingService.class.getDeclaredField("craftingLinks");
+                field.setAccessible(true);
+                gtocraftfix$fCraftingLinks = field;
+            }
+            Object value = field.get(this);
+            return value instanceof Map<?, ?> map
+                    ? (Map<java.util.UUID, appeng.crafting.CraftingLinkNexus>) map
+                    : null;
+        } catch (Throwable t) {
+            gtocraftfix$nexusResolveFailed = true;
+            LOG.warn("[craftfix][link] 讀不到 CraftingService.craftingLinks，link 稽核停用：{}", t.toString());
+            return null;
+        }
+    }
+
+    /** CraftingLinkNexus 的私有欄位；解析不到就永久停用稽核（純診斷，不值得每 tick 重試）。 */
+    private static java.lang.reflect.Field[] gtocraftfix$nexusFields() {
+        var cached = gtocraftfix$fNexus;
+        if (cached != null) {
+            return cached;
+        }
+        try {
+            Class<?> c = appeng.crafting.CraftingLinkNexus.class;
+            var f = new java.lang.reflect.Field[5];
+            String[] names = { "canceled", "done", "req", "cpu", "tickOfDeath" };
+            for (int i = 0; i < names.length; i++) {
+                f[i] = c.getDeclaredField(names[i]);
+                f[i].setAccessible(true);
+            }
+            gtocraftfix$fNexus = f;
+            return f;
+        } catch (Throwable t) {
+            gtocraftfix$nexusResolveFailed = true;
+            LOG.warn("[craftfix][link] CraftingLinkNexus 欄位對不上，link 稽核停用：{}", t.toString());
+            return null;
+        }
     }
 
     /** [3.8.0] 把 KeyCounter 倒回快照值（以差額回沖，KeyCounter.add 吃負數）。 */
@@ -2207,6 +2355,14 @@ public abstract class CraftingServiceSyncMixin {
         com.gtocraftfix.calc.CalcTicker.tick(); // 內置原版算料器的預算泵（每 tick）
         com.gtocraftfix.lpcalc.LpFallbackQueue.drainOnServerTick(); // LP 晚期回退/影子驗證的伺服器緒建構點（鐵則5/8）
         gtocraftfix$tickCounter++;
+        // [3.17.0] link 稽核：每 5 秒 dump 一次登記簿（狀態沒變不重印）。純唯讀。
+        if (gtocraftfix$tickCounter % 100 == 0) {
+            try {
+                gtocraftfix$linkAudit();
+            } catch (Throwable ignored) {
+                // 純診斷，永遠不能影響合成
+            }
+        }
         // [3.7.0] 帳本：每 tick 逐 CPU 對「Δ庫存＋Δ在途＋Δ交付 == 產出−消耗＋自補」這條不變量，
         // 違反即帳外流動（多吃／被領走／產出沒掛帳）；另含新單/離場快照、任務增減、一覽、凍結全景。
         // 取代 3.6.0 的每 2 tick 取樣式 pushAudit（取樣會把任務移除誤算成巨量 Δ）。
